@@ -1,0 +1,169 @@
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 3600); // 24 jam default TTL
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelCache {
+    pub fetched_at: u64,
+    pub domain: String,
+    pub models: Vec<String>,
+}
+
+pub struct ModelManager {
+    cache_dir: PathBuf,
+    ttl: Duration,
+}
+
+impl ModelManager {
+    pub fn new(workspace_root: &Path) -> Self {
+        Self {
+            cache_dir: workspace_root.join(".seavx/cache"),
+            ttl: DEFAULT_CACHE_TTL,
+        }
+    }
+
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Extract clean domain/slug for cache filename: .seavx/cache/models-[domain].json
+    pub fn domain_slug(base_url: &str) -> String {
+        let clean = base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split(['/', ':', '?'])
+            .next()
+            .unwrap_or("default");
+
+        clean
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+            .collect()
+    }
+
+    fn cache_path(&self, domain_slug: &str) -> PathBuf {
+        self.cache_dir.join(format!("models-{domain_slug}.json"))
+    }
+
+    /// Load models from cache if still valid within TTL
+    pub fn get_cached_models(&self, domain_slug: &str) -> Option<Vec<String>> {
+        let path = self.cache_path(domain_slug);
+        if !path.exists() {
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&path).ok()?;
+        let cache: ModelCache = serde_json::from_str(&content).ok()?;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if now.saturating_sub(cache.fetched_at) < self.ttl.as_secs() {
+            Some(cache.models)
+        } else {
+            None // TTL expired
+        }
+    }
+
+    /// Save fetched models into cache file
+    pub fn save_cache(&self, domain_slug: &str, models: &[String]) -> Result<(), String> {
+        let _ = std::fs::create_dir_all(&self.cache_dir);
+        let path = self.cache_path(domain_slug);
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let cache = ModelCache {
+            fetched_at: now,
+            domain: domain_slug.to_string(),
+            models: models.to_vec(),
+        };
+
+        let json = serde_json::to_string_pretty(&cache)
+            .map_err(|e| format!("Serialization error: {e}"))?;
+
+        std::fs::write(&path, json)
+            .map_err(|e| format!("Failed to write cache {}: {e}", path.display()))?;
+
+        Ok(())
+    }
+
+    /// Fetch models from remote /models endpoint or use cache
+    pub async fn fetch_or_cache_models(
+        &self,
+        base_url: &str,
+        api_key: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let domain_slug = Self::domain_slug(base_url);
+
+        if let Some(cached) = self.get_cached_models(&domain_slug) {
+            tracing::info!(domain = %domain_slug, "Loaded models from local cache");
+            return Ok(cached);
+        }
+
+        // Endpoint: standard OpenAI/Anthropic gateway /models
+        let mut endpoint = base_url.trim_end_matches('/').to_string();
+        if !endpoint.ends_with("/models") {
+            endpoint.push_str("/models");
+        }
+
+        tracing::info!(endpoint = %endpoint, "Fetching live models from remote gateway");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+        let mut req = client.get(&endpoint);
+        if let Some(key) = api_key {
+            if !key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {key}"));
+                req = req.header("x-api-key", key);
+            }
+        }
+
+        let resp = req.send().await.map_err(|e| format!("HTTP request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Gateway returned error status: {}", resp.status()));
+        }
+
+        let json_val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse JSON response: {e}"))?;
+
+        let mut model_list = Vec::new();
+        // Parse OpenAI format: { "data": [ { "id": "model-name" } ] }
+        if let Some(arr) = json_val.get("data").and_then(|d| d.as_array()) {
+            for item in arr {
+                if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                    model_list.push(id.to_string());
+                }
+            }
+        } else if let Some(arr) = json_val.as_array() {
+            // Raw list format: [ "model-a", "model-b" ]
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    model_list.push(s.to_string());
+                } else if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                    model_list.push(id.to_string());
+                }
+            }
+        }
+
+        if model_list.is_empty() {
+            return Err("No models discovered in remote response".to_string());
+        }
+
+        model_list.sort();
+        let _ = self.save_cache(&domain_slug, &model_list);
+        Ok(model_list)
+    }
+}

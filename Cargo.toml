@@ -1,0 +1,23 @@
+[package]
+name = "seavx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+futures = "0.3.31"
+ratatui = "0.29.0"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "sync", "time"] }
+tui-textarea = "0.7.0"
+async-trait = "0.1.92"
+genai = "0.7.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+schemars = "0.8.22"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+dotenvy = "0.15.7"
+toml = "0.8.20"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
