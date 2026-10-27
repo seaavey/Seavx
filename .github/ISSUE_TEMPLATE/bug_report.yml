@@ -1,0 +1,93 @@
+name: "Bug Report / Agent Execution Failure"
+description: Report an issue, tool error, or execution failure in Seavx AI Coding Agent
+title: "[Bug]: <short summary of the failure>"
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Terima kasih telah melaporkan masalah! Mohon sertakan informasi selengkap mungkin agar agen atau maintainer dapat langsung mendiagnosis akar masalah (*root cause*).
+
+  - type: textarea
+    id: prompt
+    attributes:
+      label: 1. Prompt / Tugas yang Diberikan
+      description: Tuliskan tugas atau prompt apa yang diberikan ke Seavx saat error terjadi.
+      placeholder: "Contoh: seavx exec 'Baca file main.rs dan edit fungsi run'"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: execution_mode
+    attributes:
+      label: 2. Mode Eksekusi
+      description: Mode apa yang digunakan saat menjalankan Seavx?
+      options:
+        - "TUI Interaktif (seavx / cargo run)"
+        - "Headless CLI (seavx exec '...')"
+        - "CLI Model Switcher (seavx model ...)"
+    validations:
+      required: true
+
+  - type: input
+    id: model_info
+    attributes:
+      label: 3. Model & Base URL Gateway
+      description: Model apa dan endpoint mana yang dikonfigurasi di .seavx/config.toml?
+      placeholder: "Contoh: model = zen/deepseek-v4.1-flash-free, base_url = https://seavx.ai.id/v1/"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reasoning_effort
+    attributes:
+      label: 4. Reasoning Effort
+      description: Tingkat reasoning effort apa yang aktif?
+      options:
+        - "None / Zero"
+        - "Minimal / Low"
+        - "Medium"
+        - "High"
+        - "HighX"
+        - "Max"
+    validations:
+      required: true
+
+  - type: textarea
+    id: error_message
+    attributes:
+      label: 5. Pesan Error yang Ditampilkan
+      description: Salin pesan error yang muncul di layar terminal / TUI.
+      placeholder: "Error executing task: Web call failed..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: tool_execution_trace
+    attributes:
+      label: 6. Tool yang Sedang Berjalan Saat Error
+      description: Tool apa yang dipanggil terakhir kali sebelum crash/gagal? (read_file, run_command, save_memory, dll.)
+      placeholder: "Contoh: Tool: list_directory(path='/workspace') gagal karena path escapes workspace"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 7. Cuplikan Log (.seavx/debug.log / .seavx/request.log)
+      description: Salin baris-baris terakhir dari `.seavx/debug.log` atau `.seavx/request.log` (pastikan HAPUS api_key atau rahasia sensitif sebelum mem-paste).
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 8. Lingkungan Sistem
+      description: Informasi OS dan versi Seavx.
+      value: |
+        - OS: Linux / macOS
+        - Seavx Version: 0.1.0 (`seavx --version`)
+        - Rust Version: (`rustc --version`)
+    validations:
+      required: true

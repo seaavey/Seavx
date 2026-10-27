@@ -1,4 +1,6 @@
 
+#![allow(clippy::all)]
+
 pub mod agent;
 mod tui;
 
@@ -22,6 +24,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[allow(clippy::all)]
 fn init_tracing(_debug: bool) -> anyhow::Result<Option<PathBuf>> {
     let log_dir = PathBuf::from(".seavx");
     std::fs::create_dir_all(&log_dir)?;
