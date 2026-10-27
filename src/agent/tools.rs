@@ -1,6 +1,6 @@
 use crate::agent::security::WorkspaceSecurity;
 use async_trait::async_trait;
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -190,11 +190,7 @@ impl AgentTool for ListDirectoryTool {
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = entry
-                .file_type()
-                .await
-                .map(|t| t.is_dir())
-                .unwrap_or(false);
+            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
             if is_dir {
                 list.push(format!("{name}/"));
             } else {
@@ -304,7 +300,10 @@ impl AgentTool for SearchFilesTool {
 
                 for entry in read_dir.flatten() {
                     let path = entry.path();
-                    let file_name = path.file_name().map(|s| s.to_string_lossy()).unwrap_or_default();
+                    let file_name = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy())
+                        .unwrap_or_default();
 
                     // Skip hidden git and target build artifacts
                     if file_name == ".git" || file_name == "target" || file_name == "node_modules" {
@@ -322,7 +321,12 @@ impl AgentTool for SearchFilesTool {
                             if let Ok(content) = std::fs::read_to_string(&path) {
                                 for (idx, line) in content.lines().enumerate() {
                                     if line.contains(&pattern) {
-                                        matches.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+                                        matches.push(format!(
+                                            "{}:{}: {}",
+                                            path.display(),
+                                            idx + 1,
+                                            line.trim()
+                                        ));
                                         if matches.len() >= 100 {
                                             break;
                                         }
@@ -433,7 +437,9 @@ impl AgentTool for SaveMemoryTool {
         let lower = lesson.to_lowercase();
         for s in &sensitive {
             if lower.contains(s) {
-                return Err(format!("Memory rejected: potential credential detected ({s})"));
+                return Err(format!(
+                    "Memory rejected: potential credential detected ({s})"
+                ));
             }
         }
 
@@ -450,7 +456,8 @@ impl AgentTool for SaveMemoryTool {
                 let _ = tokio::fs::create_dir_all(&seavx_dir).await;
                 seavx_dir.join("USER.md")
             } else {
-                let home = std::env::var("HOME").map_err(|_| "HOME directory not set".to_string())?;
+                let home =
+                    std::env::var("HOME").map_err(|_| "HOME directory not set".to_string())?;
                 let dir = std::path::PathBuf::from(home).join(".seavx");
                 let _ = tokio::fs::create_dir_all(&dir).await;
                 dir.join("USER.md")
@@ -469,7 +476,10 @@ impl AgentTool for SaveMemoryTool {
             .unwrap_or_default();
 
         if existing.contains(lesson) {
-            return Ok(format!("Lesson already recorded in {}", target_file.display()));
+            return Ok(format!(
+                "Lesson already recorded in {}",
+                target_file.display()
+            ));
         }
 
         let mut updated = existing;
@@ -490,7 +500,11 @@ impl AgentTool for SaveMemoryTool {
             .await
             .map_err(|e| format!("Failed to write memory: {e}"))?;
 
-        Ok(format!("Saved [{confidence}%] to {}: {}", target_file.display(), lesson))
+        Ok(format!(
+            "Saved [{confidence}%] to {}: {}",
+            target_file.display(),
+            lesson
+        ))
     }
 }
 

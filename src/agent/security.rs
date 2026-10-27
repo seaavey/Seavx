@@ -46,10 +46,15 @@ impl WorkspaceSecurity {
         }
 
         let sensitive_prefixes = [".env", "id_rsa", "id_ed25519"];
-        let file_name = canonical.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let file_name = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
         for s in &sensitive_prefixes {
             if file_name.starts_with(s) {
-                return Err(format!("Access denied to protected sensitive file: {file_name}"));
+                return Err(format!(
+                    "Access denied to protected sensitive file: {file_name}"
+                ));
             }
         }
 

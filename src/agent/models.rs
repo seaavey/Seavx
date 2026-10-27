@@ -40,7 +40,13 @@ impl ModelManager {
 
         clean
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     }
 
@@ -129,7 +135,10 @@ impl ModelManager {
             }
         }
 
-        let resp = req.send().await.map_err(|e| format!("HTTP request failed: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Gateway returned error status: {}", resp.status()));
         }

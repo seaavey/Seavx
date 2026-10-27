@@ -4,9 +4,14 @@ use std::time::Duration;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, style::Style, widgets::{Block, Borders}, Terminal};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    style::Style,
+    widgets::{Block, Borders},
+};
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
@@ -59,7 +64,10 @@ pub async fn run_agent_worker(prompt: String, tx: mpsc::UnboundedSender<Action>)
                     if parts.len() == 2 {
                         let total = parts[0].parse::<i32>().unwrap_or(0);
                         let prompt = parts[1].parse::<i32>().unwrap_or(0);
-                        let _ = tx_clone.send(Action::AgentUsage { total_tokens: total, prompt_tokens: prompt });
+                        let _ = tx_clone.send(Action::AgentUsage {
+                            total_tokens: total,
+                            prompt_tokens: prompt,
+                        });
                     }
                 } else {
                     let _ = tx_clone.send(Action::AgentToken(format!("\n[{evt}]\n")));
@@ -73,11 +81,15 @@ pub async fn run_agent_worker(prompt: String, tx: mpsc::UnboundedSender<Action>)
                 if !clean_answer.is_empty() {
                     let _ = tx.send(Action::AgentToken(format!("\n\n{clean_answer}\n")));
                 } else {
-                    let _ = tx.send(Action::AgentToken("\n\n[Agent finished work without final message]\n".to_string()));
+                    let _ = tx.send(Action::AgentToken(
+                        "\n\n[Agent finished work without final message]\n".to_string(),
+                    ));
                 }
             }
             Err(e) => {
-                let _ = tx.send(Action::AgentToken(format!("\n\nError executing task: {e}\n")));
+                let _ = tx.send(Action::AgentToken(format!(
+                    "\n\nError executing task: {e}\n"
+                )));
             }
         }
 
@@ -180,7 +192,10 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                         app.scroll = lines;
                     }
                 }
-                Action::AgentUsage { total_tokens, prompt_tokens } => {
+                Action::AgentUsage {
+                    total_tokens,
+                    prompt_tokens,
+                } => {
                     app.total_tokens = total_tokens;
                     app.prompt_tokens = prompt_tokens;
                 }
@@ -200,7 +215,11 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     // Clear debug.log on exit if reasoning effort is enabled

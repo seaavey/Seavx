@@ -6,7 +6,10 @@ pub enum Action {
     Key(KeyEvent),
     AgentToken(String),
     AgentToolStart(String),
-    AgentUsage { total_tokens: i32, prompt_tokens: i32 },
+    AgentUsage {
+        total_tokens: i32,
+        prompt_tokens: i32,
+    },
     AgentDone,
 }
 

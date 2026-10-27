@@ -37,7 +37,10 @@ mod tests {
         let res = registry
             .get("read_file")
             .unwrap()
-            .execute(json!({ "path": "Cargo.toml", "offset": 1, "limit": 5 }), &sec)
+            .execute(
+                json!({ "path": "Cargo.toml", "offset": 1, "limit": 5 }),
+                &sec,
+            )
             .await;
         assert!(res.is_ok());
         assert!(res.unwrap().contains("name = \"seavx\""));
@@ -61,7 +64,10 @@ mod tests {
         let low_conf_res = registry
             .get("save_memory")
             .unwrap()
-            .execute(json!({ "lesson": "Low confidence guess", "confidence": 50 }), &sec)
+            .execute(
+                json!({ "lesson": "Low confidence guess", "confidence": 50 }),
+                &sec,
+            )
             .await;
         assert!(low_conf_res.is_err());
 
@@ -69,7 +75,10 @@ mod tests {
         let high_conf_res = registry
             .get("save_memory")
             .unwrap()
-            .execute(json!({ "lesson": "High confidence verified rule", "confidence": 95 }), &sec)
+            .execute(
+                json!({ "lesson": "High confidence verified rule", "confidence": 95 }),
+                &sec,
+            )
             .await;
         assert!(high_conf_res.is_ok());
         let _ = std::fs::remove_file("MEMORY.md");
@@ -102,7 +111,8 @@ mod tests {
         let seavx_dir = temp_dir.join(".seavx");
         let _ = std::fs::create_dir_all(&seavx_dir);
 
-        let toml_content = "model = \"test-model-xyz\"\nmax_turns = 42\napi_key = \"secret-test-key\"\n";
+        let toml_content =
+            "model = \"test-model-xyz\"\nmax_turns = 42\napi_key = \"secret-test-key\"\n";
         let _ = std::fs::write(seavx_dir.join("config.toml"), toml_content);
 
         let config = crate::agent::engine::AgentConfig::load(&temp_dir);

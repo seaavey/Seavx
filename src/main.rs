@@ -1,4 +1,3 @@
-
 #![allow(clippy::all)]
 
 pub mod agent;
@@ -7,14 +6,10 @@ mod tui;
 use clap::{Parser, Subcommand};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "seavx",
-    version,
-    about = "A customizable AI coding agent"
-)]
+#[command(name = "seavx", version, about = "A customizable AI coding agent")]
 struct Cli {
     /// Enable file-based debug logging to .seavx/debug.log in current repository
     #[arg(short, long, global = true)]
@@ -47,7 +42,10 @@ fn init_tracing(_debug: bool) -> anyhow::Result<Option<PathBuf>> {
         .with(file_layer)
         .init();
 
-    tracing::info!("Tracing initialized. Writing debug log to {:?}", log_file_path);
+    tracing::info!(
+        "Tracing initialized. Writing debug log to {:?}",
+        log_file_path
+    );
     Ok(Some(log_file_path))
 }
 
@@ -92,7 +90,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let debug_enabled = cli.debug
         || cfg!(debug_assertions)
-        || std::env::var("SEAVX_DEBUG").map(|v| v == "1" || v == "true").unwrap_or(false);
+        || std::env::var("SEAVX_DEBUG")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
 
     let _log_path = init_tracing(debug_enabled)?;
 
@@ -117,9 +117,12 @@ async fn main() -> anyhow::Result<()> {
             let runtime = crate::agent::engine::AgentRuntime::new(config, security);
 
             println!("Executing task: {task}\n");
-            let result = runtime.execute_task(&task, |evt| {
-                println!("{evt}");
-            }).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let result = runtime
+                .execute_task(&task, |evt| {
+                    println!("{evt}");
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             println!("\nFinal Response:\n{result}");
         }
@@ -141,7 +144,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Model { model, effort }) => {
             let config_path = PathBuf::from(".seavx/config.toml");
             let mut config = crate::agent::engine::AgentConfig::load(&PathBuf::from("."));
-            let base_url = config.base_url.clone().unwrap_or_else(|| "https://seavx.ai.id/v1/".to_string());
+            let base_url = config
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://seavx.ai.id/v1/".to_string());
             let model_mgr = crate::agent::models::ModelManager::new(&PathBuf::from("."));
 
             // 1. If explicit model name given
@@ -152,13 +158,19 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let toml_str = toml::to_string_pretty(&config)?;
                 std::fs::write(&config_path, toml_str)?;
-                println!("Updated .seavx/config.toml: model = {}, effort = {:?}", config.model, config.reasoning_effort);
+                println!(
+                    "Updated .seavx/config.toml: model = {}, effort = {:?}",
+                    config.model, config.reasoning_effort
+                );
                 return Ok(());
             }
 
             // 2. Interactive Selection from Cached / Remote Gateway Models
             println!("Loading available models for {base_url}...");
-            let available_models = match model_mgr.fetch_or_cache_models(&base_url, config.api_key.as_deref()).await {
+            let available_models = match model_mgr
+                .fetch_or_cache_models(&base_url, config.api_key.as_deref())
+                .await
+            {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("Failed to fetch remote models: {e}");
@@ -177,7 +189,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("  [{}] {}{}", idx + 1, m, mark);
             }
 
-            print!("\nSelect model number (or press Enter to keep '{}'): ", config.model);
+            print!(
+                "\nSelect model number (or press Enter to keep '{}'): ",
+                config.model
+            );
             use std::io::{self, Write};
             io::stdout().flush()?;
 
@@ -203,7 +218,10 @@ async fn main() -> anyhow::Result<()> {
             println!("  [6] Max");
 
             let current_effort = config.reasoning_effort.as_deref().unwrap_or("none");
-            print!("Select effort 1-6 (or press Enter to keep '{}'): ", current_effort);
+            print!(
+                "Select effort 1-6 (or press Enter to keep '{}'): ",
+                current_effort
+            );
             io::stdout().flush()?;
 
             let mut eff_input = String::new();
@@ -227,7 +245,10 @@ async fn main() -> anyhow::Result<()> {
             std::fs::write(&config_path, toml_str)?;
             println!("\nSuccessfully saved to .seavx/config.toml!");
             println!("  Model : {}", config.model);
-            println!("  Effort: {}", config.reasoning_effort.as_deref().unwrap_or("none"));
+            println!(
+                "  Effort: {}",
+                config.reasoning_effort.as_deref().unwrap_or("none")
+            );
         }
         Some(Commands::Memory) => {
             let memory_candidates = [

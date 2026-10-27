@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 use crate::tui::app::App;
@@ -23,9 +23,17 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // 1. Top Header Bar: 🏺 Seavx Agent
     let header_line = Line::from(vec![
-        Span::styled("🏺 Seavx", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "🏺 Seavx",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
-        Span::styled("Autonomous AI Coding Agent", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Autonomous AI Coding Agent",
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     frame.render_widget(Paragraph::new(header_line), chunks[0]);
 
@@ -54,7 +62,14 @@ pub fn render(app: &App, frame: &mut Frame) {
     };
 
     let divider = Line::from(vec![
-        Span::styled("─".repeat(chunks[2].width.saturating_sub(task_status_str.len() as u16 + 4) as usize), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "─".repeat(
+                chunks[2]
+                    .width
+                    .saturating_sub(task_status_str.len() as u16 + 4) as usize,
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw(" "),
         Span::styled(task_status_str, Style::default().fg(Color::Cyan)),
         Span::raw(" ─"),
@@ -69,7 +84,10 @@ pub fn render(app: &App, frame: &mut Frame) {
     let effort_label = config.reasoning_effort.as_deref().unwrap_or("none");
 
     // Dynamic model context window limit detection
-    let max_context_limit: i32 = if config.model.contains("claude") || config.model.contains("nemotron") || config.model.contains("gemini") {
+    let max_context_limit: i32 = if config.model.contains("claude")
+        || config.model.contains("nemotron")
+        || config.model.contains("gemini")
+    {
         1_000_000 // 1M context
     } else if config.model.contains("deepseek") || config.model.contains("glm") {
         128_000 // 128k context
@@ -86,7 +104,11 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     let filled_blocks = ((percentage / 10.0).round() as usize).min(10);
     let empty_blocks = 10usize.saturating_sub(filled_blocks);
-    let progress_bar = format!("[{}{}]", "█".repeat(filled_blocks), " ".repeat(empty_blocks));
+    let progress_bar = format!(
+        "[{}{}]",
+        "█".repeat(filled_blocks),
+        " ".repeat(empty_blocks)
+    );
 
     let token_display = if total >= 1_000 {
         format!("~{}k/{}M", total / 1_000, max_context_limit / 1_000_000)
@@ -96,15 +118,29 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     let bottom_status = Line::from(vec![
         Span::styled(" 🍸 ", Style::default().fg(Color::Cyan)),
-        Span::styled(&config.model, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            &config.model,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(token_display, Style::default().fg(Color::Yellow)),
         Span::styled(" ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{progress_bar} ~{:.0}%", percentage), Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("{progress_bar} ~{:.0}%", percentage),
+            Style::default().fg(Color::Green),
+        ),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("effort: {effort_label}"), Style::default().fg(Color::LightCyan)),
+        Span::styled(
+            format!("effort: {effort_label}"),
+            Style::default().fg(Color::LightCyan),
+        ),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled("⚡ Active", Style::default().fg(Color::Yellow)),
     ]);
-    frame.render_widget(Paragraph::new(bottom_status).style(Style::default().bg(Color::Rgb(20, 24, 34))), chunks[4]);
+    frame.render_widget(
+        Paragraph::new(bottom_status).style(Style::default().bg(Color::Rgb(20, 24, 34))),
+        chunks[4],
+    );
 }

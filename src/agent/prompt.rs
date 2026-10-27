@@ -23,7 +23,9 @@ pub fn load_system_prompt(workspace_root: &Path) -> String {
         workspace_root.join("SOUL.md"),
         workspace_root.join("src/systems/SOUL.md"),
     ];
-    let custom_soul = soul_candidates.into_iter().find(|p| p.exists())
+    let custom_soul = soul_candidates
+        .into_iter()
+        .find(|p| p.exists())
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_else(|| SOUL_PROMPT.to_string());
 
@@ -40,7 +42,10 @@ pub fn load_system_prompt(workspace_root: &Path) -> String {
     for memory_file in &memory_candidates {
         if memory_file.exists() {
             if let Ok(memory_content) = std::fs::read_to_string(memory_file) {
-                full_prompt.push_str(&format!("\n\n# PROJECT MEMORY ({})\n{memory_content}", memory_file.display()));
+                full_prompt.push_str(&format!(
+                    "\n\n# PROJECT MEMORY ({})\n{memory_content}",
+                    memory_file.display()
+                ));
                 break;
             }
         }

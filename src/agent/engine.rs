@@ -2,13 +2,13 @@ use crate::agent::prompt::load_system_prompt;
 use crate::agent::protocol::Message;
 use crate::agent::security::WorkspaceSecurity;
 use crate::agent::tools::ToolRegistry;
+use genai::Client;
 use genai::adapter::AdapterKind;
 use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort, ToolResponse};
 use genai::resolver::{AuthData, Endpoint};
-use genai::Client;
 
-use std::path::Path;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -98,11 +98,7 @@ impl AgentConfig {
             Some(local_config)
         } else if let Ok(home) = std::env::var("HOME") {
             let global = std::path::PathBuf::from(home).join(".seavx/config.toml");
-            if global.exists() {
-                Some(global)
-            } else {
-                None
-            }
+            if global.exists() { Some(global) } else { None }
         } else {
             None
         };
@@ -147,7 +143,10 @@ impl AgentRuntime {
     pub fn new(config: AgentConfig, security: WorkspaceSecurity) -> Self {
         let mut builder = Client::builder();
 
-        let auth_data = config.api_key.as_ref().map(|k| AuthData::from_single(k.clone()));
+        let auth_data = config
+            .api_key
+            .as_ref()
+            .map(|k| AuthData::from_single(k.clone()));
 
         if let Some(ref base_url) = config.base_url {
             let (normalized, adapters) = normalize_base_url(base_url);
@@ -156,7 +155,8 @@ impl AgentRuntime {
             let endpoint = Endpoint::from_owned(normalized);
             for adapter in adapters {
                 if let Some(ref auth) = auth_data {
-                    builder = builder.append_provider_config(adapter, (endpoint.clone(), auth.clone()));
+                    builder =
+                        builder.append_provider_config(adapter, (endpoint.clone(), auth.clone()));
                 } else {
                     builder = builder.append_provider_config(adapter, endpoint.clone());
                 }
@@ -165,7 +165,10 @@ impl AgentRuntime {
             // Custom gateway mapping: ensure unknown models map to OpenAI adapter instead of Ollama
             builder = builder.with_model_mapper_fn(|model_iden: genai::ModelIden| {
                 if model_iden.adapter_kind == AdapterKind::Ollama {
-                    Ok(genai::ModelIden::new(AdapterKind::OpenAI, model_iden.model_name))
+                    Ok(genai::ModelIden::new(
+                        AdapterKind::OpenAI,
+                        model_iden.model_name,
+                    ))
                 } else {
                     Ok(model_iden)
                 }
@@ -206,10 +209,7 @@ impl AgentRuntime {
             .append_message(ChatMessage::system(&system_prompt))
             .append_message(ChatMessage::user(task));
 
-        let mut history = vec![
-            Message::system(&system_prompt),
-            Message::user(task),
-        ];
+        let mut history = vec![Message::system(&system_prompt), Message::user(task)];
 
         tracing::info!(model = %self.config.model, "Starting Seavx agent task");
         event_sink("Starting agent reasoning...");
@@ -228,7 +228,13 @@ impl AgentRuntime {
             tracing::debug!(turn = turn, "Executing chat request");
 
             // Log full request payload to .seavx/request.log
-            Self::log_request_payload(&self.config.model, turn, &chat_req, &chat_options, self.security.root());
+            Self::log_request_payload(
+                &self.config.model,
+                turn,
+                &chat_req,
+                &chat_options,
+                self.security.root(),
+            );
 
             let response = self
                 .client
@@ -251,10 +257,7 @@ impl AgentRuntime {
 
             let tool_calls = response.tool_calls();
             if tool_calls.is_empty() {
-                let final_text = response
-                    .clone()
-                    .into_first_text()
-                    .unwrap_or_default();
+                let final_text = response.clone().into_first_text().unwrap_or_default();
 
                 let return_text = if !final_text.trim().is_empty() {
                     final_text
@@ -269,7 +272,8 @@ impl AgentRuntime {
 
                 // Auto-Skill Evaluation: If task was non-trivial (used tools across turns), distill into a skill
                 if turn >= 2 {
-                    self.auto_distill_skill(task, &history, &mut event_sink).await;
+                    self.auto_distill_skill(task, &history, &mut event_sink)
+                        .await;
                 }
 
                 return Ok(return_text);
@@ -333,11 +337,7 @@ impl AgentRuntime {
                 tracing::info!(tool = %tool_name, is_error = is_err, output = %result_str, "Agent tool completed");
 
                 // Emit preview snippet of tool output (first 3 lines or 150 chars)
-                let preview = result_str
-                    .lines()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let preview = result_str.lines().take(3).collect::<Vec<_>>().join("\n");
                 let truncated_preview = if result_str.lines().count() > 3 {
                     format!("{preview}\n  ... (truncated)")
                 } else {
@@ -347,9 +347,10 @@ impl AgentRuntime {
                 event_sink(&format!("Output:\n{truncated_preview}"));
 
                 history.push(Message::tool_result(&call.call_id, &result_str, is_err));
-                chat_req = chat_req.append_message(ChatMessage::from(
-                    ToolResponse::new(call.call_id.clone(), result_str),
-                ));
+                chat_req = chat_req.append_message(ChatMessage::from(ToolResponse::new(
+                    call.call_id.clone(),
+                    result_str,
+                )));
             }
         }
 
@@ -404,7 +405,8 @@ impl AgentRuntime {
                     None => {
                         let calls = msg.content.tool_calls();
                         if !calls.is_empty() {
-                            let names: Vec<String> = calls.iter().map(|c| c.fn_name.clone()).collect();
+                            let names: Vec<String> =
+                                calls.iter().map(|c| c.fn_name.clone()).collect();
                             format!("[ToolCalls: {}]", names.join(", "))
                         } else {
                             "[Multipart/Binary/ToolResponse]".to_string()
@@ -417,7 +419,11 @@ impl AgentRuntime {
             // List tool names concisely instead of thousands of JSON schema lines
             if let Some(ref tools) = chat_req.tools {
                 let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-                summary.push_str(&format!("  tools({}): {}\n", tools.len(), tool_names.join(", ")));
+                summary.push_str(&format!(
+                    "  tools({}): {}\n",
+                    tools.len(),
+                    tool_names.join(", ")
+                ));
             }
 
             summary.push('\n');
@@ -452,11 +458,20 @@ impl AgentRuntime {
                 let name = trimmed
                     .lines()
                     .find(|l| l.trim().starts_with("name:"))
-                    .map(|l| l.trim().trim_start_matches("name:").trim().trim_matches('"').trim_matches('\''))
+                    .map(|l| {
+                        l.trim()
+                            .trim_start_matches("name:")
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                    })
                     .unwrap_or("auto-workflow");
 
                 if let Ok(saved_path) = mgr.save_skill(name, trimmed) {
-                    event_sink(&format!("✨ High Singularity Skill Synthesized: {}", saved_path.display()));
+                    event_sink(&format!(
+                        "✨ High Singularity Skill Synthesized: {}",
+                        saved_path.display()
+                    ));
                     tracing::info!(skill = %name, "Automatically created high-confidence skill from workflow");
                 }
             } else {

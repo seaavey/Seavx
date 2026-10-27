@@ -42,10 +42,12 @@ impl SkillManager {
                 let skill_file = path.join("SKILL.md");
                 if skill_file.exists() {
                     if let Ok(content) = std::fs::read_to_string(&skill_file) {
-                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        let description = extract_description(&content).unwrap_or_else(|| {
-                            format!("Skill for {name}")
-                        });
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let description = extract_description(&content)
+                            .unwrap_or_else(|| format!("Skill for {name}"));
                         list.push(SkillMetadata {
                             name,
                             description,
@@ -61,7 +63,13 @@ impl SkillManager {
     pub fn save_skill(&self, name: &str, content: &str) -> Result<PathBuf, String> {
         let sanitized_name: String = name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect();
 
         if sanitized_name.is_empty() {
