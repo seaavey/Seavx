@@ -36,7 +36,10 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
         .await?;
 
     if !force && latest.version == CURRENT_VERSION {
-        println!("SEAVX is already up to date (v{}, {})", latest.version, latest.sha);
+        println!(
+            "SEAVX is already up to date (v{}, {})",
+            latest.version, latest.sha
+        );
         return Ok(());
     }
 
