@@ -224,25 +224,13 @@ impl<'a> App<'a> {
     }
 
     /// Switch modes only when no task is running. Returns whether the mode changed.
+    /// The header and footer already show the active mode, so switching stays silent.
     pub fn set_mode(&mut self, mode: AgentMode) -> bool {
-        if self.status != AgentState::Idle {
-            self.push_mode_notice("Agent is busy, try again when it is idle.");
-            return false;
-        }
-
-        if self.mode == mode {
-            self.push_mode_notice(match mode {
-                AgentMode::Build => "Build mode is already active.",
-                AgentMode::Plan => "Plan mode is already active.",
-            });
+        if self.status != AgentState::Idle || self.mode == mode {
             return false;
         }
 
         self.mode = mode;
-        self.push_mode_notice(match mode {
-            AgentMode::Build => "Build mode on — all tools enabled.",
-            AgentMode::Plan => "Plan mode on — write tools disabled.",
-        });
         true
     }
 
@@ -1311,11 +1299,16 @@ mod tests {
         app.status = AgentState::Streaming;
         assert!(apply_plan_command(&mut app, "/plan"));
         assert_eq!(app.mode, AgentMode::Build);
-        assert!(
-            app.segments
-                .iter()
-                .any(|segment| format!("{segment:?}").contains("Agent is busy"))
-        );
+        assert!(app.segments.is_empty());
+    }
+
+    #[test]
+    fn switching_modes_does_not_write_to_the_transcript() {
+        let mut app = App::new();
+        app.toggle_mode();
+        app.toggle_mode();
+        assert_eq!(app.mode, AgentMode::Build);
+        assert!(app.segments.is_empty());
     }
 
     #[test]
