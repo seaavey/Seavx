@@ -9,9 +9,15 @@
 
 ## ⚡ Quick Start
 
-### 1. One-Line Install
+### 1. One-Line Install (Linux / macOS)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/seaavey/Seavx/master/install.sh | bash
+```
+
+### 1b. Windows
+Download `seavx-windows-x86_64.exe` from the [latest release](https://github.com/seaavey/Seavx/releases/latest), rename it to `seavx.exe`, and put it on your `PATH`. Building from source works too:
+```powershell
+cargo install --path .
 ```
 
 ### 2. Run Interactive Agent

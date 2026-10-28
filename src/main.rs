@@ -1,5 +1,6 @@
 pub mod agent;
 mod cli;
+mod home;
 mod tui;
 
 use clap::{Parser, Subcommand};

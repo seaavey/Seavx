@@ -14,9 +14,9 @@ pub struct SkillManager {
 impl SkillManager {
     pub fn new(workspace_root: &Path) -> Self {
         let mut roots = vec![workspace_root.join(".seavx/skills")];
-        if let Ok(home) = std::env::var("HOME") {
-            roots.push(PathBuf::from(&home).join(".seavx/skills"));
-            roots.push(PathBuf::from(home).join(".agents/skills"));
+        if let Some(home) = crate::home::dir() {
+            roots.push(home.join(".seavx/skills"));
+            roots.push(home.join(".agents/skills"));
         }
         Self { roots }
     }

@@ -58,9 +58,9 @@ pub fn load_system_prompt(workspace_root: &Path) -> String {
     ];
     let mut user_path = user_candidates.into_iter().find(|p| p.exists());
     if user_path.is_none()
-        && let Ok(home) = std::env::var("HOME")
+        && let Some(home) = crate::home::dir()
     {
-        let global_user = Path::new(&home).join(".seavx/USER.md");
+        let global_user = home.join(".seavx/USER.md");
         if global_user.exists() {
             user_path = Some(global_user);
         }
