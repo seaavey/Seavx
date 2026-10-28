@@ -1,13 +1,10 @@
 //! `seavx uninstall`: remove the binary after asking whether `~/.seavx` data goes too.
 
 use super::prompt;
-use std::path::PathBuf;
 
 pub fn run() -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let data_dir = std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".seavx"));
+    let data_dir = crate::home::dir().map(|home| home.join(".seavx"));
 
     let data_label = match &data_dir {
         Some(dir) if dir.exists() => dir.display().to_string(),
@@ -33,12 +30,24 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     // Binary first: if it is not removable (e.g. root-owned), no data has been lost yet.
+    #[cfg(not(windows))]
     std::fs::remove_file(&exe).map_err(|e| {
         anyhow::anyhow!(
             "Failed to remove {}: {e}. Re-run with sufficient permissions.",
             exe.display()
         )
     })?;
+
+    // Windows refuses to delete a running exe, so it is renamed aside; the leftover is inert.
+    #[cfg(windows)]
+    {
+        let leftover = exe.with_extension("old");
+        let _ = std::fs::remove_file(&leftover);
+        std::fs::rename(&exe, &leftover)
+            .map_err(|e| anyhow::anyhow!("Failed to remove {}: {e}", exe.display()))?;
+        println!("Moved {} aside to {}", exe.display(), leftover.display());
+        println!("Delete that leftover file once this window closes.");
+    }
     println!("Removed {}", exe.display());
 
     if all

@@ -23,11 +23,11 @@ pub fn run() -> anyhow::Result<()> {
         println!("No MEMORY.md found in current workspace.");
     }
 
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = crate::home::dir() {
         let user_candidates = [
             PathBuf::from(".seavx/USER.md"),
             PathBuf::from("USER.md"),
-            PathBuf::from(home).join(".seavx/USER.md"),
+            home.join(".seavx/USER.md"),
         ];
         for u in &user_candidates {
             if u.exists() {

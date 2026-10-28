@@ -102,8 +102,8 @@ impl AgentConfig {
         let local_config = workspace_root.join(".seavx/config.toml");
         let path = if local_config.exists() {
             Some(local_config)
-        } else if let Ok(home) = std::env::var("HOME") {
-            let global = std::path::PathBuf::from(home).join(".seavx/config.toml");
+        } else if let Some(home) = crate::home::dir() {
+            let global = home.join(".seavx/config.toml");
             if global.exists() { Some(global) } else { None }
         } else {
             None

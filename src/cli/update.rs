@@ -46,6 +46,7 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     // Determine target binary name
     let target_asset_name = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "seavx-linux-x86_64",
+        ("windows", "x86_64") => "seavx-windows-x86_64.exe",
         (os, arch) => {
             anyhow::bail!(
                 "Unsupported platform for binary self-update: {os}-{arch}. Please update via cargo install or build from source."
@@ -124,7 +125,7 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     }
 
     // Atomically replace current executable
-    if let Err(e) = std::fs::rename(&temp_path, &current_exe) {
+    if let Err(e) = replace_exe(&temp_path, &current_exe) {
         let _ = tokio::fs::remove_file(&temp_path).await;
         anyhow::bail!(
             "Failed to replace binary at {}: {e}. You may need elevated permissions (e.g. sudo).",
@@ -140,4 +141,23 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// Windows cannot overwrite a running exe, so the old one is moved aside first and kept
+/// as `<name>.old` until the next update clears it.
+fn replace_exe(temp: &std::path::Path, exe: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    return std::fs::rename(temp, exe);
+
+    #[cfg(windows)]
+    {
+        let old = exe.with_extension("old");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(exe, &old)?;
+        if let Err(e) = std::fs::rename(temp, exe) {
+            let _ = std::fs::rename(&old, exe);
+            return Err(e);
+        }
+        Ok(())
+    }
 }

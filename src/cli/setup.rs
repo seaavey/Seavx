@@ -26,9 +26,9 @@ fn screen(config_path: &std::path::Path, rows: &[(&str, String)]) {
 pub async fn providers() -> anyhow::Result<()> {
     use std::io::{self, Write};
 
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow::anyhow!("HOME is not set, cannot locate config"))?;
-    let config_path = std::path::PathBuf::from(home).join(".seavx/config.toml");
+    let home = crate::home::dir()
+        .ok_or_else(|| anyhow::anyhow!("home directory is not set, cannot locate config"))?;
+    let config_path = home.join(".seavx/config.toml");
 
     // A malformed file is replaced, matching AgentConfig::load's fallback to defaults.
     let mut config: crate::agent::engine::AgentConfig = std::fs::read_to_string(&config_path)

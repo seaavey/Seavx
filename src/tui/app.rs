@@ -141,8 +141,10 @@ impl<'a> App<'a> {
             workspace: std::env::current_dir()
                 .map(|p| {
                     let path = p.to_string_lossy().to_string();
-                    match std::env::var("HOME") {
-                        Ok(home) if path.starts_with(&home) => path.replacen(&home, "~", 1),
+                    match crate::home::dir() {
+                        Some(home) if path.starts_with(home.to_string_lossy().as_ref()) => {
+                            path.replacen(home.to_string_lossy().as_ref(), "~", 1)
+                        }
                         _ => path,
                     }
                 })

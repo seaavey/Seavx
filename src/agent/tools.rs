@@ -235,8 +235,21 @@ impl AgentTool for RunCommandTool {
             }
         }
 
-        let cmd = tokio::process::Command::new("sh")
-            .arg("-c")
+        // Windows has no `sh`; `cmd /C` runs the same command through the system shell.
+        #[cfg(windows)]
+        let mut shell = {
+            let mut cmd = tokio::process::Command::new("cmd");
+            cmd.arg("/C");
+            cmd
+        };
+        #[cfg(not(windows))]
+        let mut shell = {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c");
+            cmd
+        };
+
+        let cmd = shell
             .arg(&parsed.command)
             .current_dir(security.root())
             .output();
@@ -457,8 +470,8 @@ impl AgentTool for SaveMemoryTool {
                 seavx_dir.join("USER.md")
             } else {
                 let home =
-                    std::env::var("HOME").map_err(|_| "HOME directory not set".to_string())?;
-                let dir = std::path::PathBuf::from(home).join(".seavx");
+                    crate::home::dir().ok_or_else(|| "home directory not set".to_string())?;
+                let dir = home.join(".seavx");
                 let _ = tokio::fs::create_dir_all(&dir).await;
                 dir.join("USER.md")
             }
