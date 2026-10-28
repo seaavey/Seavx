@@ -309,12 +309,15 @@ pub async fn run_agent_worker(
             let title_prompt = prompt.clone();
             let client_clone = runtime.client().clone();
             let model_name = config.model.clone();
+            let title_options = runtime.chat_options();
             tokio::spawn(async move {
                 let req = genai::chat::ChatRequest::from_user(format!(
                     "Generate a very short 3-5 word concise title for this task without punctuation or quotes:\n{}",
                     title_prompt
                 ));
-                if let Ok(res) = client_clone.exec_chat(&model_name, req, None).await
+                if let Ok(res) = client_clone
+                    .exec_chat(&model_name, req, Some(&title_options))
+                    .await
                     && let Some(text) = res.into_first_text()
                 {
                     let clean = text.trim().trim_matches('"').trim_matches('\'').to_string();
@@ -343,6 +346,8 @@ pub async fn run_agent_worker(
                     let _ = tx_clone.send(Action::AgentToolStart(tool_label.to_string()));
                 } else if let Some(thoughts) = evt.strip_prefix("THINKING:") {
                     let _ = tx_clone.send(Action::AgentThinking(thoughts.to_string()));
+                } else if let Some(note) = evt.strip_prefix("System: ") {
+                    let _ = tx_clone.send(Action::AgentToken(format!("\n  {note}\n")));
                 }
             })
             .await;
@@ -587,7 +592,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                         .config
                                         .base_url
                                         .as_deref()
-                                        .unwrap_or("https://seavx.ai.id/v1/");
+                                        .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
                                     let model_mgr = crate::agent::models::ModelManager::new(
                                         std::path::Path::new("."),
                                     );
@@ -808,7 +813,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                         .config
                                         .base_url
                                         .as_deref()
-                                        .unwrap_or("https://seavx.ai.id/v1/");
+                                        .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
                                     let model_mgr = crate::agent::models::ModelManager::new(
                                         std::path::Path::new("."),
                                     );
@@ -918,7 +923,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                         .config
                                         .base_url
                                         .as_deref()
-                                        .unwrap_or("https://seavx.ai.id/v1/");
+                                        .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
                                     let model_mgr = crate::agent::models::ModelManager::new(
                                         std::path::Path::new("."),
                                     );

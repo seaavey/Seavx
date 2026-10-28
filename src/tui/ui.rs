@@ -491,12 +491,37 @@ fn build_transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
-                lines.extend(text.lines().map(|line| {
-                    Line::from(Span::styled(
-                        format!("  │ {line}"),
-                        Style::default().fg(Color::DarkGray),
-                    ))
-                }));
+                let prefix = "  │ ";
+                let content_width = (width as usize).saturating_sub(prefix.len()).max(10);
+                for raw_line in text.lines() {
+                    let mut current = String::new();
+                    let mut current_len = 0;
+                    for word in raw_line.split_whitespace() {
+                        let word_len = unicode_width::UnicodeWidthStr::width(word);
+                        if current.is_empty() {
+                            current.push_str(word);
+                            current_len = word_len;
+                        } else if current_len + 1 + word_len <= content_width {
+                            current.push(' ');
+                            current.push_str(word);
+                            current_len += 1 + word_len;
+                        } else {
+                            lines.push(Line::from(Span::styled(
+                                format!("{prefix}{current}"),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                            current.clear();
+                            current.push_str(word);
+                            current_len = word_len;
+                        }
+                    }
+                    if !current.is_empty() || raw_line.trim().is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            format!("{prefix}{current}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
             }
         }
     }
@@ -685,6 +710,23 @@ mod tests {
         );
         let answer_y = (0..24).find(|y| row(*y).starts_with("Done.")).unwrap();
         assert!(answer_y > thinking_y, "reasoning sits above the answer");
+    }
+
+    #[test]
+    fn reasoning_wraps_long_lines_with_aligned_prefix() {
+        let mut app = App::new();
+        app.push_thinking("This is a very long reasoning text that will exceed forty columns easily and must wrap nicely.");
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let row = |y: u16| -> String { (0..40).map(|x| buffer[(x, y)].symbol()).collect() };
+        let thinking_y = (0..24)
+            .find(|y| row(*y).contains("thinking"))
+            .expect("thinking header");
+        assert!(row(thinking_y + 1).starts_with("  │ This is a very"));
+        assert!(row(thinking_y + 2).starts_with("  │ "));
+        assert!(!row(thinking_y + 2).starts_with("  │   "));
     }
 
     #[test]

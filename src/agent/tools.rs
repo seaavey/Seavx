@@ -508,18 +508,27 @@ impl AgentTool for SaveMemoryTool {
     }
 }
 
-// 8. read_skill
+fn find_skill_file(security: &WorkspaceSecurity, name: &str) -> Result<std::path::PathBuf, String> {
+    crate::agent::skills::SkillManager::new(security.root())
+        .list_skills()
+        .into_iter()
+        .find(|s| s.name == name)
+        .map(|s| s.path)
+        .ok_or_else(|| format!("Skill '{name}' not found"))
+}
+
+// 8. skill_view
 #[derive(Deserialize, JsonSchema)]
-struct ReadSkillArgs {
+struct SkillViewArgs {
     name: String,
 }
 
-pub struct ReadSkillTool;
+pub struct SkillViewTool;
 
 #[async_trait]
-impl AgentTool for ReadSkillTool {
+impl AgentTool for SkillViewTool {
     fn name(&self) -> &'static str {
-        "read_skill"
+        "skill_view"
     }
 
     fn description(&self) -> &'static str {
@@ -527,22 +536,104 @@ impl AgentTool for ReadSkillTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(ReadSkillArgs)).unwrap_or_default()
+        serde_json::to_value(schema_for!(SkillViewArgs)).unwrap_or_default()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: ReadSkillArgs =
+        let parsed: SkillViewArgs =
             serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let path = find_skill_file(security, &parsed.name)?;
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| format!("Failed to read skill: {e}"))
+    }
+}
 
-        let mgr = crate::agent::skills::SkillManager::new(security.root());
-        let skills = mgr.list_skills();
-        if let Some(target) = skills.iter().find(|s| s.name == parsed.name) {
-            tokio::fs::read_to_string(&target.path)
-                .await
-                .map_err(|e| format!("Failed to read skill: {e}"))
-        } else {
-            Err(format!("Skill '{}' not found", parsed.name))
+// 9. skill_write
+#[derive(Deserialize, JsonSchema)]
+struct SkillWriteArgs {
+    name: String,
+    content: String,
+}
+
+pub struct SkillWriteTool;
+
+#[async_trait]
+impl AgentTool for SkillWriteTool {
+    fn name(&self) -> &'static str {
+        "skill_write"
+    }
+
+    fn description(&self) -> &'static str {
+        "Create a new skill or overwrite an existing skill's SKILL.md with full content"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::to_value(schema_for!(SkillWriteArgs)).unwrap_or_default()
+    }
+
+    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+        let parsed: SkillWriteArgs =
+            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        if parsed.content.trim().is_empty() {
+            return Err("Skill content cannot be empty".to_string());
         }
+
+        // Overwrite in place when the skill already exists (could live in a shared skills root).
+        if let Ok(path) = find_skill_file(security, &parsed.name) {
+            tokio::fs::write(&path, parsed.content)
+                .await
+                .map_err(|e| format!("Failed to write skill: {e}"))?;
+            return Ok(format!("Successfully updated {}", path.display()));
+        }
+
+        let path = crate::agent::skills::SkillManager::new(security.root())
+            .save_skill(&parsed.name, &parsed.content)?;
+        Ok(format!("Successfully created {}", path.display()))
+    }
+}
+
+// 10. skill_patch
+#[derive(Deserialize, JsonSchema)]
+struct SkillPatchArgs {
+    name: String,
+    old_string: String,
+    new_string: String,
+}
+
+pub struct SkillPatchTool;
+
+#[async_trait]
+impl AgentTool for SkillPatchTool {
+    fn name(&self) -> &'static str {
+        "skill_patch"
+    }
+
+    fn description(&self) -> &'static str {
+        "Replace an exact snippet with new text inside an existing skill's SKILL.md"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::to_value(schema_for!(SkillPatchArgs)).unwrap_or_default()
+    }
+
+    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+        let parsed: SkillPatchArgs =
+            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let path = find_skill_file(security, &parsed.name)?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("Failed to read skill: {e}"))?;
+
+        if !content.contains(&parsed.old_string) {
+            return Err("Target old_string not found in skill".to_string());
+        }
+
+        let updated = content.replacen(&parsed.old_string, &parsed.new_string, 1);
+        tokio::fs::write(&path, updated)
+            .await
+            .map_err(|e| format!("Failed to save skill patch: {e}"))?;
+        Ok(format!("Successfully patched {}", parsed.name))
     }
 }
 
@@ -565,7 +656,9 @@ impl ToolRegistry {
         registry.register(Arc::new(RunCommandTool));
         registry.register(Arc::new(SearchFilesTool));
         registry.register(Arc::new(SaveMemoryTool));
-        registry.register(Arc::new(ReadSkillTool));
+        registry.register(Arc::new(SkillViewTool));
+        registry.register(Arc::new(SkillWriteTool));
+        registry.register(Arc::new(SkillPatchTool));
         registry
     }
 
