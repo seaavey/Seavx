@@ -20,6 +20,14 @@ Download `seavx-windows-x86_64.exe` from the [latest release](https://github.com
 cargo install --path .
 ```
 
+### 1c. Prebuilt builds (sha-tagged)
+Every push to master publishes artifacts named after its commit and mirrors them to the CDN:
+```bash
+curl -sI https://cdn.seavx.com/latest/linux/x86_64   # 302 → newest linux build
+curl -sIL https://cdn.seavx.com/latest/windows/x86_64
+curl -O https://cdn.seavx.com/builds/<sha>/seavx-linux-x86_64
+```
+
 ### 2. Run Interactive Agent
 ```bash
 seavx

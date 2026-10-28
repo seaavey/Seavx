@@ -50,22 +50,30 @@ jobs:
       - name: Cargo check
         run: cargo check --all-targets
 
-  build-and-release:
-    name: Build & Release Binary
+  build:
+    name: Build (${{ matrix.os_name }})
     needs: [check-and-test, check-windows]
-    if: startsWith(github.ref, 'refs/tags/')
+    # Every push to master produces a downloadable build; PRs only run the checks.
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    env:
+      # Non-secret flag: lets a step test for R2 credentials without exposing them.
+      HAS_R2: ${{ secrets.R2_ACCESS_KEY_ID != '' }}
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            os_name: linux
+            platform: linux-x86_64
             exe: seavx
             binary_name: seavx-linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            os_name: windows
+            platform: windows-x86_64
             exe: seavx.exe
             binary_name: seavx-windows-x86_64.exe
     steps:
@@ -84,13 +92,53 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Compute short sha
+        shell: bash
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
       - name: Package binary
         shell: bash
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.exe }} dist/${{ matrix.binary_name }}
+          mkdir -p dist pointer
+          cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "dist/${{ matrix.binary_name }}"
+          # The sha-suffixed copy is the immutable record; the plain name stays the "latest" alias.
+          cp "dist/${{ matrix.binary_name }}" "dist/${{ matrix.binary_name }}-$SHORT_SHA"
 
-      - name: Upload Release Artifact
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seavx-${{ matrix.os_name }}-${{ env.SHORT_SHA }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Mirror to R2
+        if: env.HAS_R2 == 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          key="builds/$SHORT_SHA/${{ matrix.binary_name }}"
+
+          aws s3 cp "dist/${{ matrix.binary_name }}" "s3://seavx/$key" \
+            --endpoint-url "$endpoint" \
+            --content-type application/octet-stream
+
+          # Pointer the worker's /latest/ route resolves; short cache, the target is immutable.
+          printf '{"sha":"%s","key":"%s","built_at":"%s"}\n' \
+            "$SHORT_SHA" "$key" "$(date -u +%FT%TZ)" > "pointer/latest-${{ matrix.platform }}.json"
+          aws s3 cp "pointer/latest-${{ matrix.platform }}.json" \
+            "s3://seavx/latest-${{ matrix.platform }}.json" \
+            --endpoint-url "$endpoint" \
+            --content-type application/json \
+            --cache-control "public, max-age=60"
+
+      - name: Upload Release Assets
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
