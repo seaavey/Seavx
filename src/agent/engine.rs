@@ -1,4 +1,4 @@
-use crate::agent::prompt::load_system_prompt;
+use crate::agent::prompt::{PLAN_POLICY, load_system_prompt};
 use crate::agent::protocol::Message;
 use crate::agent::security::WorkspaceSecurity;
 use crate::agent::tools::ToolRegistry;
@@ -12,6 +12,37 @@ use std::path::Path;
 
 /// Minimum evaluator confidence before an auto-distilled workflow is persisted as a skill.
 pub const SKILL_CONFIDENCE_THRESHOLD: u8 = 75;
+
+/// Runtime operating mode. Ephemeral: never persisted in `AgentConfig`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentMode {
+    #[default]
+    Build,
+    Plan,
+}
+
+impl AgentMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// A completed task is only a skill candidate in Build Mode.
+pub(crate) fn should_auto_distill(mode: AgentMode, step_count: usize) -> bool {
+    mode == AgentMode::Build && step_count >= 2
+}
+
+/// Append the read-only planning policy after the base prompt has been resolved.
+pub(crate) fn with_mode_policy(mut prompt: String, mode: AgentMode) -> String {
+    if mode == AgentMode::Plan {
+        prompt.push_str("\n\n");
+        prompt.push_str(PLAN_POLICY);
+    }
+    prompt
+}
 
 /// Endpoint used when the config does not set `base_url`.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
@@ -226,6 +257,7 @@ impl AgentRuntime {
     pub async fn execute_task(
         &self,
         task: &str,
+        mode: AgentMode,
         mut event_sink: impl FnMut(&str) + Send,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let system_prompt = self
@@ -234,8 +266,10 @@ impl AgentRuntime {
             .clone()
             .unwrap_or_else(|| load_system_prompt(self.security.root()));
 
+        let system_prompt = with_mode_policy(system_prompt, mode);
+
         let mut chat_req = ChatRequest::default()
-            .with_tools(self.registry.to_genai_tools())
+            .with_tools(self.registry.to_genai_tools(mode))
             .append_message(ChatMessage::system(&system_prompt))
             .append_message(ChatMessage::user(task));
 
@@ -295,7 +329,7 @@ impl AgentRuntime {
 
                 // Auto-Skill Evaluation: a completed task that ran at least two tools is a
                 // candidate workflow (a single call is not), regardless of how many turns it took.
-                if steps.len() >= 2 {
+                if should_auto_distill(mode, steps.len()) {
                     self.auto_distill_skill(task, &steps, &mut event_sink).await;
                 }
 
@@ -350,14 +384,15 @@ impl AgentRuntime {
                 tracing::info!(tool = %tool_name, args = %args_summary, id = %call.call_id, "Executing agent tool");
                 steps.push(format!("{tool_name}({args_summary})"));
 
-                let (result_str, is_err) = if let Some(tool) = self.registry.get(tool_name) {
-                    let args = call.fn_arguments.clone();
-                    match tool.execute(args, &self.security).await {
-                        Ok(res) => (res, false),
-                        Err(err) => (format!("Error executing {tool_name}: {err}"), true),
+                let (result_str, is_err) = match self.registry.get_for_mode(tool_name, mode) {
+                    Ok(tool) => {
+                        let args = call.fn_arguments.clone();
+                        match tool.execute(args, &self.security).await {
+                            Ok(res) => (res, false),
+                            Err(err) => (format!("Error executing {tool_name}: {err}"), true),
+                        }
                     }
-                } else {
-                    (format!("Tool '{tool_name}' not found"), true)
+                    Err(err) => (format!("Error executing {tool_name}: {err}"), true),
                 };
 
                 tracing::info!(tool = %tool_name, is_error = is_err, output = %result_str, "Agent tool completed");
@@ -573,4 +608,24 @@ pub(crate) fn parse_confidence(skill_md: &str) -> Option<u8> {
             .parse()
             .ok()
     })
+}
+
+#[cfg(test)]
+mod mode_policy_tests {
+    use super::*;
+    use crate::agent::prompt::PLAN_POLICY;
+
+    #[test]
+    fn build_mode_leaves_the_prompt_unchanged() {
+        let prompt = "base prompt".to_string();
+        assert_eq!(with_mode_policy(prompt.clone(), AgentMode::Build), prompt);
+    }
+
+    #[test]
+    fn plan_mode_appends_the_policy() {
+        let prompt = with_mode_policy("base prompt".to_string(), AgentMode::Plan);
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("# PLAN MODE ACTIVE"));
+        assert!(prompt.contains(PLAN_POLICY));
+    }
 }

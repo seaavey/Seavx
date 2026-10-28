@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod test_cases {
+    use crate::agent::engine::AgentMode;
     use crate::agent::protocol::Message;
     use crate::agent::security::WorkspaceSecurity;
     use crate::agent::tools::ToolRegistry;
@@ -246,5 +247,86 @@ mod test_cases {
         assert!(missing.is_err());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn tool_names(mode: AgentMode) -> Vec<String> {
+        let registry = ToolRegistry::with_default_tools();
+        let mut names: Vec<String> = registry
+            .to_genai_tools(mode)
+            .iter()
+            .map(|tool| tool.name.as_str().to_string())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn plan_mode_exports_only_read_only_tools() {
+        assert_eq!(
+            tool_names(AgentMode::Plan),
+            vec![
+                "list_directory".to_string(),
+                "read_file".to_string(),
+                "search_files".to_string(),
+                "skill_view".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_mode_exports_every_tool() {
+        let names = tool_names(AgentMode::Build);
+        assert_eq!(names.len(), 10, "{names:?}");
+        for expected in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_directory",
+            "run_command",
+            "search_files",
+            "save_memory",
+            "skill_view",
+            "skill_write",
+            "skill_patch",
+        ] {
+            assert!(
+                names.iter().any(|name| name.as_str() == expected),
+                "missing {expected} in {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_mode_rejects_mutation_tools_at_execution_time() {
+        let registry = ToolRegistry::with_default_tools();
+        for name in [
+            "write_file",
+            "edit_file",
+            "save_memory",
+            "skill_write",
+            "skill_patch",
+            "run_command",
+        ] {
+            let err = registry
+                .get_for_mode(name, AgentMode::Plan)
+                .err()
+                .unwrap_or_else(|| panic!("{name} should be blocked"));
+            assert!(err.contains("disabled in Plan Mode"), "{err}");
+        }
+
+        assert!(registry.get_for_mode("read_file", AgentMode::Plan).is_ok());
+        assert!(
+            registry
+                .get_for_mode("run_command", AgentMode::Build)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn auto_distill_is_disabled_in_plan_mode() {
+        use crate::agent::engine::should_auto_distill;
+        assert!(!should_auto_distill(AgentMode::Plan, 5));
+        assert!(!should_auto_distill(AgentMode::Build, 1));
+        assert!(should_auto_distill(AgentMode::Build, 2));
     }
 }

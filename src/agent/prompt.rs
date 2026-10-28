@@ -8,6 +8,20 @@ pub const SECURITY_POLICY: &str = include_str!("../systems/security.md");
 pub const TOOLS_POLICY: &str = include_str!("../systems/tools.md");
 pub const SKILLS_POLICY: &str = include_str!("../systems/skills.md");
 
+pub const PLAN_POLICY: &str = r#"# PLAN MODE ACTIVE
+
+You are in read-only planning mode. File modification tools and command execution are unavailable.
+Use only read-only tools to inspect the codebase. Do not claim that files were changed.
+Do not ask to switch modes; the user controls the mode.
+
+Produce a final plan with:
+
+1. Context & Architecture — files involved and current behavior
+2. Proposed Changes — exact file targets and functions to modify or add
+3. Step-by-Step Implementation — ordered, independently verifiable steps
+4. Verification — exact tests, lints, and manual checks
+5. Risks & Trade-offs"#;
+
 pub fn load_system_prompt(workspace_root: &Path) -> String {
     let workspace_systems = workspace_root.join("src/systems/systems.md");
     let base_prompt = if workspace_systems.exists() {
