@@ -39,3 +39,4 @@ confidence: 85%
 - No generic AI commentary or filler ("antislop" standards).
 - State clear inputs, step-by-step commands, expected outputs, and known pitfalls/failure recovery.
 - Do not include credentials, secrets, or environment-specific hardcoded paths.
+- Author skills with `skill_write` (new skill, or full rewrite) and `skill_patch` (exact snippet fix).

@@ -10,6 +10,12 @@ use genai::resolver::{AuthData, Endpoint};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Minimum evaluator confidence before an auto-distilled workflow is persisted as a skill.
+pub const SKILL_CONFIDENCE_THRESHOLD: u8 = 75;
+
+/// Endpoint used when the config does not set `base_url`.
+pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub model: String,
@@ -32,7 +38,7 @@ impl Default for AgentConfig {
         let reasoning_effort = std::env::var("SEAVX_REASONING_EFFORT").ok();
         Self {
             model,
-            max_turns: 20,
+            max_turns: 1000,
             base_url,
             api_key,
             reasoning_effort,
@@ -196,6 +202,27 @@ impl AgentRuntime {
         &self.client
     }
 
+    /// Options for every request. Effort is always sent explicitly: with no effort in the
+    /// options genai strips a `-high`/`-low` suffix off the model name, and gateways reject
+    /// the trimmed id (`model_not_allowed`).
+    pub fn chat_options(&self) -> ChatOptions {
+        let effort = self
+            .config
+            .reasoning_effort
+            .as_deref()
+            .and_then(parse_reasoning_effort)
+            .or_else(|| ReasoningEffort::from_model_name(&self.config.model).0);
+
+        let options = ChatOptions::default()
+            .with_capture_reasoning_content(true)
+            .with_normalize_reasoning_content(true);
+
+        match effort {
+            Some(effort) => options.with_reasoning_effort(effort),
+            None => options,
+        }
+    }
+
     pub async fn execute_task(
         &self,
         task: &str,
@@ -216,18 +243,11 @@ impl AgentRuntime {
 
         tracing::info!(model = %self.config.model, "Starting Seavx agent task");
 
-        let mut chat_options = ChatOptions::default()
-            .with_capture_reasoning_content(true)
-            .with_normalize_reasoning_content(true);
+        let chat_options = self.chat_options();
 
-        if let Some(effort) = self
-            .config
-            .reasoning_effort
-            .as_deref()
-            .and_then(parse_reasoning_effort)
-        {
-            chat_options = chat_options.with_reasoning_effort(effort);
-        }
+        // Tool steps of this run, fed to the post-task skill evaluator: the model
+        // cannot judge repeatability from the task text alone.
+        let mut steps: Vec<String> = Vec::new();
 
         for turn in 0..self.config.max_turns {
             tracing::debug!(turn = turn, "Executing chat request");
@@ -273,10 +293,10 @@ impl AgentRuntime {
                 history.push(Message::assistant_text(&return_text));
                 tracing::info!(turns = turn + 1, final_output = %return_text, "Agent completed task");
 
-                // Auto-Skill Evaluation: If task was non-trivial (used tools across turns), distill into a skill
-                if turn >= 2 {
-                    self.auto_distill_skill(task, &history, &mut event_sink)
-                        .await;
+                // Auto-Skill Evaluation: a completed task that ran at least two tools is a
+                // candidate workflow (a single call is not), regardless of how many turns it took.
+                if steps.len() >= 2 {
+                    self.auto_distill_skill(task, &steps, &mut event_sink).await;
                 }
 
                 return Ok(return_text);
@@ -328,6 +348,7 @@ impl AgentRuntime {
 
                 event_sink(&format!("Tool: {tool_name}({args_summary})"));
                 tracing::info!(tool = %tool_name, args = %args_summary, id = %call.call_id, "Executing agent tool");
+                steps.push(format!("{tool_name}({args_summary})"));
 
                 let (result_str, is_err) = if let Some(tool) = self.registry.get(tool_name) {
                     let args = call.fn_arguments.clone();
@@ -359,7 +380,27 @@ impl AgentRuntime {
             }
         }
 
-        Err("Maximum turn budget reached without resolution".into())
+        // Final turn: force the model to provide a response without calling tools
+        tracing::warn!("Turn budget exhausted, requesting final summary response");
+        let final_prompt = "You have reached the maximum allowed tool iterations. Please summarize what you have accomplished, what is left, and provide your final response to the user now without calling any more tools.";
+        let forced_req = chat_req
+            .with_tools(Vec::<genai::chat::Tool>::new())
+            .append_message(ChatMessage::user(final_prompt));
+
+        let response = self
+            .client
+            .exec_chat(&self.config.model, forced_req, Some(&chat_options))
+            .await?;
+
+        let final_text = response.into_first_text().unwrap_or_default();
+        if !final_text.trim().is_empty() {
+            Ok(final_text)
+        } else {
+            Ok(
+                "Turn budget reached. Work partially completed without a final response."
+                    .to_string(),
+            )
+        }
     }
 
     fn log_request_payload(
@@ -439,49 +480,97 @@ impl AgentRuntime {
     async fn auto_distill_skill(
         &self,
         task: &str,
-        history: &[Message],
+        steps: &[String],
         event_sink: &mut (impl FnMut(&str) + Send),
     ) {
-        event_sink("Evaluating workflow singularity for automatic skill synthesis...");
+        event_sink("System: evaluating workflow for automatic skill synthesis...");
+        let trace = steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}. {s}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
         let prompt = format!(
-            "Analyze this completed task execution:\nTask: {}\nTotal steps: {}\n\n\
+            "Analyze this completed task execution:\nTask: {}\nSteps:\n{}\n\n\
             Task Criteria for Skill Singularity:\n\
             1. Rate repeatability & engineering value as a confidence percentage (0-100%).\n\
-            2. If confidence >= 75%, output a valid SKILL.md with frontmatter (name, description, confidence: <percentage>%) and concise steps.\n\
-            3. If confidence < 75%, output ONLY: NONE",
-            task,
-            history.len()
+            2. If confidence >= {SKILL_CONFIDENCE_THRESHOLD}%, output a valid SKILL.md with frontmatter (name, description, confidence: <percentage>%) and concise steps.\n\
+            3. If confidence < {SKILL_CONFIDENCE_THRESHOLD}%, output ONLY: NONE",
+            task, trace
         );
 
         let req = ChatRequest::from_user(prompt);
-        if let Ok(res) = self.client.exec_chat(&self.config.model, req, None).await {
-            let text = res.into_first_text().unwrap_or_default();
-            let trimmed = text.trim();
-            if trimmed.starts_with("---") && trimmed.contains("name:") {
-                let mgr = crate::agent::skills::SkillManager::new(self.security.root());
-                // Extract skill name
-                let name = trimmed
-                    .lines()
-                    .find(|l| l.trim().starts_with("name:"))
-                    .map(|l| {
-                        l.trim()
-                            .trim_start_matches("name:")
-                            .trim()
-                            .trim_matches('"')
-                            .trim_matches('\'')
-                    })
-                    .unwrap_or("auto-workflow");
+        let options = self.chat_options();
+        let res = match self
+            .client
+            .exec_chat(&self.config.model, req, Some(&options))
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::warn!(error = %err, "Skill synthesis skipped: evaluator request failed");
+                event_sink(&format!("System: skill evaluator request failed: {err}"));
+                return;
+            }
+        };
 
-                if let Ok(saved_path) = mgr.save_skill(name, trimmed) {
-                    event_sink(&format!(
-                        "✨ High Singularity Skill Synthesized: {}",
-                        saved_path.display()
-                    ));
-                    tracing::info!(skill = %name, "Automatically created high-confidence skill from workflow");
-                }
-            } else {
-                tracing::info!("Skill synthesis skipped: confidence below singularity threshold");
+        let text = res.into_first_text().unwrap_or_default();
+        let trimmed = text.trim();
+        if !(trimmed.starts_with("---") && trimmed.contains("name:")) {
+            tracing::info!("Skill synthesis skipped: evaluator returned no skill");
+            event_sink("System: no repeatable workflow found, skill not saved");
+            return;
+        }
+
+        let confidence = parse_confidence(trimmed);
+        if !matches!(confidence, Some(c) if c >= SKILL_CONFIDENCE_THRESHOLD) {
+            tracing::info!(
+                ?confidence,
+                "Skill synthesis skipped: confidence below threshold"
+            );
+            event_sink("System: workflow rated below singularity threshold, skill not saved");
+            return;
+        }
+
+        let name = trimmed
+            .lines()
+            .find(|l| l.trim().starts_with("name:"))
+            .map(|l| {
+                l.trim()
+                    .trim_start_matches("name:")
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+            })
+            .unwrap_or("auto-workflow");
+
+        let mgr = crate::agent::skills::SkillManager::new(self.security.root());
+        match mgr.save_skill(name, trimmed) {
+            Ok(saved_path) => {
+                tracing::info!(skill = %name, "Automatically created high-confidence skill from workflow");
+                event_sink(&format!(
+                    "System: skill synthesized -> {}",
+                    saved_path.display()
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "Skill synthesis failed: cannot persist skill");
+                event_sink(&format!("System: skill synthesis failed: {err}"));
             }
         }
     }
+}
+
+/// Confidence percentage declared in a synthesized skill's frontmatter.
+pub(crate) fn parse_confidence(skill_md: &str) -> Option<u8> {
+    skill_md.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("confidence:")?
+            .trim()
+            .trim_matches('"')
+            .trim_end_matches('%')
+            .trim()
+            .parse()
+            .ok()
+    })
 }

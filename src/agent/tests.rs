@@ -31,7 +31,9 @@ mod test_cases {
         assert!(registry.get("run_command").is_some());
         assert!(registry.get("search_files").is_some());
         assert!(registry.get("save_memory").is_some());
-        assert!(registry.get("read_skill").is_some());
+        assert!(registry.get("skill_view").is_some());
+        assert!(registry.get("skill_write").is_some());
+        assert!(registry.get("skill_patch").is_some());
 
         let sec = WorkspaceSecurity::new(".");
         let res = registry
@@ -150,6 +152,33 @@ mod test_cases {
     }
 
     #[test]
+    fn test_parse_skill_confidence() {
+        use crate::agent::engine::{SKILL_CONFIDENCE_THRESHOLD, parse_confidence};
+
+        let pass = "---\nname: rust-release\nconfidence: 85%\n---\n";
+        let quoted = "---\nname: rust-release\nconfidence: \"90%\"\n---\n";
+        let fail = "---\nname: one-off\nconfidence: 60%\n---\n";
+        let missing = "---\nname: one-off\n---\n";
+
+        assert_eq!(parse_confidence(pass), Some(85));
+        assert_eq!(parse_confidence(quoted), Some(90));
+        assert_eq!(parse_confidence(fail), Some(60));
+        assert_eq!(parse_confidence(missing), None);
+
+        // The gate accepts only at/above the threshold.
+        for (md, expected) in [
+            (pass, true),
+            (quoted, true),
+            (fail, false),
+            (missing, false),
+        ] {
+            let accepted =
+                matches!(parse_confidence(md), Some(c) if c >= SKILL_CONFIDENCE_THRESHOLD);
+            assert_eq!(accepted, expected, "{md}");
+        }
+    }
+
+    #[test]
     fn test_skill_manager_workflow() {
         let mgr = crate::agent::skills::SkillManager::new(std::path::Path::new("."));
         let test_content = "---\nname: test-skill\ndescription: A test skill\n---\n# Test Content";
@@ -168,5 +197,54 @@ mod test_cases {
 
         let _ = std::fs::remove_dir_all(".seavx/skills/test-skill");
         let _ = std::fs::remove_dir_all(".seavx/skills/category");
+    }
+
+    #[tokio::test]
+    async fn test_skill_tools_create_patch_view() {
+        let root = std::env::temp_dir().join(format!("seavx_skill_tools_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let sec = WorkspaceSecurity::new(&root);
+        let registry = ToolRegistry::with_default_tools();
+        let name = "seavx-skill-tools-roundtrip";
+
+        let created = registry
+            .get("skill_write")
+            .unwrap()
+            .execute(
+                json!({
+                    "name": name,
+                    "content": "---\nname: seavx-skill-tools-roundtrip\ndescription: \"Roundtrip test skill.\"\n---\n\nStep A\n"
+                }),
+                &sec,
+            )
+            .await;
+        assert!(created.unwrap().contains("Successfully created"));
+
+        let patched = registry
+            .get("skill_patch")
+            .unwrap()
+            .execute(
+                json!({ "name": name, "old_string": "Step A", "new_string": "Step B" }),
+                &sec,
+            )
+            .await;
+        assert!(patched.unwrap().contains("Successfully patched"));
+
+        let viewed = registry
+            .get("skill_view")
+            .unwrap()
+            .execute(json!({ "name": name }), &sec)
+            .await
+            .unwrap();
+        assert!(viewed.contains("Step B"));
+
+        let missing = registry
+            .get("skill_view")
+            .unwrap()
+            .execute(json!({ "name": "no-such-skill-xyz" }), &sec)
+            .await;
+        assert!(missing.is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
