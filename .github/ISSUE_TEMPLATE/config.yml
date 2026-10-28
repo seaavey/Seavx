@@ -2,4 +2,4 @@ blank_issues_enabled: false
 contact_links:
   - name: Seavx Documentation & Issues
     url: https://github.com/seaavey/Seavx/issues
-    about: Laporkan bug atau kegagalan eksekusi model/tools di sini.
+    about: Report bugs or model/tool execution failures here.

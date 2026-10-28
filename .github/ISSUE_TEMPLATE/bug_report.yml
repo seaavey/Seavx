@@ -6,24 +6,24 @@ body:
   - type: markdown
     attributes:
       value: |
-        Terima kasih telah melaporkan masalah! Mohon sertakan informasi selengkap mungkin agar agen atau maintainer dapat langsung mendiagnosis akar masalah (*root cause*).
+        Thanks for reporting a problem! Include as much detail as you can so the agent or a maintainer can get straight to the root cause.
 
   - type: textarea
     id: prompt
     attributes:
-      label: 1. Prompt / Tugas yang Diberikan
-      description: Tuliskan tugas atau prompt apa yang diberikan ke Seavx saat error terjadi.
-      placeholder: "Contoh: seavx exec 'Baca file main.rs dan edit fungsi run'"
+      label: 1. Prompt / Task Given
+      description: What task or prompt did you give Seavx when the failure happened?
+      placeholder: "Example: seavx exec 'Read main.rs and edit the run function'"
     validations:
       required: true
 
   - type: dropdown
     id: execution_mode
     attributes:
-      label: 2. Mode Eksekusi
-      description: Mode apa yang digunakan saat menjalankan Seavx?
+      label: 2. Execution Mode
+      description: How were you running Seavx?
       options:
-        - "TUI Interaktif (seavx / cargo run)"
+        - "Interactive TUI (seavx / cargo run)"
         - "Headless CLI (seavx exec '...')"
         - "CLI Model Switcher (seavx model ...)"
     validations:
@@ -32,9 +32,9 @@ body:
   - type: input
     id: model_info
     attributes:
-      label: 3. Model & Base URL Gateway
-      description: Model apa dan endpoint mana yang dikonfigurasi di .seavx/config.toml?
-      placeholder: "Contoh: model = zen/deepseek-v4.1-flash-free, base_url = https://seavx.ai.id/v1/"
+      label: 3. Model & Gateway Base URL
+      description: Which model and endpoint are configured in .seavx/config.toml?
+      placeholder: "Example: model = zen/deepseek-v4.1-flash-free, base_url = https://seavx.ai.id/v1/"
     validations:
       required: true
 
@@ -42,7 +42,7 @@ body:
     id: reasoning_effort
     attributes:
       label: 4. Reasoning Effort
-      description: Tingkat reasoning effort apa yang aktif?
+      description: Which reasoning effort level was active?
       options:
         - "None / Zero"
         - "Minimal / Low"
@@ -56,8 +56,8 @@ body:
   - type: textarea
     id: error_message
     attributes:
-      label: 5. Pesan Error yang Ditampilkan
-      description: Salin pesan error yang muncul di layar terminal / TUI.
+      label: 5. Error Message Shown
+      description: Paste the error message printed in the terminal / TUI.
       placeholder: "Error executing task: Web call failed..."
     validations:
       required: true
@@ -65,17 +65,17 @@ body:
   - type: textarea
     id: tool_execution_trace
     attributes:
-      label: 6. Tool yang Sedang Berjalan Saat Error
-      description: Tool apa yang dipanggil terakhir kali sebelum crash/gagal? (read_file, run_command, save_memory, dll.)
-      placeholder: "Contoh: Tool: list_directory(path='/workspace') gagal karena path escapes workspace"
+      label: 6. Tool Running When It Failed
+      description: Which tool was called last before the crash? (read_file, run_command, save_memory, etc.)
+      placeholder: "Example: Tool: list_directory(path='/workspace') failed because the path escapes the workspace"
     validations:
       required: false
 
   - type: textarea
     id: logs
     attributes:
-      label: 7. Cuplikan Log (.seavx/debug.log / .seavx/request.log)
-      description: Salin baris-baris terakhir dari `.seavx/debug.log` atau `.seavx/request.log` (pastikan HAPUS api_key atau rahasia sensitif sebelum mem-paste).
+      label: 7. Log Excerpt (.seavx/debug.log / .seavx/request.log)
+      description: Paste the last lines of `.seavx/debug.log` or `.seavx/request.log` (remove any api_key or other secrets before pasting).
       render: text
     validations:
       required: true
@@ -83,10 +83,10 @@ body:
   - type: textarea
     id: environment
     attributes:
-      label: 8. Lingkungan Sistem
-      description: Informasi OS dan versi Seavx.
+      label: 8. Environment
+      description: OS information and Seavx version.
       value: |
-        - OS: Linux / macOS
+        - OS: Linux / macOS / Windows
         - Seavx Version: 0.1.0 (`seavx --version`)
         - Rust Version: (`rustc --version`)
     validations:
