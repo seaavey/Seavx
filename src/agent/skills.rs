@@ -7,59 +7,30 @@ pub struct SkillMetadata {
 }
 
 pub struct SkillManager {
-    skills_dir: PathBuf,
+    /// Highest priority first: project (debug), installed, then shared agent skills.
+    roots: Vec<PathBuf>,
 }
 
 impl SkillManager {
     pub fn new(workspace_root: &Path) -> Self {
-        Self {
-            skills_dir: workspace_root.join(".seavx/skills"),
+        let mut roots = vec![workspace_root.join(".seavx/skills")];
+        if let Ok(home) = std::env::var("HOME") {
+            roots.push(PathBuf::from(&home).join(".seavx/skills"));
+            roots.push(PathBuf::from(home).join(".agents/skills"));
         }
+        Self { roots }
     }
 
-    /// List all available skills in workspace or global dir (~/.seavx/skills)
+    /// List all available skills; earlier roots shadow later ones with the same name
     pub fn list_skills(&self) -> Vec<SkillMetadata> {
         let mut list = Vec::new();
-        self.scan_dir(&self.skills_dir, &mut list);
-
-        if let Ok(home) = std::env::var("HOME") {
-            let global_skills = PathBuf::from(home).join(".seavx/skills");
-            self.scan_dir(&global_skills, &mut list);
+        for root in &self.roots {
+            scan_dir(root, &mut list, 0);
         }
-
         list
     }
 
-    fn scan_dir(&self, base: &Path, list: &mut Vec<SkillMetadata>) {
-        let entries = match std::fs::read_dir(base) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let skill_file = path.join("SKILL.md");
-                if skill_file.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&skill_file) {
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let description = extract_description(&content)
-                            .unwrap_or_else(|| format!("Skill for {name}"));
-                        list.push(SkillMetadata {
-                            name,
-                            description,
-                            path: skill_file,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    /// Automatically save a synthesised skill
+    /// Automatically save a synthesised skill into the project skills dir
     pub fn save_skill(&self, name: &str, content: &str) -> Result<PathBuf, String> {
         let sanitized_name: String = name
             .chars()
@@ -76,7 +47,7 @@ impl SkillManager {
             return Err("Invalid skill name".to_string());
         }
 
-        let skill_dir = self.skills_dir.join(&sanitized_name);
+        let skill_dir = self.roots[0].join(&sanitized_name);
         std::fs::create_dir_all(&skill_dir)
             .map_err(|e| format!("Failed to create skill directory: {e}"))?;
 
@@ -85,6 +56,47 @@ impl SkillManager {
             .map_err(|e| format!("Failed to write SKILL.md: {e}"))?;
 
         Ok(skill_file)
+    }
+}
+
+fn scan_dir(base: &Path, list: &mut Vec<SkillMetadata>, depth: usize) {
+    // Shared skill dirs group entries by category one level deeper (<category>/<name>/SKILL.md).
+    if depth > 2 {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(base) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let skill_file = path.join("SKILL.md");
+        if skill_file.exists()
+            && let Ok(content) = std::fs::read_to_string(&skill_file)
+        {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if list.iter().any(|s| s.name == name) {
+                continue;
+            }
+            let description =
+                extract_description(&content).unwrap_or_else(|| format!("Skill for {name}"));
+            list.push(SkillMetadata {
+                name,
+                description,
+                path: skill_file,
+            });
+        } else {
+            scan_dir(&path, list, depth + 1);
+        }
     }
 }
 

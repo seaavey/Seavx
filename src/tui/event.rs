@@ -1,11 +1,14 @@
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 #[derive(Debug)]
 pub enum Action {
     Tick,
     Key(KeyEvent),
+    Mouse(MouseEvent),
     AgentToken(String),
+    AgentThinking(String),
     AgentToolStart(String),
+    AgentTitle(String),
     AgentUsage {
         total_tokens: i32,
         prompt_tokens: i32,

@@ -101,18 +101,13 @@ impl ModelManager {
         Ok(())
     }
 
-    /// Fetch models from remote /models endpoint or use cache
-    pub async fn fetch_or_cache_models(
+    /// Fetch live models directly bypassing cache and update local cache file
+    pub async fn refresh_remote_models(
         &self,
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<Vec<String>, String> {
         let domain_slug = Self::domain_slug(base_url);
-
-        if let Some(cached) = self.get_cached_models(&domain_slug) {
-            tracing::info!(domain = %domain_slug, "Loaded models from local cache");
-            return Ok(cached);
-        }
 
         // Endpoint: standard OpenAI/Anthropic gateway /models
         let mut endpoint = base_url.trim_end_matches('/').to_string();
@@ -120,7 +115,7 @@ impl ModelManager {
             endpoint.push_str("/models");
         }
 
-        tracing::info!(endpoint = %endpoint, "Fetching live models from remote gateway");
+        tracing::info!(endpoint = %endpoint, "Refreshing live models from remote gateway");
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -128,11 +123,9 @@ impl ModelManager {
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
         let mut req = client.get(&endpoint);
-        if let Some(key) = api_key {
-            if !key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {key}"));
-                req = req.header("x-api-key", key);
-            }
+        if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+            req = req.header("Authorization", format!("Bearer {key}"));
+            req = req.header("x-api-key", key);
         }
 
         let resp = req
@@ -149,7 +142,6 @@ impl ModelManager {
             .map_err(|e| format!("Failed to parse JSON response: {e}"))?;
 
         let mut model_list = Vec::new();
-        // Parse OpenAI format: { "data": [ { "id": "model-name" } ] }
         if let Some(arr) = json_val.get("data").and_then(|d| d.as_array()) {
             for item in arr {
                 if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
@@ -157,7 +149,6 @@ impl ModelManager {
                 }
             }
         } else if let Some(arr) = json_val.as_array() {
-            // Raw list format: [ "model-a", "model-b" ]
             for item in arr {
                 if let Some(s) = item.as_str() {
                     model_list.push(s.to_string());
@@ -174,5 +165,21 @@ impl ModelManager {
         model_list.sort();
         let _ = self.save_cache(&domain_slug, &model_list);
         Ok(model_list)
+    }
+
+    /// Fetch models from remote /models endpoint or use cache
+    pub async fn fetch_or_cache_models(
+        &self,
+        base_url: &str,
+        api_key: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let domain_slug = Self::domain_slug(base_url);
+
+        if let Some(cached) = self.get_cached_models(&domain_slug) {
+            tracing::info!(domain = %domain_slug, "Loaded models from local cache");
+            return Ok(cached);
+        }
+
+        self.refresh_remote_models(base_url, api_key).await
     }
 }

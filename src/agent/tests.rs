@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+mod test_cases {
     use crate::agent::protocol::Message;
     use crate::agent::security::WorkspaceSecurity;
     use crate::agent::tools::ToolRegistry;
@@ -106,6 +106,32 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_workspace_entries() {
+        let entries = crate::tui::app::scan_workspace_entries("@Cargo");
+        assert!(!entries.is_empty());
+        assert!(entries.iter().any(|(_, p)| p == "Cargo.toml"));
+    }
+
+    #[test]
+    fn test_tui_scroll_calculation() {
+        let visible_height = 20u16;
+        let total_lines = 100u16;
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        assert_eq!(max_scroll, 80);
+
+        let auto_offset = max_scroll;
+        assert_eq!(auto_offset, 80);
+
+        let mut scroll = max_scroll;
+        scroll = scroll.saturating_sub(10);
+        let user_offset = scroll.min(max_scroll);
+        assert_eq!(user_offset, 70);
+
+        scroll = scroll.saturating_sub(200);
+        assert_eq!(scroll, 0);
+    }
+
+    #[test]
     fn test_agent_config_load() {
         let temp_dir = std::env::temp_dir().join("seavx_test_config");
         let seavx_dir = temp_dir.join(".seavx");
@@ -133,6 +159,14 @@ mod tests {
         let skills = mgr.list_skills();
         assert!(skills.iter().any(|s| s.name == "test-skill"));
 
+        // Category subdirectories (shared ~/.agents/skills layout) are scanned too.
+        let nested = std::path::Path::new(".seavx/skills/category/nested-skill");
+        let _ = std::fs::create_dir_all(nested);
+        let _ = std::fs::write(nested.join("SKILL.md"), test_content);
+        let skills = mgr.list_skills();
+        assert!(skills.iter().any(|s| s.name == "nested-skill"));
+
         let _ = std::fs::remove_dir_all(".seavx/skills/test-skill");
+        let _ = std::fs::remove_dir_all(".seavx/skills/category");
     }
 }

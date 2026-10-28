@@ -1,5 +1,3 @@
-#![allow(clippy::all)]
-
 pub mod agent;
 mod tui;
 
@@ -19,7 +17,6 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[allow(clippy::all)]
 fn init_tracing(_debug: bool) -> anyhow::Result<Option<PathBuf>> {
     let log_dir = PathBuf::from(".seavx");
     std::fs::create_dir_all(&log_dir)?;
@@ -119,7 +116,10 @@ async fn main() -> anyhow::Result<()> {
             println!("Executing task: {task}\n");
             let result = runtime
                 .execute_task(&task, |evt| {
-                    println!("{evt}");
+                    // Reasoning blocks are a TUI concern; headless runs skip them.
+                    if !evt.starts_with("THINKING:") {
+                        println!("{evt}");
+                    }
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -200,12 +200,11 @@ async fn main() -> anyhow::Result<()> {
             io::stdin().read_line(&mut input)?;
             let trimmed = input.trim();
 
-            if !trimmed.is_empty() {
-                if let Ok(num) = trimmed.parse::<usize>() {
-                    if num > 0 && num <= available_models.len() {
-                        config.model = available_models[num - 1].clone();
-                    }
-                }
+            if let Ok(num) = trimmed.parse::<usize>()
+                && num > 0
+                && num <= available_models.len()
+            {
+                config.model = available_models[num - 1].clone();
             }
 
             // Reasoning effort selection
@@ -292,7 +291,9 @@ async fn main() -> anyhow::Result<()> {
             let skill_mgr = crate::agent::skills::SkillManager::new(&PathBuf::from("."));
             let skills = skill_mgr.list_skills();
             if !skills.is_empty() {
-                println!("\n--- Installed Skills (.seavx/skills & ~/.seavx/skills) ---");
+                println!(
+                    "\n--- Installed Skills (.seavx/skills, ~/.seavx/skills, ~/.agents/skills) ---"
+                );
                 for s in skills {
                     println!("- {}: {}", s.name, s.description);
                 }

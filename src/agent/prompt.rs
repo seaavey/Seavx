@@ -40,14 +40,14 @@ pub fn load_system_prompt(workspace_root: &Path) -> String {
     ];
 
     for memory_file in &memory_candidates {
-        if memory_file.exists() {
-            if let Ok(memory_content) = std::fs::read_to_string(memory_file) {
-                full_prompt.push_str(&format!(
-                    "\n\n# PROJECT MEMORY ({})\n{memory_content}",
-                    memory_file.display()
-                ));
-                break;
-            }
+        if memory_file.exists()
+            && let Ok(memory_content) = std::fs::read_to_string(memory_file)
+        {
+            full_prompt.push_str(&format!(
+                "\n\n# PROJECT MEMORY ({})\n{memory_content}",
+                memory_file.display()
+            ));
+            break;
         }
     }
 
@@ -57,28 +57,36 @@ pub fn load_system_prompt(workspace_root: &Path) -> String {
         workspace_root.join("USER.md"),
     ];
     let mut user_path = user_candidates.into_iter().find(|p| p.exists());
-    if user_path.is_none() {
-        if let Ok(home) = std::env::var("HOME") {
-            let global_user = Path::new(&home).join(".seavx/USER.md");
-            if global_user.exists() {
-                user_path = Some(global_user);
-            }
+    if user_path.is_none()
+        && let Ok(home) = std::env::var("HOME")
+    {
+        let global_user = Path::new(&home).join(".seavx/USER.md");
+        if global_user.exists() {
+            user_path = Some(global_user);
         }
     }
 
-    if let Some(user_file) = user_path {
-        if let Ok(user_content) = std::fs::read_to_string(user_file) {
-            full_prompt.push_str(&format!("\n\n# USER PREFERENCES (USER.md)\n{user_content}"));
-        }
+    if let Some(user_file) = user_path
+        && let Ok(user_content) = std::fs::read_to_string(user_file)
+    {
+        full_prompt.push_str(&format!("\n\n# USER PREFERENCES (USER.md)\n{user_content}"));
     }
 
-    // Auto-inject lightweight skills index
+    // Auto-inject lightweight skills index: one line per skill, first sentence only
     let skill_mgr = crate::agent::skills::SkillManager::new(workspace_root);
     let skills = skill_mgr.list_skills();
     if !skills.is_empty() {
         full_prompt.push_str("\n\n# AVAILABLE SKILLS (Loaded on demand)\n");
         for sk in skills {
-            full_prompt.push_str(&format!("- {}: {}\n", sk.name, sk.description));
+            let summary: String = sk
+                .description
+                .split(". ")
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(100)
+                .collect();
+            full_prompt.push_str(&format!("- {}: {}\n", sk.name, summary));
         }
     }
 

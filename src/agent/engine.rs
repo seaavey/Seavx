@@ -103,12 +103,11 @@ impl AgentConfig {
             None
         };
 
-        if let Some(cfg_path) = path {
-            if let Ok(content) = std::fs::read_to_string(cfg_path) {
-                if let Ok(parsed) = toml::from_str::<AgentConfig>(&content) {
-                    config = parsed;
-                }
-            }
+        if let Some(cfg_path) = path
+            && let Ok(content) = std::fs::read_to_string(cfg_path)
+            && let Ok(parsed) = toml::from_str::<AgentConfig>(&content)
+        {
+            config = parsed;
         }
 
         // Environment override takes highest precedence if provided
@@ -193,6 +192,10 @@ impl AgentRuntime {
         &mut self.registry
     }
 
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     pub async fn execute_task(
         &self,
         task: &str,
@@ -212,16 +215,18 @@ impl AgentRuntime {
         let mut history = vec![Message::system(&system_prompt), Message::user(task)];
 
         tracing::info!(model = %self.config.model, "Starting Seavx agent task");
-        event_sink("Starting agent reasoning...");
 
         let mut chat_options = ChatOptions::default()
             .with_capture_reasoning_content(true)
             .with_normalize_reasoning_content(true);
 
-        if let Some(ref effort_str) = self.config.reasoning_effort {
-            if let Some(effort) = parse_reasoning_effort(effort_str) {
-                chat_options = chat_options.with_reasoning_effort(effort);
-            }
+        if let Some(effort) = self
+            .config
+            .reasoning_effort
+            .as_deref()
+            .and_then(parse_reasoning_effort)
+        {
+            chat_options = chat_options.with_reasoning_effort(effort);
         }
 
         for turn in 0..self.config.max_turns {
@@ -247,11 +252,11 @@ impl AgentRuntime {
                 event_sink(&format!("USAGE:{total}:{prompt}"));
             }
 
-            // Emit reasoning thought stream if available from model
+            // Surface the model's reasoning so the TUI can render it as a gray block
             if let Some(ref thoughts) = response.reasoning_content {
                 let trimmed = thoughts.trim();
                 if !trimmed.is_empty() {
-                    event_sink(&format!("💭 Thought:\n{trimmed}"));
+                    event_sink(&format!("THINKING:{trimmed}"));
                 }
             }
 
@@ -261,8 +266,6 @@ impl AgentRuntime {
 
                 let return_text = if !final_text.trim().is_empty() {
                     final_text
-                } else if let Some(ref thoughts) = response.reasoning_content {
-                    format!("💭 Reasoning:\n{thoughts}")
                 } else {
                     "Task completed.".to_string()
                 };
@@ -305,8 +308,10 @@ impl AgentRuntime {
                             .map(|(k, v)| {
                                 let val_str = match v {
                                     serde_json::Value::String(s) => {
-                                        if s.len() > 60 {
-                                            format!("\"{}...\"", &s[..57])
+                                        // char-safe: byte slicing panics on multibyte args
+                                        if s.chars().count() > 60 {
+                                            let head: String = s.chars().take(57).collect();
+                                            format!("\"{head}...\"")
                                         } else {
                                             format!("\"{s}\"")
                                         }
