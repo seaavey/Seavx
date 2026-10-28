@@ -128,9 +128,10 @@ jobs:
             --endpoint-url "$endpoint" \
             --content-type application/octet-stream
 
-          # Pointer the worker's /latest/ route resolves; short cache, the target is immutable.
-          printf '{"sha":"%s","key":"%s","built_at":"%s"}\n' \
-            "$SHORT_SHA" "$key" "$(date -u +%FT%TZ)" > "pointer/latest-${{ matrix.platform }}.json"
+          # Pointer the worker's /latest/ routes resolve; short cache, the target is immutable.
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          printf '{"sha":"%s","key":"%s","version":"%s","built_at":"%s"}\n' \
+            "$SHORT_SHA" "$key" "$version" "$(date -u +%FT%TZ)" > "pointer/latest-${{ matrix.platform }}.json"
           aws s3 cp "pointer/latest-${{ matrix.platform }}.json" \
             "s3://seavx/latest-${{ matrix.platform }}.json" \
             --endpoint-url "$endpoint" \

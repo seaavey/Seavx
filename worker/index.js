@@ -14,17 +14,35 @@ export default {
       return new Response("method not allowed\n", { status: 405 });
     }
 
-    const latest = url.pathname.match(/^\/latest\/([a-z0-9]+)\/([a-z0-9_]+)$/);
+    const latest = url.pathname.match(
+      /^\/latest\/([a-z0-9]+)\/([a-z0-9_]+)(\.json)?$/,
+    );
     if (latest) {
-      const pointer = await env.BUCKET.get(`latest-${latest[1]}-${latest[2]}.json`);
+      const pointer = await env.BUCKET.get(
+        `latest-${latest[1]}-${latest[2]}.json`,
+      );
       if (!pointer) {
-        return new Response("no build published for that target\n", { status: 404 });
+        return new Response("no build published for that target\n", {
+          status: 404,
+        });
+      }
+      // The updater asks for the pointer itself; installers follow the redirect.
+      if (latest[3]) {
+        return new Response(pointer.body, {
+          headers: {
+            "content-type": "application/json",
+            "cache-control": "public, max-age=60",
+          },
+        });
       }
       const { key } = await pointer.json();
       // The pointer moves, the artifact it names never does.
       return new Response(null, {
         status: 302,
-        headers: { location: `${url.origin}/${key}`, "cache-control": "public, max-age=60" },
+        headers: {
+          location: `${url.origin}/${key}`,
+          "cache-control": "public, max-age=60",
+        },
       });
     }
 
@@ -45,6 +63,8 @@ export default {
     }
     headers.set("etag", object.httpEtag);
     headers.set("cache-control", "public, max-age=31536000, immutable");
-    return new Response(request.method === "HEAD" ? null : object.body, { headers });
+    return new Response(request.method === "HEAD" ? null : object.body, {
+      headers,
+    });
   },
 };

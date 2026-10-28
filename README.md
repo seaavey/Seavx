@@ -14,11 +14,13 @@
 curl -fsSL https://raw.githubusercontent.com/seaavey/Seavx/master/install.sh | bash
 ```
 
-### 1b. Windows
-Download `seavx-windows-x86_64.exe` from the [latest release](https://github.com/seaavey/Seavx/releases/latest), rename it to `seavx.exe`, and put it on your `PATH`. Building from source works too:
+### 1b. Windows (PowerShell)
 ```powershell
-cargo install --path .
+irm https://raw.githubusercontent.com/seaavey/Seavx/master/install.ps1 | iex
 ```
+Installs to `%LOCALAPPDATA%\Programs\seavx` and adds it to your user `PATH`. Manual alternative: download
+`seavx-windows-x86_64.exe` from the [latest release](https://github.com/seaavey/Seavx/releases/latest) or
+`cargo install --path .`.
 
 ### 1c. Prebuilt builds (sha-tagged)
 Every push to master publishes artifacts named after its commit and mirrors them to the CDN:

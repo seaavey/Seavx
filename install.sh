@@ -1,52 +1,47 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-REPO="seaavey/Seavx"
 INSTALL_DIR="${HOME}/.local/bin"
-mkdir -p "${INSTALL_DIR}"
+BIN="seavx"
 
-echo "=== Seavx One-Line Installer ==="
+# Only these platforms have CI-built binaries; everything else builds from source.
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64) CDN="linux/x86_64" ;;
+    Darwin-arm64) CDN="macos/arm64" ;;
+    *) CDN="" ;;
+esac
 
-# Detect OS and Architecture
-OS="$(uname -s)"
-ARCH="$(uname -m)"
+echo "=== Seavx Installer ==="
+mkdir -p "$INSTALL_DIR"
 
-BINARY_NAME=""
-if [[ "$OS" == "Linux" && "$ARCH" == "x86_64" ]]; then
-    BINARY_NAME="seavx-linux-x86_64"
-elif [[ "$OS" == "Darwin" && "$ARCH" == "arm64" ]]; then
-    BINARY_NAME="seavx-macos-arm64"
-fi
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
 
-# 1. Try to download pre-built binary from latest GitHub release
-DOWNLOAD_SUCCESS=false
-if [[ -n "$BINARY_NAME" ]]; then
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}"
-    echo "Attempting to download pre-built binary for ${OS} ${ARCH}..."
-    if curl -sL --fail "$DOWNLOAD_URL" -o "${INSTALL_DIR}/seavx"; then
-        chmod +x "${INSTALL_DIR}/seavx"
-        DOWNLOAD_SUCCESS=true
-        echo "Successfully downloaded pre-built binary to ${INSTALL_DIR}/seavx"
+installed=false
+
+# 1. CDN: /latest redirects to an immutable sha-tagged build published by CI.
+if [[ -n "$CDN" ]]; then
+    echo "Downloading the newest build from cdn.seavx.com ..."
+    if curl -fsSL --retry 2 "https://cdn.seavx.com/latest/${CDN}" -o "$TMP" \
+        && install -m 755 "$TMP" "${INSTALL_DIR}/${BIN}"; then
+        installed=true
     fi
 fi
 
-# 2. Fallback to local cargo build if pre-built binary is not found or fails
-if [[ "$DOWNLOAD_SUCCESS" != "true" ]]; then
-    echo "Pre-built binary not available. Building from source via Cargo..."
-    if ! command -v cargo &> /dev/null; then
-        echo "Error: Cargo is not installed and prebuilt binary is not available. Please install Rust: https://rustup.rs"
+# 2. Source build, for platforms without a prebuilt binary.
+if [[ "$installed" != true ]]; then
+    echo "No prebuilt binary for $(uname -s) $(uname -m); building from source ..."
+    if ! command -v cargo > /dev/null; then
+        echo "error: cargo is not installed and no prebuilt binary is available. Install Rust: https://rustup.rs" >&2
         exit 1
     fi
     cargo build --release
-    install -m 755 target/release/seavx "${INSTALL_DIR}/seavx"
+    install -m 755 target/release/seavx "${INSTALL_DIR}/${BIN}"
 fi
 
-# Ensure ~/.local/bin is in PATH
 if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
-    echo "Notice: ${INSTALL_DIR} is not in your current PATH."
-    echo "Add this to your shell config (~/.bashrc or ~/.zshrc):"
+    echo "note: ${INSTALL_DIR} is not in PATH. Add this to your shell config (~/.bashrc or ~/.zshrc):"
     echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
-echo "=== Installation Complete! ==="
-echo "You can now run 'seavx' or 'seavx --help'."
+echo "Installed $("${INSTALL_DIR}/${BIN}" --version) -> ${INSTALL_DIR}/${BIN}"
