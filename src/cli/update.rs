@@ -1,52 +1,11 @@
-//! `seavx update`: replace the running binary with the latest GitHub release.
+//! `seavx update`: replace the running binary with the newest CI build served by cdn.seavx.com.
 
 pub async fn run(force: bool) -> anyhow::Result<()> {
     const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-    println!("Checking for updates... (current version: v{CURRENT_VERSION})");
 
-    let client = reqwest::Client::builder()
-        .user_agent("seavx-updater")
-        .build()?;
-
-    let url = "https://api.github.com/repos/seaavey/Seavx/releases/latest";
-    let resp = client
-        .get(url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "Failed to query latest release from GitHub: HTTP {}",
-            resp.status()
-        );
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Asset {
-        name: String,
-        browser_download_url: String,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Release {
-        tag_name: String,
-        assets: Vec<Asset>,
-    }
-
-    let release: Release = resp.json().await?;
-    let latest_tag = release.tag_name.trim();
-    let latest_version = latest_tag.trim_start_matches('v');
-
-    if !force && latest_version == CURRENT_VERSION {
-        println!("SEAVX is already up to date ({latest_tag}).");
-        return Ok(());
-    }
-
-    // Determine target binary name
-    let target_asset_name = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => "seavx-linux-x86_64",
-        ("windows", "x86_64") => "seavx-windows-x86_64.exe",
+    let (os, arch) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => ("linux", "x86_64"),
+        ("windows", "x86_64") => ("windows", "x86_64"),
         (os, arch) => {
             anyhow::bail!(
                 "Unsupported platform for binary self-update: {os}-{arch}. Please update via cargo install or build from source."
@@ -54,27 +13,41 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
         }
     };
 
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == target_asset_name)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No release binary artifact '{}' found for release {}",
-                target_asset_name,
-                latest_tag
-            )
-        })?;
+    println!("Checking for updates... (current version: v{CURRENT_VERSION})");
 
-    println!("Downloading {} ({})...", latest_tag, asset.name);
+    let client = reqwest::Client::builder()
+        .user_agent("seavx-updater")
+        .build()?;
+
+    /// Pointer object CI publishes next to each build.
+    #[derive(serde::Deserialize)]
+    struct Latest {
+        sha: String,
+        key: String,
+        version: String,
+    }
+
+    let latest: Latest = client
+        .get(format!("https://cdn.seavx.com/latest/{os}/{arch}.json"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    if !force && latest.version == CURRENT_VERSION {
+        println!("SEAVX is already up to date (v{}, {})", latest.version, latest.sha);
+        return Ok(());
+    }
+
+    println!("Downloading v{} ({})...", latest.version, latest.sha);
     let response = client
-        .get(&asset.browser_download_url)
+        .get(format!("https://cdn.seavx.com/{}", latest.key))
         .send()
         .await?
         .error_for_status()?;
 
-    let total_size = response.content_length();
-    let pb = match total_size {
+    let pb = match response.content_length() {
         Some(size) => {
             let pb = indicatif::ProgressBar::new(size);
             pb.set_style(
@@ -107,15 +80,13 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     }
     pb.finish_with_message("Download complete");
 
-    let bytes = downloaded_bytes;
-
     let current_exe = std::env::current_exe()?;
     let current_dir = current_exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Unable to get parent dir of executable"))?;
 
     let temp_path = current_dir.join(format!(".seavx-update-{}.tmp", std::process::id()));
-    tokio::fs::write(&temp_path, &bytes).await?;
+    tokio::fs::write(&temp_path, &downloaded_bytes).await?;
 
     #[cfg(unix)]
     {
@@ -134,9 +105,10 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     }
 
     println!(
-        "Successfully updated SEAVX from v{} to {} ({})",
+        "Successfully updated SEAVX from v{} to v{} ({}, {})",
         CURRENT_VERSION,
-        latest_tag,
+        latest.version,
+        latest.sha,
         current_exe.display()
     );
 
