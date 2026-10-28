@@ -2,7 +2,10 @@ use std::io::stdout;
 use std::time::Duration;
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -15,6 +18,7 @@ use ratatui::{
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
+use crate::agent::engine::AgentMode;
 use crate::tui::event::{Action, AgentState};
 use crate::tui::ui;
 
@@ -67,6 +71,7 @@ pub enum Segment {
 
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model and reasoning effort"),
+    ("/plan", "Enter plan mode (read-only)"),
     ("/clear", "Clear session conversation output"),
     ("/help", "Show help and command palette"),
     ("/init", "Initialize workspace configuration"),
@@ -74,6 +79,49 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/memory", "Inspect persistent memory"),
     ("/exit", "Quit Seavx agent TUI"),
 ];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanCommand {
+    Enter,
+    Exit,
+    Invalid,
+}
+
+fn parse_plan_command(input: &str) -> Option<PlanCommand> {
+    let mut parts = input.split_whitespace();
+    if parts.next() != Some("/plan") {
+        return None;
+    }
+
+    match (parts.next(), parts.next()) {
+        (None, None) | (Some("on"), None) => Some(PlanCommand::Enter),
+        (Some("off"), None) => Some(PlanCommand::Exit),
+        _ => Some(PlanCommand::Invalid),
+    }
+}
+
+fn is_mode_shortcut(key: &KeyEvent) -> bool {
+    key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn apply_plan_command(app: &mut App, input: &str) -> bool {
+    let Some(command) = parse_plan_command(input) else {
+        return false;
+    };
+
+    app.input = new_input();
+    match command {
+        PlanCommand::Enter => {
+            app.set_mode(AgentMode::Plan);
+        }
+        PlanCommand::Exit => {
+            app.set_mode(AgentMode::Build);
+        }
+        PlanCommand::Invalid => app.push_mode_notice("Usage: /plan [on|off]"),
+    }
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalSelection {
     Model {
@@ -113,6 +161,7 @@ pub struct App<'a> {
     pub session_title: Option<String>,
     pub should_quit: bool,
     pub config: crate::agent::engine::AgentConfig,
+    pub mode: AgentMode,
     pub modal: Option<ModalSelection>,
     pub slash_selected: usize,
     pub at_selected: usize,
@@ -165,12 +214,50 @@ impl<'a> App<'a> {
             session_title: None,
             should_quit: false,
             config,
+            mode: AgentMode::Build,
             modal: None,
             slash_selected: 0,
             at_selected: 0,
             toast: None,
             last_ctrl_c: None,
         }
+    }
+
+    /// Switch modes only when no task is running. Returns whether the mode changed.
+    pub fn set_mode(&mut self, mode: AgentMode) -> bool {
+        if self.status != AgentState::Idle {
+            self.push_mode_notice("Agent is busy, try again when it is idle.");
+            return false;
+        }
+
+        if self.mode == mode {
+            self.push_mode_notice(match mode {
+                AgentMode::Build => "Build mode is already active.",
+                AgentMode::Plan => "Plan mode is already active.",
+            });
+            return false;
+        }
+
+        self.mode = mode;
+        self.push_mode_notice(match mode {
+            AgentMode::Build => "Build mode on — all tools enabled.",
+            AgentMode::Plan => "Plan mode on — write tools disabled.",
+        });
+        true
+    }
+
+    pub fn toggle_mode(&mut self) -> bool {
+        let next = match self.mode {
+            AgentMode::Build => AgentMode::Plan,
+            AgentMode::Plan => AgentMode::Build,
+        };
+        self.set_mode(next)
+    }
+
+    fn push_mode_notice(&mut self, text: &str) {
+        self.push_text(&format!("\nSystem: {text}\n"));
+        self.scroll = self.line_count();
+        self.auto_scroll = true;
     }
 
     /// Append assistant/tool transcript text, coalescing into the last text block.
@@ -298,6 +385,7 @@ pub async fn run_agent_worker(
     prompt: String,
     tx: mpsc::UnboundedSender<Action>,
     is_first_turn: bool,
+    mode: AgentMode,
 ) {
     tokio::spawn(async move {
         let _done = DoneGuard(tx.clone());
@@ -332,7 +420,7 @@ pub async fn run_agent_worker(
 
         let tx_clone = tx.clone();
         let result = runtime
-            .execute_task(&prompt, move |evt| {
+            .execute_task(&prompt, mode, move |evt| {
                 if let Some(rest) = evt.strip_prefix("USAGE:") {
                     let parts: Vec<&str> = rest.split(':').collect();
                     if parts.len() == 2 {
@@ -374,6 +462,13 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
+            terminal.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
 
@@ -418,7 +513,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
         app.remember_prompt(&prompt);
         app.push_text(&format!("User: {prompt}\n\n"));
         app.status = AgentState::Thinking;
-        run_agent_worker(prompt, tx.clone(), true).await;
+        run_agent_worker(prompt, tx.clone(), true, AgentMode::Build).await;
     }
 
     while !app.should_quit {
@@ -714,6 +809,11 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                         continue;
                     }
 
+                    if is_mode_shortcut(&key) {
+                        app.toggle_mode();
+                        continue;
+                    }
+
                     let input_text = app.input.lines().join("\n").trim().to_string();
                     let at_query = input_text
                         .split_whitespace()
@@ -841,6 +941,10 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                         app.auto_scroll = true;
                                     }
                                     continue;
+                                } else if selected_cmd == "/plan" {
+                                    app.input = new_input();
+                                    app.set_mode(AgentMode::Plan);
+                                    continue;
                                 } else if selected_cmd == "/clear" {
                                     app.input = new_input();
                                     app.clear_transcript();
@@ -915,6 +1019,10 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                             let lines = app.input.lines().to_vec();
                             let prompt = lines.join("\n").trim().to_string();
                             if !prompt.is_empty() {
+                                if apply_plan_command(&mut app, &prompt) {
+                                    continue;
+                                }
+
                                 let is_model_cmd =
                                     prompt == "/model" || prompt.starts_with("/model ");
                                 if is_model_cmd {
@@ -1002,7 +1110,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                 app.status = AgentState::Thinking;
                                 app.input = new_input();
                                 let is_first_turn = app.session_title.is_none();
-                                run_agent_worker(prompt, tx.clone(), is_first_turn).await;
+                                run_agent_worker(prompt, tx.clone(), is_first_turn, app.mode).await;
                             }
                         }
                         _ => {
@@ -1052,6 +1160,10 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
         }
     }
 
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
+
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -1078,6 +1190,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn app_with(history: &[&str]) -> App<'static> {
         let mut app = App::new();
@@ -1159,5 +1272,73 @@ mod tests {
         app.input.insert_str("line two");
         app.history_previous();
         assert_eq!(typed(&app), "line one\nline two");
+    }
+
+    #[test]
+    fn plan_command_parses_supported_forms() {
+        assert!(matches!(
+            parse_plan_command("/plan"),
+            Some(PlanCommand::Enter)
+        ));
+        assert!(matches!(
+            parse_plan_command("/plan on"),
+            Some(PlanCommand::Enter)
+        ));
+        assert!(matches!(
+            parse_plan_command("/plan off"),
+            Some(PlanCommand::Exit)
+        ));
+        assert!(matches!(
+            parse_plan_command("/plan nope"),
+            Some(PlanCommand::Invalid)
+        ));
+        assert_eq!(parse_plan_command("/model"), None);
+        assert_eq!(parse_plan_command("plan"), None);
+    }
+
+    #[test]
+    fn apply_plan_command_enters_and_leaves_plan_mode() {
+        let mut app = App::new();
+        assert!(apply_plan_command(&mut app, "/plan"));
+        assert_eq!(app.mode, AgentMode::Plan);
+        assert!(apply_plan_command(&mut app, "/plan off"));
+        assert_eq!(app.mode, AgentMode::Build);
+    }
+
+    #[test]
+    fn mode_change_is_rejected_while_busy() {
+        let mut app = App::new();
+        app.status = AgentState::Streaming;
+        assert!(apply_plan_command(&mut app, "/plan"));
+        assert_eq!(app.mode, AgentMode::Build);
+        assert!(
+            app.segments
+                .iter()
+                .any(|segment| format!("{segment:?}").contains("Agent is busy"))
+        );
+    }
+
+    #[test]
+    fn second_plan_command_is_idempotent() {
+        let mut app = App::new();
+        assert!(apply_plan_command(&mut app, "/plan"));
+        assert!(apply_plan_command(&mut app, "/plan"));
+        assert_eq!(app.mode, AgentMode::Plan);
+    }
+
+    #[test]
+    fn mode_shortcuts_recognise_backtab_and_ctrl_tab() {
+        assert!(is_mode_shortcut(&KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::NONE
+        )));
+        assert!(is_mode_shortcut(&KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_mode_shortcut(&KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE
+        )));
     }
 }

@@ -42,6 +42,16 @@ seavx exec "Inspect Cargo.toml and list dependencies"
 
 ---
 
+## 🧭 Modes
+
+- **Build** (default): all tools, including file writes and command execution.
+- **Plan**: read-only exploration; write and command tools are disabled.
+
+Use `/plan` to enter Plan Mode, `/plan off` to return to Build,
+or toggle with `Ctrl+Tab` (`Shift+Tab` on terminals that do not report Ctrl+Tab).
+
+---
+
 ## ⚙️ Configuration
 
 Configure a provider once per machine (base URL, API key, model, reasoning effort):

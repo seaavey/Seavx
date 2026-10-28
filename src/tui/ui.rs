@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
+use crate::agent::engine::AgentMode;
 use crate::tui::app::{App, ModalSelection, Segment};
 use crate::tui::event::AgentState;
 use crate::tui::markdown;
@@ -24,6 +25,10 @@ pub fn render(app: &App, frame: &mut Frame) {
         .split(frame.area());
 
     let dim = Style::default().fg(Color::DarkGray);
+    let (mode_style, mode_tag) = match app.mode {
+        AgentMode::Build => (dim, "[build]"),
+        AgentMode::Plan => (Style::default().fg(Color::Yellow), "[plan]"),
+    };
 
     // 1. Header
     frame.render_widget(
@@ -34,6 +39,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(format!(" {mode_tag}"), mode_style),
             Span::styled("  ", dim),
             Span::styled(app.workspace.as_str(), dim),
         ])),
@@ -259,6 +265,8 @@ pub fn render(app: &App, frame: &mut Frame) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
+            Span::styled(app.mode.label(), mode_style),
+            separator.clone(),
             Span::styled(
                 config.model.as_str(),
                 Style::default()
@@ -622,6 +630,24 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn header_and_footer_show_build_mode() {
+        let app = App::new();
+        let screen = screen_of(&app);
+        assert!(screen.contains("[build]"), "{screen}");
+        assert!(screen.contains("build"), "{screen}");
+    }
+
+    #[test]
+    fn header_and_footer_show_plan_mode() {
+        let mut app = App::new();
+        app.mode = AgentMode::Plan;
+        let screen = screen_of(&app);
+        assert!(screen.contains("[plan]"), "{screen}");
+        assert!(screen.contains("plan"), "{screen}");
+        assert!(!screen.contains("[build]"), "{screen}");
     }
 
     #[test]

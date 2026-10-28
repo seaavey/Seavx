@@ -1,3 +1,4 @@
+use crate::agent::engine::AgentMode;
 use crate::agent::security::WorkspaceSecurity;
 use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
@@ -11,6 +12,12 @@ pub trait AgentTool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn parameters_schema(&self) -> Value;
+
+    /// Tools default to mutation. Only explicitly classified tools are safe in Plan Mode.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String>;
 }
 
@@ -32,6 +39,10 @@ impl AgentTool for ReadFileTool {
 
     fn description(&self) -> &'static str {
         "Read file contents within workspace, with optional line offset (1-based) and limit"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn parameters_schema(&self) -> Value {
@@ -170,6 +181,10 @@ impl AgentTool for ListDirectoryTool {
         "List files and subdirectories in a workspace path"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> Value {
         serde_json::to_value(schema_for!(ListDirArgs)).unwrap_or_default()
     }
@@ -287,6 +302,10 @@ impl AgentTool for SearchFilesTool {
 
     fn description(&self) -> &'static str {
         "Search file contents (target='content', default) or match filenames (target='files') across the workspace"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn parameters_schema(&self) -> Value {
@@ -548,6 +567,10 @@ impl AgentTool for SkillViewTool {
         "Read full instructions of an available skill by name"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> Value {
         serde_json::to_value(schema_for!(SkillViewArgs)).unwrap_or_default()
     }
@@ -683,14 +706,27 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
-    pub fn to_genai_tools(&self) -> Vec<genai::chat::Tool> {
+    pub fn to_genai_tools(&self, mode: AgentMode) -> Vec<genai::chat::Tool> {
         self.tools
             .values()
-            .map(|t| {
-                genai::chat::Tool::new(t.name())
-                    .with_description(t.description())
-                    .with_schema(t.parameters_schema())
+            .filter(|tool| mode == AgentMode::Build || tool.is_read_only())
+            .map(|tool| {
+                genai::chat::Tool::new(tool.name())
+                    .with_description(tool.description())
+                    .with_schema(tool.parameters_schema())
             })
             .collect()
+    }
+
+    pub fn get_for_mode(&self, name: &str, mode: AgentMode) -> Result<Arc<dyn AgentTool>, String> {
+        let tool = self
+            .get(name)
+            .ok_or_else(|| format!("Tool '{name}' not found."))?;
+
+        if mode == AgentMode::Plan && !tool.is_read_only() {
+            return Err(format!("Tool '{name}' is disabled in Plan Mode."));
+        }
+
+        Ok(tool)
     }
 }
