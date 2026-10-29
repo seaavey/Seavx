@@ -449,3 +449,223 @@ fn shell_destinations_classify_global_writes_and_refusals() {
     // A workspace destination stays an ordinary write.
     assert_eq!(check("cp f g").kind, ActionKind::Write);
 }
+
+// ---- Phase 1 task 9: the ask seam ------------------------------------------
+
+struct RecordingConfirmer {
+    seen: std::sync::Mutex<Vec<crate::agent::permissions::PermissionRequest>>,
+    answer: crate::agent::permissions::Answer,
+}
+
+impl RecordingConfirmer {
+    fn new(answer: crate::agent::permissions::Answer) -> Self {
+        Self {
+            seen: std::sync::Mutex::new(Vec::new()),
+            answer,
+        }
+    }
+
+    fn seen(&self) -> Vec<crate::agent::permissions::PermissionRequest> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::agent::permissions::Confirmer for RecordingConfirmer {
+    async fn confirm(
+        &self,
+        request: crate::agent::permissions::PermissionRequest,
+    ) -> crate::agent::permissions::Answer {
+        self.seen.lock().unwrap().push(request);
+        self.answer
+    }
+}
+
+fn runtime_with(
+    mode: &str,
+    permitted: &[&str],
+) -> (tempfile::TempDir, crate::agent::engine::AgentRuntime) {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join(".seavx")).unwrap();
+    std::fs::write(
+        dir.path().join(".seavx/config.toml"),
+        "model = \"m\"\nmax_turns = 10\n",
+    )
+    .unwrap();
+    let config = crate::agent::engine::AgentConfig {
+        model: "test-model".to_string(),
+        tool_permissions: mode.to_string(),
+        permitted_actions: permitted.iter().map(|kind| kind.to_string()).collect(),
+        ..Default::default()
+    };
+    let runtime =
+        crate::agent::engine::AgentRuntime::new(config, WorkspaceSecurity::new(dir.path()));
+    (dir, runtime)
+}
+
+#[tokio::test]
+async fn global_writes_ask_in_every_mode() {
+    use crate::agent::permissions::{ActionKind, Answer};
+
+    // An approval in `allow` mode still goes through the human.
+    let (_dir, runtime) = runtime_with("allow", &["execute", "network"]);
+    let confirmer = RecordingConfirmer::new(Answer::Once);
+    runtime
+        .gate(
+            &confirmer,
+            ActionKind::GlobalWrite,
+            "save_memory",
+            "~/.seavx/USER.md",
+        )
+        .await
+        .unwrap();
+    let seen = confirmer.seen();
+    assert_eq!(seen.len(), 1, "a global write must ask exactly once");
+    assert_eq!(seen[0].kind, ActionKind::GlobalWrite);
+    assert!(seen[0].detail.contains("USER.md"), "{:?}", seen[0]);
+    assert!(seen[0].effect.contains("outside the workspace"));
+
+    // `deny` refuses it without asking at all.
+    let (_dir, runtime) = runtime_with("deny", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Once);
+    let error = runtime
+        .gate(
+            &confirmer,
+            ActionKind::GlobalWrite,
+            "save_memory",
+            "~/.seavx/USER.md",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("Permission denied"), "{error}");
+    assert!(confirmer.seen().is_empty(), "deny must not ask");
+
+    // A refusal from the human is a denial with an explanation.
+    let (_dir, runtime) = runtime_with("ask", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    let error = runtime
+        .gate(
+            &confirmer,
+            ActionKind::GlobalWrite,
+            "skill_write",
+            "~/.agents/skills/x/SKILL.md",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.starts_with("Permission denied:"), "{error}");
+    assert_eq!(confirmer.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn category_and_unrestricted_persist_through_the_one_writer() {
+    use crate::agent::permissions::{ActionKind, Answer};
+
+    let (dir, runtime) = runtime_with("ask", &[]);
+    runtime
+        .gate(
+            &RecordingConfirmer::new(Answer::Category),
+            ActionKind::Network,
+            "run_command",
+            "curl x",
+        )
+        .await
+        .unwrap();
+    let config_path = dir.path().join(".seavx/config.toml");
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(text.contains("permitted_actions = [\"network\"]"), "{text}");
+
+    runtime
+        .gate(
+            &RecordingConfirmer::new(Answer::Unrestricted),
+            ActionKind::Execute,
+            "run_command",
+            "make",
+        )
+        .await
+        .unwrap();
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(text.contains("tool_permissions = \"allow\""), "{text}");
+    assert!(
+        text.contains("permitted_actions = [\"network\"]"),
+        "the earlier category was lost: {text}"
+    );
+}
+
+#[tokio::test]
+async fn quitting_while_a_prompt_is_pending_denies() {
+    use crate::agent::permissions::{ActionKind, Answer, Confirmer, PermissionRequest};
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let confirmer = crate::tui::app::TuiConfirmer::new(tx);
+    let worker = tokio::spawn(async move {
+        confirmer
+            .confirm(PermissionRequest::new(
+                ActionKind::GlobalWrite,
+                "save_memory",
+                "/tmp/x",
+            ))
+            .await
+    });
+
+    // The UI receives the question and then goes away without answering.
+    match rx.recv().await {
+        Some(crate::tui::event::Action::PermissionAsk { reply, request }) => {
+            assert_eq!(request.kind, ActionKind::GlobalWrite);
+            drop(reply);
+        }
+        other => panic!("expected a permission ask, got {other:?}"),
+    }
+    assert_eq!(worker.await.unwrap(), Answer::Deny);
+}
+
+#[test]
+fn permission_prompt_keys_answer_once_category_and_unrestricted() {
+    use crate::agent::permissions::{ActionKind, Answer, PermissionRequest};
+
+    for (code, expected) in [
+        (crossterm::event::KeyCode::Char('y'), Answer::Once),
+        (crossterm::event::KeyCode::Char('a'), Answer::Category),
+        (crossterm::event::KeyCode::Char('u'), Answer::Unrestricted),
+        (crossterm::event::KeyCode::Char('n'), Answer::Deny),
+        (crossterm::event::KeyCode::Esc, Answer::Deny),
+    ] {
+        let mut app = crate::tui::app::test_app();
+        let (reply, mut receiver) = tokio::sync::oneshot::channel();
+        app.pending_permission = Some(crate::tui::app::PendingPermission {
+            request: PermissionRequest::new(ActionKind::GlobalWrite, "save_memory", "/tmp/x"),
+            reply,
+        });
+
+        assert_eq!(app.answer_permission(code), Some(expected));
+        assert_eq!(receiver.try_recv().unwrap(), expected);
+        assert!(app.pending_permission.is_none(), "the question is consumed");
+
+        // A key that is not an answer leaves the question standing.
+        let mut app = crate::tui::app::test_app();
+        let (reply, _receiver) = tokio::sync::oneshot::channel();
+        app.pending_permission = Some(crate::tui::app::PendingPermission {
+            request: PermissionRequest::new(ActionKind::GlobalWrite, "save_memory", "/tmp/x"),
+            reply,
+        });
+        assert_eq!(
+            app.answer_permission(crossterm::event::KeyCode::Char('z')),
+            None
+        );
+        assert!(app.pending_permission.is_some());
+    }
+}
+
+#[test]
+fn exec_denies_an_ask_action_with_an_explanation() {
+    use crate::agent::permissions::{ActionKind, Answer, Confirmer, PermissionRequest};
+
+    let confirmer = crate::agent::permissions::DenyingConfirmer;
+    let answer = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(confirmer.confirm(PermissionRequest::new(
+            ActionKind::GlobalWrite,
+            "save_memory",
+            "/tmp/x",
+        )));
+    assert_eq!(answer, Answer::Deny);
+}

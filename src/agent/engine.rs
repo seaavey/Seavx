@@ -613,7 +613,7 @@ impl AgentRuntime {
 
     /// One place decides a tool call: the matrix, then the human, then the
     /// answer's persistence. A denial is a tool result, never a turn failure.
-    async fn gate(
+    pub(crate) async fn gate(
         &self,
         confirm: &dyn Confirmer,
         kind: ActionKind,

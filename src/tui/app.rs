@@ -196,6 +196,46 @@ pub struct App<'a> {
     dismissed_popup: Option<String>,
     pub toast: Option<(String, std::time::Instant)>,
     pub last_ctrl_c: Option<std::time::Instant>,
+    /// The question the worker is blocked on, until the user answers it.
+    pub pending_permission: Option<PendingPermission>,
+}
+
+/// A permission question and the channel its answer travels back on.
+pub struct PendingPermission {
+    pub request: crate::agent::permissions::PermissionRequest,
+    pub reply: tokio::sync::oneshot::Sender<crate::agent::permissions::Answer>,
+}
+
+/// Answers asks through the event loop: the UI thread renders the question, the
+/// worker waits on the oneshot. A dropped channel is a denial, so quitting with a
+/// question on screen never approves anything.
+pub struct TuiConfirmer {
+    tx: mpsc::UnboundedSender<Action>,
+}
+
+impl TuiConfirmer {
+    pub fn new(tx: mpsc::UnboundedSender<Action>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::agent::permissions::Confirmer for TuiConfirmer {
+    async fn confirm(
+        &self,
+        request: crate::agent::permissions::PermissionRequest,
+    ) -> crate::agent::permissions::Answer {
+        use crate::agent::permissions::Answer;
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(Action::PermissionAsk { request, reply })
+            .is_err()
+        {
+            return Answer::Deny;
+        }
+        receiver.await.unwrap_or(Answer::Deny)
+    }
 }
 
 /// Single source for the prompt textarea so resets keep its styling.
@@ -216,6 +256,26 @@ pub fn new_input<'a>() -> TextArea<'a> {
 }
 
 impl<'a> App<'a> {
+    /// Answer the pending permission question with one key: `y` once, `a` this
+    /// category, `u` unrestricted, `n`/`Esc` deny. Returns the answer sent, or
+    /// `None` when the key is not an answer.
+    pub fn answer_permission(
+        &mut self,
+        code: KeyCode,
+    ) -> Option<crate::agent::permissions::Answer> {
+        use crate::agent::permissions::Answer;
+        let answer = match code {
+            KeyCode::Char('y') => Answer::Once,
+            KeyCode::Char('a') => Answer::Category,
+            KeyCode::Char('u') => Answer::Unrestricted,
+            KeyCode::Char('n') | KeyCode::Esc => Answer::Deny,
+            _ => return None,
+        };
+        let pending = self.pending_permission.take()?;
+        let _ = pending.reply.send(answer);
+        Some(answer)
+    }
+
     pub fn new() -> Self {
         Self::with_history(crate::history::ChatHistory::load(
             &crate::history::config_dir(),
@@ -269,6 +329,7 @@ impl<'a> App<'a> {
             dismissed_popup: None,
             toast: None,
             last_ctrl_c: None,
+            pending_permission: None,
         }
     }
 
@@ -913,31 +974,26 @@ pub async fn run_agent_worker(
         let tx_clone = tx.clone();
         let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
         let result = runtime
-            .execute_task(
-                &task,
-                mode,
-                &crate::agent::permissions::DenyingConfirmer,
-                move |evt| {
-                    if let Some(rest) = evt.strip_prefix("USAGE:") {
-                        let parts: Vec<&str> = rest.split(':').collect();
-                        if parts.len() == 2 {
-                            let total = parts[0].parse::<i32>().unwrap_or(0);
-                            let prompt = parts[1].parse::<i32>().unwrap_or(0);
-                            let _ = tx_clone.send(Action::AgentUsage {
-                                total_tokens: total,
-                                prompt_tokens: prompt,
-                            });
-                        }
-                    } else if evt.starts_with("Tool: ") {
-                        let tool_label = evt.strip_prefix("Tool: ").unwrap_or(evt);
-                        let _ = tx_clone.send(Action::AgentToolStart(tool_label.to_string()));
-                    } else if let Some(thoughts) = evt.strip_prefix("THINKING:") {
-                        let _ = tx_clone.send(Action::AgentThinking(thoughts.to_string()));
-                    } else if let Some(note) = evt.strip_prefix("System: ") {
-                        let _ = tx_clone.send(Action::AgentToken(format!("\n  {note}\n")));
+            .execute_task(&task, mode, &TuiConfirmer::new(tx.clone()), move |evt| {
+                if let Some(rest) = evt.strip_prefix("USAGE:") {
+                    let parts: Vec<&str> = rest.split(':').collect();
+                    if parts.len() == 2 {
+                        let total = parts[0].parse::<i32>().unwrap_or(0);
+                        let prompt = parts[1].parse::<i32>().unwrap_or(0);
+                        let _ = tx_clone.send(Action::AgentUsage {
+                            total_tokens: total,
+                            prompt_tokens: prompt,
+                        });
                     }
-                },
-            )
+                } else if evt.starts_with("Tool: ") {
+                    let tool_label = evt.strip_prefix("Tool: ").unwrap_or(evt);
+                    let _ = tx_clone.send(Action::AgentToolStart(tool_label.to_string()));
+                } else if let Some(thoughts) = evt.strip_prefix("THINKING:") {
+                    let _ = tx_clone.send(Action::AgentThinking(thoughts.to_string()));
+                } else if let Some(note) = evt.strip_prefix("System: ") {
+                    let _ = tx_clone.send(Action::AgentToken(format!("\n  {note}\n")));
+                }
+            })
             .await;
 
         match result {
@@ -1075,6 +1131,25 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                     }
                 }
                 Action::Key(key) => {
+                    // A pending question owns the next key: y/a/u answer it, n/Esc
+                    // denies. Nothing else runs until it is resolved.
+                    if app.pending_permission.is_some() {
+                        match app.answer_permission(key.code) {
+                            Some(answer) => {
+                                use crate::agent::permissions::Answer;
+                                let label = match answer {
+                                    Answer::Once => "approved once",
+                                    Answer::Category => "approved for this category",
+                                    Answer::Unrestricted => "switched to allow",
+                                    Answer::Deny => "denied",
+                                };
+                                app.push_notice(format!("Permission {label}."));
+                            }
+                            None => app.push_notice("Answer the permission prompt: y / a / u / n"),
+                        }
+                        continue;
+                    }
+
                     // Ctrl+C double press exit with confirmation toast
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
@@ -1450,6 +1525,13 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                 }
                 Action::AgentDone => {
                     app.status = AgentState::Idle;
+                }
+                Action::PermissionAsk { request, reply } => {
+                    app.push_notice(format!(
+                        "Permission required: {} wants to {}.\n  y = once  ·  a = this category  ·  u = unrestricted  ·  n = deny",
+                        request.tool, request.effect
+                    ));
+                    app.pending_permission = Some(PendingPermission { request, reply });
                 }
                 Action::DoctorDone(report) => {
                     app.status = AgentState::Idle;
