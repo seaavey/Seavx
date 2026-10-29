@@ -287,12 +287,19 @@ fn apply_plan_command_enters_and_leaves_plan_mode() {
 }
 
 #[test]
-fn mode_change_is_rejected_while_busy() {
+fn mode_change_is_rejected_while_busy_and_says_so() {
     let mut app = test_app();
     app.status = AgentState::Streaming;
     assert!(apply_plan_command(&mut app, "/plan"));
     assert_eq!(app.mode, AgentMode::Build);
-    assert!(app.segments.is_empty());
+    let notice = app.segments.iter().any(|segment| match segment {
+        Segment::Text(text) => text.contains("Cannot switch mode"),
+        Segment::Thinking(_) => false,
+    });
+    assert!(
+        notice,
+        "a refused switch explains itself instead of vanishing"
+    );
 }
 
 #[test]
