@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod models;
+pub mod patch;
 pub mod permissions;
 pub mod prompt;
 pub mod security;
