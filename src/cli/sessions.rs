@@ -40,10 +40,16 @@ pub async fn run(command: SessionsCommand) -> anyhow::Result<()> {
             );
         }
         SessionsCommand::Show { id } => {
-            print!("{}", show_text(&store, id).map_err(anyhow::Error::msg)?);
+            print!(
+                "{}",
+                show_text(&store, &workspace, id).map_err(anyhow::Error::msg)?
+            );
         }
         SessionsCommand::Export { id } => {
-            println!("{}", export_text(&store, id).map_err(anyhow::Error::msg)?);
+            println!(
+                "{}",
+                export_text(&store, &workspace, id).map_err(anyhow::Error::msg)?
+            );
         }
         SessionsCommand::Resume { id } => {
             let session = resume_target(&store, &workspace, id).map_err(anyhow::Error::msg)?;
@@ -171,8 +177,8 @@ pub fn resume_by_number(
 
 /// Full transcript with the header the spec asks for: id, title, model,
 /// payload format and usage.
-pub fn show_text(store: &SessionStore, id: i64) -> Result<String, String> {
-    let session = load_named(store, id)?;
+pub fn show_text(store: &SessionStore, workspace: &str, id: i64) -> Result<String, String> {
+    let session = resume_target(store, workspace, id)?;
     let mut out = format!(
         "Session {} · {}\n",
         session.id,
@@ -193,11 +199,14 @@ pub fn show_text(store: &SessionStore, id: i64) -> Result<String, String> {
     Ok(out)
 }
 
-pub fn export_text(store: &SessionStore, id: i64) -> Result<String, String> {
-    Ok(crate::session::export_json(&load_named(store, id)?))
+pub fn export_text(store: &SessionStore, workspace: &str, id: i64) -> Result<String, String> {
+    Ok(crate::session::export_json(&resume_target(
+        store, workspace, id,
+    )?))
 }
 
-/// Resume's pre-flight: another workspace's session is refused with that path.
+/// Another workspace's session is refused with that path, for resume, show and
+/// export alike: a transcript is not readable just because its id was guessed.
 pub fn resume_target(
     store: &SessionStore,
     workspace: &str,

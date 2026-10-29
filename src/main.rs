@@ -153,6 +153,9 @@ async fn main() -> anyhow::Result<()> {
 
             let runtime = agent::engine::AgentRuntime::new(config, security);
             println!("Executing task: {task}\n");
+            // Set by the first streamed token: the answer is already on screen,
+            // so printing it again would show it twice.
+            let mut streamed = false;
             let result = runtime
                 .execute_task(
                     &task,
@@ -163,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
                     |evt| {
                         // Reasoning blocks are a TUI concern; headless runs skip them.
                         if let Some(token) = evt.strip_prefix("TOKEN:") {
+                            streamed = true;
                             print!("{token}");
                         } else if !evt.starts_with("THINKING:") {
                             println!("{evt}");
@@ -175,7 +179,11 @@ async fn main() -> anyhow::Result<()> {
                 .result
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            println!("\nFinal Response:\n{result}");
+            if streamed {
+                println!();
+            } else {
+                println!("\nFinal Response:\n{result}");
+            }
         }
         Some(Commands::Init) => {
             let (config_path, created) = cli::config::init_workspace(std::path::Path::new("."))

@@ -373,13 +373,16 @@ fn session_path(options: &DoctorOptions) -> Option<PathBuf> {
         .map(|home| home.join(".seavx").join("sessions.db"))
 }
 
-/// Path, schema version, payload format and writability, read without writing.
+/// Path, schema version, payload format and writability. The database is opened
+/// read-only; writability is proven by a probe file, and only in a directory
+/// that already exists, so a check never creates the store it inspects.
 fn session_check(options: &DoctorOptions) -> CheckResult {
     let Some(path) = session_path(options) else {
         return warn("session", "home directory is not set");
     };
     let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let writable = std::fs::create_dir_all(&directory).is_ok()
+    let exists = directory.is_dir();
+    let writable = exists
         && create_probe(&directory, &probe_name())
             .ok()
             .is_some_and(|probe| remove_probe(probe).is_ok());
@@ -413,14 +416,32 @@ fn session_check(options: &DoctorOptions) -> CheckResult {
 
     match header {
         Ok((version, format)) => {
-            let detail = format!(
-                "{} · schema v{version} · {format} · {}",
-                display_path(&path),
-                if writable { "writable" } else { "not writable" }
-            );
+            // A version or payload format this build does not know opens the
+            // session read-only, so it is a warning rather than a quiet pass.
+            let version_ok = version == i64::from(crate::session::SCHEMA_VERSION);
+            let format_ok = format == crate::session::PAYLOAD_FORMAT;
+            let mut detail = format!("{} · schema v{version}", display_path(&path));
+            if !version_ok {
+                detail.push_str(&format!(
+                    " (this build expects v{})",
+                    crate::session::SCHEMA_VERSION
+                ));
+            }
+            detail.push_str(&format!(" · {format}"));
+            if !format_ok {
+                detail.push_str(&format!(
+                    " (this build reads {})",
+                    crate::session::PAYLOAD_FORMAT
+                ));
+            }
+            detail.push_str(if writable {
+                " · writable"
+            } else {
+                " · not writable"
+            });
             result(
                 "session",
-                if writable {
+                if version_ok && format_ok && writable {
                     CheckStatus::Ok
                 } else {
                     CheckStatus::Warn

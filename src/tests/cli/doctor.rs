@@ -344,3 +344,62 @@ fn setup_prints_the_redacted_url() {
     assert!(!printed.contains("user:pass"), "{printed}");
     assert!(!printed.contains("secret"), "{printed}");
 }
+
+// ---- Audit regressions ------------------------------------------------------
+
+#[tokio::test]
+async fn doctor_warns_when_the_schema_is_not_the_one_this_build_reads() {
+    let temp = tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".seavx")).unwrap();
+    let store =
+        crate::session::SessionStore::open_at(&workspace.join(".seavx/sessions.db")).unwrap();
+    crate::session::prepare_turn(&store, "ws", "m", None, "hello").unwrap();
+    // A newer build wrote this database: this one opens it read-only.
+    store
+        .connection()
+        .pragma_update(None, "user_version", 99i64)
+        .unwrap();
+    drop(store);
+
+    let probe = FakeProbe {
+        calls: AtomicUsize::new(0),
+        result: ProbeResult::Ok { models: 1 },
+    };
+    let report = run_with_probe(options(&workspace), &probe).await;
+    let session = check(&report, "session");
+
+    assert_eq!(session.status, CheckStatus::Warn, "{}", session.detail);
+    assert!(session.detail.contains("v99"), "{}", session.detail);
+    assert!(
+        session
+            .detail
+            .contains(&format!("expects v{}", crate::session::SCHEMA_VERSION)),
+        "{}",
+        session.detail
+    );
+}
+
+#[tokio::test]
+async fn doctor_does_not_create_the_session_store_it_inspects() {
+    let temp = tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let probe = FakeProbe {
+        calls: AtomicUsize::new(0),
+        result: ProbeResult::Ok { models: 1 },
+    };
+    let report = run_with_probe(options(&workspace), &probe).await;
+    let session = check(&report, "session");
+
+    assert!(
+        session.detail.contains("created with the first prompt"),
+        "{}",
+        session.detail
+    );
+    assert!(
+        !workspace.join(".seavx/sessions.db").exists(),
+        "a read-only check must not create the store"
+    );
+}
