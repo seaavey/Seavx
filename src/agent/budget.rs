@@ -63,6 +63,110 @@ fn estimate_message(message: &ChatMessage) -> usize {
     serialized.chars().count().div_ceil(4)
 }
 
+/// The four headings a summary must carry.
+pub const SUMMARY_HEADINGS: [&str; 4] = ["goals", "decisions", "files", "pending"];
+/// A summary shorter than this cannot carry a usable plan.
+pub const MIN_SUMMARY_CHARS: usize = 100;
+
+/// The quality gate: a summary that fails it is worse than none, so callers
+/// drop the older turns instead of sending it.
+pub fn validate_summary(summary: &str) -> Result<(), String> {
+    let summary = summary.trim();
+    let chars = summary.chars().count();
+    if chars < MIN_SUMMARY_CHARS {
+        return Err(format!(
+            "summary is too short ({chars} chars, needs {MIN_SUMMARY_CHARS})"
+        ));
+    }
+    let missing: Vec<&str> = SUMMARY_HEADINGS
+        .iter()
+        .copied()
+        .filter(|heading| {
+            !summary.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with('#') && line.to_lowercase().contains(heading)
+            })
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "summary is missing the {} heading",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// One compaction: the summary, the turns kept verbatim, and the estimate
+/// before and after.
+#[derive(Debug)]
+pub struct Compaction {
+    pub summary: String,
+    pub history: Vec<ChatMessage>,
+    pub before: usize,
+    pub after: usize,
+}
+
+/// Summarise everything older than the recent window, then validate. The
+/// history is sent with the summary as one user message carrying the banner.
+pub async fn compact(
+    history: &[ChatMessage],
+    keep_recent: usize,
+    summarizer: &dyn crate::tui::compact::Summarizer,
+) -> Result<Compaction, String> {
+    use crate::tui::compact::{
+        CHUNK_CHARS, SESSION_CONTEXT_BANNER, build_summary_prompt, chunk_transcript,
+    };
+
+    let split = window_start(history, keep_recent);
+    if split == 0 {
+        return Err("nothing older than the recent window".to_string());
+    }
+    let transcript = crate::session::render_messages(&history[..split]);
+    let chunks = chunk_transcript(&transcript, CHUNK_CHARS);
+
+    let summary = if chunks.len() <= 1 {
+        summarize_once(summarizer, build_summary_prompt(&transcript, None)).await?
+    } else {
+        let mut partials = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            partials.push(summarize_once(summarizer, build_summary_prompt(chunk, None)).await?);
+        }
+        summarize_once(
+            summarizer,
+            build_summary_prompt(&partials.join("\n\n"), None),
+        )
+        .await?
+    };
+
+    validate_summary(&summary)?;
+
+    let before = history.iter().map(estimate_message).sum();
+    let kept = history[split..].to_vec();
+    let after = kept.iter().map(estimate_message).sum::<usize>()
+        + estimate_message(&ChatMessage::user(format!(
+            "{SESSION_CONTEXT_BANNER}\n{summary}"
+        )));
+
+    Ok(Compaction {
+        summary,
+        history: kept,
+        before,
+        after,
+    })
+}
+
+async fn summarize_once(
+    summarizer: &dyn crate::tui::compact::Summarizer,
+    prompt: String,
+) -> Result<String, String> {
+    summarizer
+        .summarize(prompt)
+        .await
+        .map(|summary| summary.trim().to_string())
+        .map_err(|error| format!("summarizer failed: {error}"))
+}
+
 #[cfg(test)]
 #[path = "../tests/core/budget.rs"]
 mod tests;

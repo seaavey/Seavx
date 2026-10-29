@@ -1,6 +1,14 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// A summary that passes the quality gate: 100+ chars and all four headings.
+fn valid_summary() -> String {
+    format!(
+        "# Goals\n{}\n# Decisions\nkeep the plan\n# Files\nsrc/tui/compact.rs\n# Pending\nnone",
+        "keep the session usable".repeat(5)
+    )
+}
+
 struct FakeSummarizer {
     calls: AtomicUsize,
     response: String,
@@ -31,13 +39,13 @@ async fn short_transcript_is_rejected_without_calling_the_model() {
 async fn large_transcript_is_chunked_and_merged() {
     let summarizer = FakeSummarizer {
         calls: AtomicUsize::new(0),
-        response: "summary".into(),
+        response: valid_summary(),
     };
     let transcript = "line\n\n".repeat(10_000);
     let result = run_compaction(&transcript, Some("files"), &summarizer)
         .await
         .unwrap();
-    assert_eq!(result.summary, "summary");
+    assert!(result.summary.contains("# Goals"));
     assert!(
         summarizer.calls.load(Ordering::SeqCst) >= 3,
         "chunk calls plus merge call"

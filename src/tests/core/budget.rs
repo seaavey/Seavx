@@ -144,3 +144,100 @@ fn a_tool_result_never_leads_the_window() {
     );
     assert!(start < 3, "the tool result is inside the window");
 }
+
+#[test]
+fn a_short_or_headless_summary_is_rejected() {
+    use crate::agent::budget::validate_summary;
+
+    assert!(validate_summary("too short").is_err());
+    let long = "x".repeat(200);
+    assert!(validate_summary(&long).is_err(), "no headings");
+    let good = format!(
+        "# Goals\n{}\n# Decisions\nx\n# Files\nx\n# Pending\nx",
+        "x".repeat(100)
+    );
+    assert!(validate_summary(&good).is_ok(), "{good}");
+}
+
+struct ScriptedSummarizer {
+    calls: std::sync::atomic::AtomicUsize,
+    response: Result<String, String>,
+}
+
+impl ScriptedSummarizer {
+    fn ok() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            response: Ok(format!(
+                "# Goals\n{}\n# Decisions\nkeep the plan\n# Files\nsrc/agent/budget.rs\n# Pending\nnone",
+                "work on the compaction contract".repeat(5)
+            )),
+        }
+    }
+
+    fn failing() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            response: Err("provider unavailable".to_string()),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tui::compact::Summarizer for ScriptedSummarizer {
+    async fn summarize(&self, _prompt: String) -> Result<String, String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.response.clone()
+    }
+}
+
+fn transcript_history(turns: usize) -> Vec<genai::chat::ChatMessage> {
+    let mut messages = Vec::new();
+    for index in 0..turns {
+        messages.extend(turn(&format!("question {index}"), 1_000));
+    }
+    messages
+}
+
+#[tokio::test]
+async fn compaction_chunks_at_twenty_four_thousand_characters_and_merges() {
+    use crate::agent::budget::compact;
+
+    let summarizer = ScriptedSummarizer::ok();
+    let history = transcript_history(60);
+    let result = compact(&history, 4_000, &summarizer).await.unwrap();
+    assert_eq!(
+        summarizer.calls(),
+        3,
+        "two chunks plus one merge call: {}",
+        summarizer.calls()
+    );
+    assert!(!result.history.is_empty(), "the recent window is kept");
+    assert!(result.before > result.after, "the summary is smaller");
+    assert!(result.summary.starts_with("# Goals"));
+
+    let summarizer = ScriptedSummarizer::ok();
+    let history = transcript_history(12);
+    let result = compact(&history, 1_000, &summarizer).await.unwrap();
+    assert_eq!(
+        summarizer.calls(),
+        1,
+        "a transcript under 24 000 chars is one call"
+    );
+    assert!(result.after > 0);
+}
+
+#[tokio::test]
+async fn a_failing_summarizer_returns_the_reason() {
+    use crate::agent::budget::compact;
+
+    let summarizer = ScriptedSummarizer::failing();
+    let error = compact(&transcript_history(60), 4_000, &summarizer)
+        .await
+        .unwrap_err();
+    assert!(error.contains("provider unavailable"), "{error}");
+}
