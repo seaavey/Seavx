@@ -327,6 +327,14 @@ impl AgentTool for RunCommandTool {
         "run_command"
     }
 
+    fn classify(&self, args: &Value, security: &WorkspaceSecurity) -> ActionKind {
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        crate::agent::shell::classify(command, security).kind
+    }
+
     fn description(&self) -> &'static str {
         "Run shell command safely in workspace root with 30s timeout"
     }

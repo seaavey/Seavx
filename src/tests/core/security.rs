@@ -364,3 +364,88 @@ fn target_classification_names_the_three_cases() {
         "an unlisted outside path must not classify"
     );
 }
+
+#[test]
+fn whole_command_classification_table() {
+    use crate::agent::permissions::ActionKind;
+    use crate::agent::shell::classify_with_home;
+
+    let dir = search_workspace();
+    let home = tempfile::TempDir::new().unwrap();
+    let security = WorkspaceSecurity::new(dir.path());
+    let check = |command: &str| classify_with_home(Some(home.path()), command, &security);
+
+    for (command, kind) in [
+        ("ls; curl x", ActionKind::Network),
+        ("cat f | rm -rf d", ActionKind::Destructive),
+        ("git status", ActionKind::Read),
+        ("git diff HEAD", ActionKind::Read),
+        ("git reset --hard", ActionKind::Execute),
+        ("git push", ActionKind::Network),
+        ("cargo test", ActionKind::Read),
+        ("sudo ls", ActionKind::Execute),
+        ("K=V curl x", ActionKind::Network),
+        ("rg PRIVATE_KEY .", ActionKind::Execute),
+        ("grep -R password .", ActionKind::Execute),
+        ("rg --hidden x .", ActionKind::Execute),
+        ("cat *.pem", ActionKind::Execute),
+        ("sh -c 'ls'", ActionKind::Execute),
+        ("bash <<EOF", ActionKind::Execute),
+        ("echo 'unbalanced", ActionKind::Execute),
+        ("`id`", ActionKind::Execute),
+    ] {
+        assert_eq!(check(command).kind, kind, "{command}");
+    }
+
+    // A protected path in an argument or a redirect position refuses the whole
+    // command, and a command whose paths cannot be analysed never allows.
+    for command in [
+        "cat .env",
+        "cat deploy.pem",
+        "echo x > .env",
+        "echo $(cat deploy.pem)",
+    ] {
+        let class = check(command);
+        assert!(
+            class.kind == ActionKind::Destructive || class.unanalysable,
+            "{command} must not be allowable (got {:?})",
+            class.kind
+        );
+    }
+}
+
+#[test]
+fn shell_destinations_classify_global_writes_and_refusals() {
+    use crate::agent::permissions::ActionKind;
+    use crate::agent::shell::classify_with_home;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join(".seavx")).unwrap();
+    std::fs::write(dir.path().join("f"), "x").unwrap();
+    let security = WorkspaceSecurity::new(dir.path());
+    let check = |command: &str| classify_with_home(Some(home.path()), command, &security);
+
+    for command in [
+        "cp f ~/.agents/skills/x/SKILL.md",
+        "tee ~/.seavx/USER.md",
+        "echo x >> ~/.seavx/MEMORY.md",
+    ] {
+        assert_eq!(check(command).kind, ActionKind::GlobalWrite, "{command}");
+    }
+
+    // The checkpoint store is refused outright, and a destination built from a
+    // variable or a glob cannot be analysed, so it asks instead of allowing.
+    assert_eq!(
+        check("cp f .seavx/checkpoints/x").kind,
+        ActionKind::Destructive
+    );
+    let unanalysable = check("cp f \"$DEST\"");
+    assert!(
+        unanalysable.unanalysable && unanalysable.kind == ActionKind::Execute,
+        "a variable destination must ask"
+    );
+
+    // A workspace destination stays an ordinary write.
+    assert_eq!(check("cp f g").kind, ActionKind::Write);
+}

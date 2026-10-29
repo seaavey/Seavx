@@ -3,6 +3,7 @@ pub mod models;
 pub mod permissions;
 pub mod prompt;
 pub mod security;
+pub mod shell;
 pub mod skills;
 #[cfg(test)]
 #[path = "../tests/agent/agent.rs"]
