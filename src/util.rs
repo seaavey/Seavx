@@ -18,6 +18,14 @@ pub fn epoch_secs() -> u64 {
         .as_secs()
 }
 
+/// Milliseconds since the Unix epoch, `0` on clock failure.
+pub fn epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// Global (per-user) config.toml path; `None` when the home directory is unset.
 pub fn global_config_path() -> Option<PathBuf> {
     crate::home::dir().map(|home| home.join(".seavx/config.toml"))

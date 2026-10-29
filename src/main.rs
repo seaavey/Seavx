@@ -1,5 +1,6 @@
 pub mod agent;
 mod cli;
+mod history;
 mod home;
 mod tui;
 mod util;

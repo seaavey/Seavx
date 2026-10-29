@@ -12,7 +12,7 @@ use crate::tui::event::AgentState;
 use crate::tui::markdown;
 
 pub fn render(app: &App, frame: &mut Frame) {
-    let input_height = (app.input.lines().len() as u16).clamp(1, 6) + 2;
+    let input_height = app.input_height();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -51,7 +51,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         chunks[0],
     );
 
-    let millis = now_millis();
+    let millis = crate::util::epoch_millis();
 
     // 2. Conversation
     let lines = transcript_lines(app, chunks[1].width);
@@ -102,129 +102,107 @@ pub fn render(app: &App, frame: &mut Frame) {
     frame.render_widget(&app.input, chunks[3]);
 
     // 4b. Inline Slash Command Auto-complete Menu
-    let input_text = app.input.lines().join("\n").trim().to_string();
-    if input_text.starts_with('/') && !input_text.contains(' ') {
-        let matches: Vec<(&str, &str)> = crate::tui::app::SLASH_COMMANDS
+    let matches = app.slash_matches();
+    if !matches.is_empty() && !app.popups_dismissed() {
+        // Two border rows plus one row per command; SLASH_COMMANDS is short enough to fit.
+        let menu_height = matches.len() as u16 + 2;
+        let menu_width = 62.min(frame.area().width.saturating_sub(4));
+        let menu_y = chunks[3].y.saturating_sub(menu_height);
+        let menu_area = Rect::new(chunks[3].x + 2, menu_y, menu_width, menu_height);
+
+        frame.render_widget(Clear, menu_area);
+
+        let selected = app.slash_selected.min(matches.len() - 1);
+        let items: Vec<ListItem> = matches
             .iter()
-            .copied()
-            .filter(|(cmd, _)| cmd.starts_with(&input_text))
+            .enumerate()
+            .map(|(i, (cmd, desc))| {
+                let is_sel = i == selected;
+                let prefix = if is_sel { "> " } else { "  " };
+                let cmd_style = if is_sel {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                let line = Line::from(vec![
+                    Span::styled(format!("{prefix}{cmd:<12}"), cmd_style),
+                    Span::raw(" "),
+                    Span::styled(*desc, Style::default().fg(Color::DarkGray)),
+                ]);
+                ListItem::new(line)
+            })
             .collect();
 
-        if !matches.is_empty() {
-            // Two border rows plus one row per command; SLASH_COMMANDS is short enough to fit.
-            let menu_height = matches.len() as u16 + 2;
-            let menu_width = 62.min(frame.area().width.saturating_sub(4));
-            let menu_y = chunks[3].y.saturating_sub(menu_height);
-            let menu_area = Rect::new(chunks[3].x + 2, menu_y, menu_width, menu_height);
+        let menu_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
 
-            frame.render_widget(Clear, menu_area);
-
-            let selected = app.slash_selected.min(matches.len() - 1);
-            let items: Vec<ListItem> = matches
-                .iter()
-                .enumerate()
-                .map(|(i, (cmd, desc))| {
-                    let is_sel = i == selected;
-                    let prefix = if is_sel { "> " } else { "  " };
-                    let cmd_style = if is_sel {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-
-                    let line = Line::from(vec![
-                        Span::styled(format!("{prefix}{cmd:<12}"), cmd_style),
-                        Span::raw(" "),
-                        Span::styled(*desc, Style::default().fg(Color::DarkGray)),
-                    ]);
-                    ListItem::new(line)
-                })
-                .collect();
-
-            let menu_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray));
-
-            frame.render_widget(List::new(items).block(menu_block), menu_area);
-        }
+        frame.render_widget(List::new(items).block(menu_block), menu_area);
     }
 
     // 4c. Inline `@` File/Folder Search Popup
-    let at_query = input_text
-        .split_whitespace()
-        .last()
-        .filter(|w| w.starts_with('@'));
-    if let Some(query) = at_query {
-        let matches = crate::tui::app::scan_workspace_entries(query);
-        if !matches.is_empty() {
-            let max_visible_items = 8;
-            let menu_height = (matches.len().min(max_visible_items) as u16 + 2).min(10);
-            let menu_width = 70.min(frame.area().width.saturating_sub(4));
-            let menu_y = chunks[3].y.saturating_sub(menu_height);
-            let menu_area = Rect::new(chunks[3].x + 2, menu_y, menu_width, menu_height);
+    let matches = app.at_matches();
+    if !matches.is_empty() && !app.popups_dismissed() {
+        let layout = app.at_popup_layout(frame.area(), matches.len());
+        let menu_area = layout.area;
+        frame.render_widget(Clear, menu_area);
 
-            frame.render_widget(Clear, menu_area);
+        let selected = app.at_selected.min(matches.len() - 1);
+        // Sliding viewport calculation for auto-scrolling
+        let window_start = layout.window_start;
+        let window_end = (window_start + layout.max_visible).min(matches.len());
 
-            let selected = app.at_selected.min(matches.len() - 1);
-            // Sliding viewport calculation for auto-scrolling
-            let window_start = if selected >= max_visible_items {
-                selected + 1 - max_visible_items
-            } else {
-                0
-            };
-            let window_end = (window_start + max_visible_items).min(matches.len());
+        let items: Vec<ListItem> = matches[window_start..window_end]
+            .iter()
+            .enumerate()
+            .map(|(i, (is_dir, path))| {
+                let actual_idx = window_start + i;
+                let is_sel = actual_idx == selected;
+                let prefix = if is_sel { "> " } else { "  " };
+                let (kind_tag, kind_color) = if *is_dir {
+                    ("[folder]", Color::Blue)
+                } else {
+                    ("[file]  ", Color::Green)
+                };
 
-            let items: Vec<ListItem> = matches[window_start..window_end]
-                .iter()
-                .enumerate()
-                .map(|(i, (is_dir, path))| {
-                    let actual_idx = window_start + i;
-                    let is_sel = actual_idx == selected;
-                    let prefix = if is_sel { "> " } else { "  " };
-                    let (kind_tag, kind_color) = if *is_dir {
-                        ("[folder]", Color::Blue)
-                    } else {
-                        ("[file]  ", Color::Green)
-                    };
+                let line = Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(Color::Cyan)),
+                    Span::styled(kind_tag, Style::default().fg(kind_color)),
+                    Span::raw(" "),
+                    Span::styled(
+                        path,
+                        if is_sel {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        },
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
 
-                    let line = Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::Cyan)),
-                        Span::styled(kind_tag, Style::default().fg(kind_color)),
-                        Span::raw(" "),
-                        Span::styled(
-                            path,
-                            if is_sel {
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(Color::White)
-                            },
-                        ),
-                    ]);
-                    ListItem::new(line)
-                })
-                .collect();
+        let title = if matches.len() > layout.max_visible {
+            format!(
+                " Reference File/Folder [{}/{}] (↑/↓: scroll, Tab/Enter: insert) ",
+                selected + 1,
+                matches.len()
+            )
+        } else {
+            " Reference File/Folder (↑/↓: move, Tab/Enter: insert) ".to_string()
+        };
 
-            let title = if matches.len() > max_visible_items {
-                format!(
-                    " Reference File/Folder [{}/{}] (↑/↓: scroll, Tab/Enter: insert) ",
-                    selected + 1,
-                    matches.len()
-                )
-            } else {
-                " Reference File/Folder (↑/↓: move, Tab/Enter: insert) ".to_string()
-            };
+        let menu_block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
 
-            let menu_block = Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray));
-
-            frame.render_widget(List::new(items).block(menu_block), menu_area);
-        }
+        frame.render_widget(List::new(items).block(menu_block), menu_area);
     }
 
     // 5. Footer: model and context on the left, key hints on the right
@@ -326,29 +304,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 selected,
             } => {
                 let current_opt = options.get(*selected).copied().unwrap_or("none");
-                let border_color = match current_opt {
-                    "none" => Color::DarkGray,
-                    "minimal" => Color::Blue,
-                    "medium" => Color::Cyan,
-                    "high" => Color::Green,
-                    "highx" => Color::Magenta,
-                    "max" => {
-                        // Dynamic cycling rainbow border on each render tick
-                        let time = millis;
-                        let rainbow_palette = [
-                            Color::Red,
-                            Color::Rgb(255, 127, 0), // Orange
-                            Color::Yellow,
-                            Color::Green,
-                            Color::Cyan,
-                            Color::Blue,
-                            Color::Magenta,
-                        ];
-                        let idx = ((time / 150) as usize) % rainbow_palette.len();
-                        rainbow_palette[idx]
-                    }
-                    _ => Color::Yellow,
-                };
+                let border_color = effort_color(current_opt, millis);
 
                 let items: Vec<ListItem> = options
                     .iter()
@@ -356,15 +312,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                     .map(|(i, opt)| {
                         let prefix = if i == *selected { "❯ " } else { "  " };
                         let style = if i == *selected {
-                            let opt_color = match *opt {
-                                "none" => Color::DarkGray,
-                                "minimal" => Color::Blue,
-                                "medium" => Color::Cyan,
-                                "high" => Color::Green,
-                                "highx" => Color::Magenta,
-                                "max" => border_color,
-                                _ => Color::Yellow,
-                            };
+                            let opt_color = effort_color(opt, millis);
                             Style::default().fg(opt_color).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::White)
@@ -457,12 +405,28 @@ impl Orb {
     }
 }
 
-/// Shared animation clock for orbs and effort borders.
-fn now_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+/// Color for a reasoning-effort level; `max` cycles through a rainbow each tick.
+fn effort_color(level: &str, millis: u128) -> Color {
+    match level {
+        "none" => Color::DarkGray,
+        "minimal" => Color::Blue,
+        "medium" => Color::Cyan,
+        "high" => Color::Green,
+        "highx" => Color::Magenta,
+        "max" => {
+            const RAINBOW: [Color; 7] = [
+                Color::Red,
+                Color::Rgb(255, 127, 0), // Orange
+                Color::Yellow,
+                Color::Green,
+                Color::Cyan,
+                Color::Blue,
+                Color::Magenta,
+            ];
+            RAINBOW[((millis / 150) as usize) % RAINBOW.len()]
+        }
+        _ => Color::Yellow,
+    }
 }
 
 fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
@@ -592,195 +556,5 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
-
-    fn screen(input: &str) -> String {
-        let mut app = App::new();
-        app.input.insert_str(input);
-        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
-    }
-
-    #[test]
-    fn slash_menu_lists_every_match_inside_its_border() {
-        let filtered = screen("/m");
-        assert!(filtered.contains("/model"), "{filtered}");
-        assert!(filtered.contains("/memory"), "{filtered}");
-
-        let all = screen("/");
-        assert!(all.contains("/exit"), "{all}");
-    }
-
-    fn screen_of(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
-        terminal.draw(|frame| render(app, frame)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
-    }
-
-    #[test]
-    fn header_and_footer_show_build_mode() {
-        let app = App::new();
-        let screen = screen_of(&app);
-        assert!(screen.contains("[build]"), "{screen}");
-        assert!(screen.contains("build"), "{screen}");
-    }
-
-    #[test]
-    fn header_and_footer_show_plan_mode() {
-        let mut app = App::new();
-        app.mode = AgentMode::Plan;
-        let screen = screen_of(&app);
-        assert!(screen.contains("[plan]"), "{screen}");
-        assert!(screen.contains("plan"), "{screen}");
-        assert!(!screen.contains("[build]"), "{screen}");
-    }
-
-    #[test]
-    fn transcript_renders_markdown_instead_of_raw_syntax() {
-        let mut app = App::new();
-        app.push_text("## Status\n\n- **bold** and `code`\n\n```bash\ncargo test\n```\n");
-        let screen = screen_of(&app);
-        assert!(screen.contains("Status"), "{screen}");
-        assert!(screen.contains("• bold and code"), "{screen}");
-        assert!(screen.contains("cargo test"), "{screen}");
-        assert!(
-            !screen.contains("**"),
-            "markdown delimiters leaked: {screen}"
-        );
-        assert!(!screen.contains("##"), "heading hashes leaked: {screen}");
-        assert!(!screen.contains("```"), "fence leaked: {screen}");
-    }
-
-    #[test]
-    fn transcript_cache_tracks_content_and_width() {
-        let mut app = App::new();
-        app.push_text("first **answer**\n");
-        let narrow = transcript_lines(&app, 40);
-        let wider = transcript_lines(&app, 60);
-        assert_eq!(narrow.len(), wider.len(), "same content, same block count");
-
-        app.push_text("- second item\n");
-        let after_push = transcript_lines(&app, 60);
-        assert!(
-            after_push.len() > wider.len(),
-            "cache must invalidate on new text"
-        );
-
-        app.set_text("replaced");
-        assert_eq!(
-            transcript_lines(&app, 60).len(),
-            1,
-            "cache must invalidate on set_text"
-        );
-
-        app.clear_transcript();
-        assert!(
-            transcript_lines(&app, 60).is_empty(),
-            "cache must invalidate on clear"
-        );
-    }
-
-    #[test]
-    fn orb_animates_for_active_states_and_holds_idle() {
-        let distinct = |orb: Orb| {
-            (0..40u128)
-                .map(|i| orb.glyph(i * 45))
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-        };
-        assert!(distinct(Orb::Breathing) > 1);
-        assert!(distinct(Orb::Composing) > 1);
-        assert!(distinct(Orb::Working) > 1);
-        assert_eq!(distinct(Orb::Idle), 1, "idle orb stays still");
-    }
-
-    #[test]
-    fn reasoning_renders_gray_and_indented_above_the_answer() {
-        let mut app = App::new();
-        app.push_thinking("checking the loader\nsecond line");
-        app.push_text("\nDone.\n");
-        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-
-        let row = |y: u16| -> String { (0..90).map(|x| buffer[(x, y)].symbol()).collect() };
-        let thinking_y = (0..24)
-            .find(|y| row(*y).contains("thinking"))
-            .expect("thinking header");
-        let header = row(thinking_y);
-        assert!(header.starts_with("  "), "header is indented: {header:?}");
-        assert!(
-            !header.trim_start().starts_with("thinking"),
-            "orb glyph precedes the label: {header:?}"
-        );
-        assert!(row(thinking_y + 1).starts_with("  │ checking the loader"));
-        assert_eq!(
-            buffer[(4, thinking_y + 1)].style().fg,
-            Some(Color::DarkGray),
-            "reasoning text is gray"
-        );
-        let answer_y = (0..24).find(|y| row(*y).starts_with("Done.")).unwrap();
-        assert!(answer_y > thinking_y, "reasoning sits above the answer");
-    }
-
-    #[test]
-    fn reasoning_wraps_long_lines_with_aligned_prefix() {
-        let mut app = App::new();
-        app.push_thinking("This is a very long reasoning text that will exceed forty columns easily and must wrap nicely.");
-        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-
-        let row = |y: u16| -> String { (0..40).map(|x| buffer[(x, y)].symbol()).collect() };
-        let thinking_y = (0..24)
-            .find(|y| row(*y).contains("thinking"))
-            .expect("thinking header");
-        assert!(row(thinking_y + 1).starts_with("  │ This is a very"));
-        assert!(row(thinking_y + 2).starts_with("  │ "));
-        assert!(!row(thinking_y + 2).starts_with("  │   "));
-    }
-
-    #[test]
-    fn empty_session_shows_splash_until_transcript_starts() {
-        let mut app = App::new();
-        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
-        let draw = |app: &App, terminal: &mut Terminal<TestBackend>| -> Vec<String> {
-            terminal.draw(|frame| render(app, frame)).unwrap();
-            let buffer = terminal.backend().buffer();
-            (0..24)
-                .map(|y| (0..90).map(|x| buffer[(x, y)].symbol()).collect())
-                .collect()
-        };
-
-        let rows = draw(&app, &mut terminal);
-        let art_y = rows
-            .iter()
-            .position(|row| row.contains(SPLASH[2]))
-            .expect("splash on an empty session");
-        // 44 columns in a 90-column pane, horizontally centered.
-        assert_eq!(rows[art_y].find(SPLASH[2]), Some((90 - 44) / 2));
-        assert!(rows[art_y + 1].starts_with(&format!("{}{}", " ".repeat(23), SPLASH[3])));
-
-        app.push_text("hello");
-        assert!(
-            !draw(&app, &mut terminal)
-                .iter()
-                .any(|r| r.contains(SPLASH[2]))
-        );
-    }
-}
+#[path = "../../tests/tui/ui.rs"]
+mod tests;
