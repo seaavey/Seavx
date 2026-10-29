@@ -4,6 +4,7 @@ mod checkpoint;
 mod cli;
 mod history;
 mod home;
+pub mod session;
 mod tui;
 mod util;
 
