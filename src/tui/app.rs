@@ -353,6 +353,22 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Attach the store, or record the one notice and keep running unpersisted.
+    /// A corrupt or newer database never fails the TUI.
+    pub fn open_store(
+        &mut self,
+        store: Result<crate::session::SessionStore, crate::session::SessionError>,
+    ) {
+        match store {
+            Ok(store) => self.attach_store(std::sync::Arc::new(std::sync::Mutex::new(store))),
+            Err(error) => {
+                let notice = format!("Session history disabled: {error}");
+                self.persistence_error = Some(notice.clone());
+                self.push_notice(notice);
+            }
+        }
+    }
+
     /// Hand the app the store it writes through, or the run is unpersisted.
     pub fn attach_store(
         &mut self,
@@ -1233,14 +1249,7 @@ pub async fn start_tui(
 
     // One store handle for the run; a store that cannot open degrades to one
     // notice and an unpersisted session instead of failing the TUI.
-    match crate::session::SessionStore::open() {
-        Ok(store) => app.attach_store(std::sync::Arc::new(std::sync::Mutex::new(store))),
-        Err(error) => {
-            let notice = format!("Session history disabled: {error}");
-            app.persistence_error = Some(notice.clone());
-            app.push_notice(notice);
-        }
-    }
+    app.open_store(crate::session::SessionStore::open());
 
     // `seavx sessions resume` loads before the loop starts, so the indicator is
     // the transcript itself: no async restore to wait for.

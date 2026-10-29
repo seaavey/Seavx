@@ -740,3 +740,298 @@ fn a_full_transcript_renders_even_when_a_row_is_unreadable() {
         "{rendered}"
     );
 }
+
+fn crashed(store: SessionStore, id: i64) -> i64 {
+    store
+        .connection()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(store);
+    id
+}
+
+#[test]
+fn crash_after_the_user_row_leaves_one_pending_turn() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let id = {
+        let store = SessionStore::open_at(&path).unwrap();
+        let id = store.create("/ws", None, None).unwrap();
+        store.record_user(id, "was I sent?").unwrap();
+        crashed(store, id)
+    };
+
+    let store = SessionStore::open_at(&path).unwrap();
+    let loaded = store.load(id).unwrap();
+    let outcome = replay(&loaded);
+    assert_eq!(outcome.draft.as_deref(), Some("was I sent?"));
+    assert!(
+        outcome.history.is_empty(),
+        "an unanswered row is not history"
+    );
+    assert_eq!(loaded.messages.len(), 1, "no invented assistant row");
+    assert_eq!(state_of(&store, "/ws", id), TurnState::Pending);
+    assert_eq!(
+        store.record_recovery(id).unwrap(),
+        0,
+        "recovery invents nothing for a pending user row"
+    );
+}
+
+#[test]
+fn crash_after_the_tool_call_row_writes_one_synthetic_result() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let id = {
+        let store = SessionStore::open_at(&path).unwrap();
+        let id = store.create("/ws", None, None).unwrap();
+        store.record_user(id, "read two").unwrap();
+        store
+            .record_message(
+                id,
+                &call_message(vec![
+                    tool_call("call_a", "read_file"),
+                    tool_call("call_b", "read_file"),
+                ]),
+                MessageStatus::Complete,
+            )
+            .unwrap();
+        crashed(store, id)
+    };
+
+    let store = SessionStore::open_at(&path).unwrap();
+    assert_eq!(
+        store.record_recovery(id).unwrap(),
+        2,
+        "one per missing call"
+    );
+    assert_eq!(store.record_recovery(id).unwrap(), 0, "persisted once");
+
+    let loaded = store.load(id).unwrap();
+    let outcome = replay(&loaded);
+    assert!(
+        outcome.synthetic.is_empty(),
+        "the rows are stored, not patched"
+    );
+    let answered: Vec<String> = outcome
+        .history
+        .iter()
+        .flat_map(|message| message.content.tool_responses())
+        .map(|response| response.call_id.clone())
+        .collect();
+    assert_eq!(answered, vec!["call_a", "call_b"]);
+}
+
+#[test]
+fn a_rolled_back_tool_result_leaves_the_previous_message() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    store.record_user(id, "go").unwrap();
+    store
+        .record_message(
+            id,
+            &call_message(vec![tool_call("call_a", "read_file")]),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+    store
+        .record_message(
+            id,
+            &result_message("call_a", "first result"),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+
+    // A crash mid-write: the insert never commits.
+    let connection = store.connection();
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    connection
+        .execute(
+            "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+             VALUES (?1, 99, 'tool', 'complete', 'half a payload', 0)",
+            [id],
+        )
+        .unwrap();
+    connection.execute_batch("ROLLBACK").unwrap();
+
+    assert_eq!(seqs(&store), vec![1, 2, 3]);
+    let loaded = store.load(id).unwrap();
+    assert_eq!(loaded.messages.len(), 3);
+    assert!(
+        loaded.messages[2].payload.contains("first result"),
+        "the previous message survives"
+    );
+}
+
+#[test]
+fn a_held_write_lock_degrades_instead_of_blocking_list() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    store.record_user(id, "listed while locked").unwrap();
+
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        ready_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        holder.execute_batch("ROLLBACK").unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    let started = std::time::Instant::now();
+    let listed = store.list("/ws").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "list runs under WAL while another process writes"
+    );
+
+    let error = store.record_user(id, "blocked").unwrap_err();
+    assert!(matches!(error, SessionError::Busy), "{error}");
+    blocker.join().unwrap();
+}
+
+#[test]
+fn a_corrupt_database_disables_persistence_for_the_run() {
+    use crate::tui::app::test_app;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    std::fs::write(&path, b"not a database").unwrap();
+    let Err(error) = SessionStore::open_at(&path) else {
+        panic!("a corrupt database must not open");
+    };
+    assert!(
+        error.to_string().starts_with("session store unavailable"),
+        "{error}"
+    );
+
+    // The TUI path: one notice, then the run continues unpersisted.
+    let expected = format!("Session history disabled: {error}");
+    let mut app = test_app();
+    app.open_store(Err(error));
+    assert!(app.store.is_none());
+    let notice = app.persistence_error.clone().expect("one notice");
+    assert_eq!(notice, expected);
+    let request = app
+        .submit_turn("still runs")
+        .expect("a turn without a store");
+    assert!(request.store.is_none());
+}
+
+#[test]
+fn an_unparseable_payload_opens_the_session_read_only() {
+    use crate::tui::app::test_app;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    store.record_user(id, "kept").unwrap();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+             VALUES (?1, 99, 'assistant', 'complete', 'not json', 0)",
+            [id],
+        )
+        .unwrap();
+
+    let loaded = store.load(id).unwrap();
+    let reason = loaded.read_only.clone().expect("read-only with a reason");
+    assert!(reason.contains("cannot be read"), "{reason}");
+
+    // New turns are refused with the reason; export still works.
+    let mut app = test_app();
+    app.open_store(Ok(store));
+    app.load_session(loaded);
+    assert!(app.submit_turn("more").is_none());
+    let transcript = app
+        .segments
+        .iter()
+        .map(|segment| match segment {
+            crate::tui::app::Segment::Text(text) => text.clone(),
+            crate::tui::app::Segment::Thinking(text) => text.clone(),
+        })
+        .collect::<String>();
+    assert!(transcript.contains("read-only"), "{transcript}");
+}
+
+#[test]
+fn redaction_covers_tool_text_but_not_prompts_or_checkpoints() {
+    use crate::agent::security;
+    use crate::checkpoint::{CheckpointInput, CheckpointStore, CheckpointTarget, EntryState};
+
+    let key = "sk-live-0123456789abcdef";
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+
+    // A prompt is stored verbatim: it is not tool output.
+    store
+        .record_user(id, &format!("my key is {key}, remember it"))
+        .unwrap();
+    let prompt_payload: String = store
+        .connection()
+        .query_row("SELECT payload FROM messages WHERE seq = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(prompt_payload.contains(key), "prompts persist verbatim");
+
+    // The tool result is redacted before it is persisted, never at read time.
+    store
+        .record_message(
+            id,
+            &call_message(vec![tool_call("call_a", "read_file")]),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+    let result = security::redact(&format!("OPENAI_API_KEY={key}"));
+    store
+        .record_message(
+            id,
+            &result_message("call_a", &result),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+    let tool_payload: String = store
+        .connection()
+        .query_row("SELECT payload FROM messages WHERE seq = 3", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(!tool_payload.contains(key), "{tool_payload}");
+    assert!(tool_payload.contains("[redacted]"));
+
+    // A checkpoint keeps the file byte-for-byte: undo must restore it.
+    let workspace = tempfile::TempDir::new().unwrap();
+    let target = workspace.path().join("notes.txt");
+    let bytes = format!("OPENAI_API_KEY={key}\n").into_bytes();
+    std::fs::write(&target, &bytes).unwrap();
+    let checkpoint = CheckpointStore::create(
+        workspace.path(),
+        &[CheckpointInput {
+            target: CheckpointTarget::Workspace(target.clone()),
+            state: EntryState::Modified,
+            original: Some(bytes.clone()),
+        }],
+    )
+    .unwrap();
+    let backup = std::fs::read_dir(&checkpoint)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .find(|path| std::fs::read(path).is_ok_and(|data| data == bytes));
+    assert!(
+        backup.is_some(),
+        "the checkpoint backup holds the original bytes"
+    );
+}

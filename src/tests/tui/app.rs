@@ -549,3 +549,69 @@ fn clear_starts_a_new_session_and_keeps_the_old_one_loadable() {
         "nothing was deleted"
     );
 }
+
+#[test]
+fn resending_a_pending_prompt_creates_one_row_and_one_request() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = crate::session::SessionStore::open_at(&path).unwrap();
+    let workspace = crate::session::workspace_key();
+    let id = store.create(&workspace, None, None).unwrap();
+    store.record_user(id, "retry me").unwrap();
+
+    let mut app = test_app();
+    app.attach_store(std::sync::Arc::new(std::sync::Mutex::new(
+        crate::session::SessionStore::open_at(&path).unwrap(),
+    )));
+    app.load_session(store.load(id).unwrap());
+    assert_eq!(app.status, AgentState::Idle, "nothing reaches the provider");
+
+    let request = app
+        .submit_turn(&app.input_text())
+        .expect("exactly one request");
+    let (same_id, history) = crate::session::prepare_turn(
+        &store,
+        &workspace,
+        "fake-model",
+        app.session_id,
+        &request.prompt,
+    )
+    .unwrap();
+    assert_eq!(same_id, id);
+    assert!(history.is_empty(), "the prompt is not replayed");
+
+    let (role, status, payload): (String, String, String) = store
+        .connection()
+        .query_row(
+            "SELECT role, status, payload FROM messages ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((role.as_str(), status.as_str()), ("user", "complete"));
+    let sent: genai::chat::ChatMessage = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        sent.content.texts().join(""),
+        "retry me",
+        "the text appears exactly once in the new row"
+    );
+
+    // A second Enter after the turn completes sends nothing again.
+    assert!(app.submit_turn(&app.input_text()).is_none());
+    let users: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE role = 'user'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(users, 2, "the old unanswered row is never rewritten");
+    let first: String = store
+        .connection()
+        .query_row("SELECT status FROM messages WHERE seq = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(first, "complete", "the stored status is untouched");
+}
