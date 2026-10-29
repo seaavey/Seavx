@@ -3,19 +3,7 @@
 All notable changes to Seavx are recorded here, grouped by category. One entry
 per landed change; no entry describes behaviour that is not in the code.
 
-## 0.1.1-rc.4 — 2026-10-29
-
-### tests
-
-- The Unix-only umask guard and its lock in `src/tests/core/atomic_file.rs`, and
-  the `run_shell` import in `src/tests/core/cancel.rs`, are `#[cfg(unix)]`.
-  `cargo check --all-targets` on Windows failed to compile the test target
-  because of them; production code was never affected.
-
-`v0.1.1-rc.3` stays tagged where it was cut (`d34604a`) and is not reused: its
-Windows check job failed, so no release was published for it.
-
-## 0.1.1-rc.3 — 2026-10-29
+## 0.1.2 — 2026-10-29
 
 ### feature
 
@@ -48,6 +36,13 @@ Windows check job failed, so no release was published for it.
   `Running → Completed|Failed`, no reverse edges) and returns a `TurnOutcome`.
 - New configs default to `max_turns = 100`.
 
+### fix
+
+- The Unix-only umask guard and its lock in `src/tests/core/atomic_file.rs`, and
+  the `run_shell` import in `src/tests/core/cancel.rs`, are `#[cfg(unix)]`, so
+  `cargo check --all-targets` compiles on Windows. Test code only; no runtime
+  behaviour changed.
+
 ### tests
 
 - Local SSE server fixtures: frame split at every boundary, multi-line `data:`,
@@ -62,8 +57,9 @@ Windows check job failed, so no release was published for it.
 ### docs
 
 - README: streaming and cancellation limits, the cleanup wording ("no orphan
-  where the OS confirmed the kill"), the Unix-only platform scope, the `doctor`
-  check list, and the registry/palette relationship.
+  where the OS confirmed the kill"), the Unix-only platform scope, the remaining
+  limits (no encryption at rest, no automatic crash rollback), the `doctor` check
+  list, and the registry/palette relationship.
 - `src/systems/coding.md` states the streaming and cleanup rules for the agent.
 
 ### deps
