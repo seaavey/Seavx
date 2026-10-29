@@ -499,10 +499,12 @@ mod engine_seam {
                 AgentMode::Build,
                 history,
                 &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
                 |_| {},
                 |message, _| reported.push(message.clone()),
             )
             .await
+            .result
             .unwrap();
 
         assert_eq!(answer, "all done");
@@ -549,10 +551,12 @@ mod engine_seam {
                 AgentMode::Build,
                 history,
                 &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
                 |_| {},
                 |_, _| {},
             )
             .await
+            .result
             .unwrap();
 
         let requests = fake.requests();
@@ -891,10 +895,12 @@ mod retry_budget {
                 AgentMode::Build,
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
                 |_| {},
                 |_, _| {},
             )
             .await
+            .result
             .unwrap();
 
         assert_eq!(answer, "recovered");
@@ -933,10 +939,12 @@ mod retry_budget {
                 AgentMode::Build,
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
                 |_| {},
                 |_, _| {},
             )
             .await
+            .result
             .unwrap_err();
 
         assert!(error.to_string().contains("bad model"), "{error}");
@@ -960,10 +968,12 @@ mod retry_budget {
                 AgentMode::Build,
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
                 |_| {},
                 |_, _| {},
             )
             .await
+            .result
             .unwrap_err();
 
         assert!(
@@ -1051,10 +1061,12 @@ mod repeated_actions {
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
                 |_| {},
                 |_, _| {},
             )
             .await
+            .result
             .unwrap();
 
         assert!(
@@ -1099,10 +1111,12 @@ mod backend_seam {
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
                 |_| {},
                 |_, _| {},
             )
             .await
+            .result
             .unwrap();
 
         assert_eq!(answer, "through the seam");

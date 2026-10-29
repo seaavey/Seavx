@@ -159,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
                     agent::engine::AgentMode::Build,
                     Vec::new(),
                     &agent::permissions::DenyingConfirmer,
+                    &agent::cancel::CancelToken::new(),
                     |evt| {
                         // Reasoning blocks are a TUI concern; headless runs skip them.
                         if let Some(token) = evt.strip_prefix("TOKEN:") {
@@ -171,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
                     |_, _| {},
                 )
                 .await
+                .result
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             println!("\nFinal Response:\n{result}");

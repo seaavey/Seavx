@@ -1,10 +1,12 @@
-use crate::agent::backend::{ChatBackend, GenaiBackend, StreamDelta};
+use crate::agent::backend::{BackendError, ChatBackend, GenaiBackend, StreamDelta};
+use crate::agent::cancel::{CancelToken, Cleanup, TurnState, TurnStatus};
 use crate::agent::permissions::{
     self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
 };
 use crate::agent::prompt::{PLAN_POLICY, load_system_prompt};
 use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
+use crate::session::MessageStatus;
 use genai::Client;
 use genai::adapter::AdapterKind;
 use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort, ToolResponse};
@@ -504,6 +506,57 @@ fn halve_turns(request: &ChatRequest) -> ChatRequest {
     rebuilt.append_message(messages[messages.len() - 1].clone())
 }
 
+/// What one turn ended as. `result` is the answer, or the error that failed or
+/// cancelled it.
+pub struct TurnOutcome {
+    pub status: TurnStatus,
+    pub cleanup: Option<Cleanup>,
+    pub result: Result<String, BackendError>,
+}
+
+/// How a turn stops inside the loop: cancelled on request, or failed.
+enum TurnError {
+    Cancelled,
+    Failed(BackendError),
+}
+
+impl From<BackendError> for TurnError {
+    fn from(error: BackendError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Runs `future` until it finishes or the token is set; `None` means the caller
+/// must abandon it and keep whatever already left its sink.
+async fn until_cancelled<F: std::future::Future>(
+    cancel: &CancelToken,
+    future: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        value = future => Some(value),
+    }
+}
+
+/// The one way a turn reports a cancel: the state machine moves to
+/// `Cancelling`, the caller finishes at `Cancelled`.
+fn cancelled(turn_state: &mut TurnState) -> TurnError {
+    turn_state.transition(TurnStatus::Cancelling);
+    TurnError::Cancelled
+}
+
+/// A cancelled turn always leaves one assistant row: `cancelled` with no text,
+/// `partial` with what arrived.
+fn report_cancelled(on_message: &mut impl FnMut(&ChatMessage, MessageStatus), received: &str) {
+    let status = if received.trim().is_empty() {
+        MessageStatus::Cancelled
+    } else {
+        MessageStatus::Partial
+    };
+    on_message(&ChatMessage::assistant(received), status);
+}
+
 pub struct AgentRuntime {
     client: Client,
     backend: Box<dyn ChatBackend>,
@@ -614,15 +667,67 @@ impl AgentRuntime {
         }
     }
 
+    /// One user turn. The outcome carries the terminal status, what the OS said
+    /// about a killed process tree, and the answer or the failure.
+    // The argument list is the phase plan's interface, and the TUI and `exec`
+    // both call it: folding it into a struct would add a shape with one caller.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_task(
         &self,
         task: &str,
         mode: AgentMode,
         history: Vec<ChatMessage>,
         confirm: &dyn Confirmer,
+        cancel: &CancelToken,
+        event_sink: impl FnMut(&str) + Send,
+        on_message: impl FnMut(&ChatMessage, MessageStatus),
+    ) -> TurnOutcome {
+        let mut turn = TurnState::new();
+        let result = match self
+            .run_turn(
+                task, mode, history, confirm, cancel, &mut turn, event_sink, on_message,
+            )
+            .await
+        {
+            Ok(answer) => {
+                turn.transition(TurnStatus::Completed);
+                Ok(answer)
+            }
+            Err(TurnError::Cancelled) => {
+                // Cancelling is reported, never skipped: the TUI reads it.
+                turn.transition(TurnStatus::Cancelling);
+                turn.transition(TurnStatus::Cancelled);
+                Err(std::io::Error::other("the turn was cancelled").into())
+            }
+            Err(TurnError::Failed(error)) => {
+                turn.transition(TurnStatus::Failed);
+                Err(error)
+            }
+        };
+
+        TurnOutcome {
+            status: turn.status(),
+            cleanup: turn.cleanup(),
+            result,
+        }
+    }
+
+    // Same seam, plus the state machine this layer owns.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_turn(
+        &self,
+        task: &str,
+        mode: AgentMode,
+        history: Vec<ChatMessage>,
+        confirm: &dyn Confirmer,
+        cancel: &CancelToken,
+        turn_state: &mut TurnState,
         mut event_sink: impl FnMut(&str) + Send,
-        mut on_message: impl FnMut(&ChatMessage, crate::session::MessageStatus),
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        mut on_message: impl FnMut(&ChatMessage, MessageStatus),
+    ) -> Result<String, TurnError> {
+        if cancel.is_cancelled() {
+            return Err(TurnError::Cancelled);
+        }
         let summarizer: std::sync::Arc<dyn crate::tui::compact::Summarizer> = match &self.summarizer
         {
             Some(summarizer) => summarizer.clone(),
@@ -649,6 +754,9 @@ impl AgentRuntime {
         let mut last_failure: Option<String> = None;
 
         for turn in 0..self.config.max_turns {
+            if cancel.is_cancelled() {
+                return Err(cancelled(turn_state));
+            }
             tracing::debug!(turn = turn, "Executing chat request");
 
             // Log full request payload to .seavx/request.log
@@ -664,32 +772,44 @@ impl AgentRuntime {
             // request otherwise. Both share the turn's single retry.
             let mut got_delta = false;
             let mut received = String::new();
-            let first = if self.config.stream {
-                let mut on_delta = |delta: StreamDelta| {
-                    got_delta = true;
-                    retry.note_output();
-                    match delta {
-                        StreamDelta::Token(token) => {
-                            received.push_str(&token);
-                            event_sink(&format!("TOKEN:{token}"));
+            let attempt = async {
+                if self.config.stream {
+                    let mut on_delta = |delta: StreamDelta| {
+                        got_delta = true;
+                        retry.note_output();
+                        match delta {
+                            StreamDelta::Token(token) => {
+                                received.push_str(&token);
+                                event_sink(&format!("TOKEN:{token}"));
+                            }
+                            StreamDelta::Thinking(thoughts) => {
+                                event_sink(&format!("THINKING:{thoughts}"));
+                            }
                         }
-                        StreamDelta::Thinking(thoughts) => {
-                            event_sink(&format!("THINKING:{thoughts}"));
-                        }
-                    }
-                };
-                self.backend
-                    .stream(
-                        &self.config.model,
-                        chat_req.clone(),
-                        Some(&chat_options),
-                        &mut on_delta,
-                    )
-                    .await
-            } else {
-                self.backend
-                    .send(&self.config.model, chat_req.clone(), Some(&chat_options))
-                    .await
+                    };
+                    self.backend
+                        .stream(
+                            &self.config.model,
+                            chat_req.clone(),
+                            Some(&chat_options),
+                            &mut on_delta,
+                        )
+                        .await
+                } else {
+                    self.backend
+                        .send(&self.config.model, chat_req.clone(), Some(&chat_options))
+                        .await
+                }
+            };
+
+            let first = match until_cancelled(cancel, attempt).await {
+                Some(first) => first,
+                None => {
+                    // The future is dropped, so nothing more is read; the
+                    // deltas that already left the sink are kept.
+                    report_cancelled(&mut on_message, &received);
+                    return Err(cancelled(turn_state));
+                }
             };
 
             let response = match first {
@@ -697,12 +817,9 @@ impl AgentRuntime {
                 Err(error) if got_delta => {
                     // Output already left the sink: persisted, never resent.
                     if !received.trim().is_empty() {
-                        on_message(
-                            &ChatMessage::assistant(&received),
-                            crate::session::MessageStatus::Partial,
-                        );
+                        on_message(&ChatMessage::assistant(&received), MessageStatus::Partial);
                     }
-                    return Err(error);
+                    return Err(TurnError::Failed(error));
                 }
                 Err(error) => {
                     // One retry per turn, on the first identified trigger only.
@@ -714,7 +831,7 @@ impl AgentRuntime {
                         None => self.config.stream && retry.spend(RetryTrigger::StreamUnavailable),
                     };
                     if !spent {
-                        return Err(error);
+                        return Err(TurnError::Failed(error));
                     }
                     if let Some(trigger) = trigger {
                         chat_req = match trigger {
@@ -728,9 +845,18 @@ impl AgentRuntime {
                     }
                     // A failure here is the turn's failure: it never buys a
                     // second retry.
-                    self.backend
-                        .send(&self.config.model, chat_req.clone(), Some(&chat_options))
-                        .await?
+                    let retry_send = self.backend.send(
+                        &self.config.model,
+                        chat_req.clone(),
+                        Some(&chat_options),
+                    );
+                    match until_cancelled(cancel, retry_send).await {
+                        Some(result) => result?,
+                        None => {
+                            report_cancelled(&mut on_message, &received);
+                            return Err(cancelled(turn_state));
+                        }
+                    }
                 }
             };
 
@@ -885,10 +1011,16 @@ impl AgentRuntime {
             .with_tools(Vec::<genai::chat::Tool>::new())
             .append_message(ChatMessage::user(final_prompt));
 
-        let response = self
+        let forced = self
             .backend
-            .send(&self.config.model, forced_req, Some(&chat_options))
-            .await?;
+            .send(&self.config.model, forced_req, Some(&chat_options));
+        let response = match until_cancelled(cancel, forced).await {
+            Some(result) => result?,
+            None => {
+                report_cancelled(&mut on_message, "");
+                return Err(cancelled(turn_state));
+            }
+        };
 
         let final_text = response.into_first_text().unwrap_or_default();
         if !final_text.trim().is_empty() {

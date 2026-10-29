@@ -141,10 +141,12 @@ async fn a_stream_that_fails_before_the_first_chunk_falls_back_once() {
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
+            &crate::agent::cancel::CancelToken::new(),
             |_| {},
             |_, _| {},
         )
         .await
+        .result
         .unwrap();
 
     assert_eq!(answer, "fallback answer");
@@ -166,10 +168,12 @@ async fn a_stream_that_fails_after_one_chunk_is_not_retried() {
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
+            &crate::agent::cancel::CancelToken::new(),
             |event| events.push(event.to_string()),
             |message, status| reported.push((message.clone(), status)),
         )
         .await
+        .result
         .unwrap_err();
 
     assert!(error.to_string().contains("broken pipe"), "{error}");
@@ -198,10 +202,12 @@ async fn the_fallback_consumes_the_single_retry() {
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
+            &crate::agent::cancel::CancelToken::new(),
             |_| {},
             |_, _| {},
         )
         .await
+        .result
         .unwrap_err();
 
     assert!(error.to_string().contains("tool_call_id"), "{error}");
@@ -225,10 +231,12 @@ async fn stream_false_skips_the_stream_attempt() {
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
+            &crate::agent::cancel::CancelToken::new(),
             |_| {},
             |_, _| {},
         )
         .await
+        .result
         .unwrap();
 
     assert_eq!(answer, "plain answer");

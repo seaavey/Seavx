@@ -1140,6 +1140,7 @@ pub async fn run_agent_worker(
         // the turn must not append it a second time.
         let streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let streamed_evt = streamed.clone();
+        let self_cancel = crate::agent::cancel::CancelToken::new();
         let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
         let result = runtime
             .execute_task(
@@ -1147,6 +1148,7 @@ pub async fn run_agent_worker(
                 mode,
                 history,
                 &TuiConfirmer::new(tx.clone()),
+                &self_cancel,
                 move |evt| {
                     if let Some(rest) = evt.strip_prefix("USAGE:") {
                         let parts: Vec<&str> = rest.split(':').collect();
@@ -1190,7 +1192,7 @@ pub async fn run_agent_worker(
             )
             .await;
 
-        match result {
+        match result.result {
             Ok(answer) => {
                 if streamed.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = tx.send(Action::AgentToken("\n".to_string()));

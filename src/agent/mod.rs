@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod batch;
 pub mod budget;
+pub mod cancel;
 pub mod engine;
 pub mod models;
 pub mod patch;
