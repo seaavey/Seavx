@@ -390,5 +390,5 @@ pub fn sanitize(text: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "../../tests/tui/commands.rs"]
+#[path = "../tests/tui/commands.rs"]
 mod tests;

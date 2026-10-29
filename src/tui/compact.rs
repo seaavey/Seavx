@@ -226,5 +226,5 @@ pub fn build_agent_task(prompt: &str, session_context: Option<&str>) -> String {
 }
 
 #[cfg(test)]
-#[path = "../../tests/tui/compact.rs"]
+#[path = "../tests/tui/compact.rs"]
 mod tests;

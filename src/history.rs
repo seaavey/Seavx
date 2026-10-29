@@ -139,5 +139,5 @@ fn unescape(text: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "../tests/core/history.rs"]
+#[path = "tests/core/history.rs"]
 mod tests;

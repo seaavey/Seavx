@@ -457,5 +457,5 @@ pub fn init_workspace(workspace_root: &Path) -> Result<(PathBuf, bool), String> 
 }
 
 #[cfg(test)]
-#[path = "../../tests/cli/config.rs"]
+#[path = "../tests/cli/config.rs"]
 mod tests;

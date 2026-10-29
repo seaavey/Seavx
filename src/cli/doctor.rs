@@ -366,5 +366,5 @@ impl EndpointProbe for HttpProbe {
 }
 
 #[cfg(test)]
-#[path = "../../tests/cli/doctor.rs"]
+#[path = "../tests/cli/doctor.rs"]
 mod tests;

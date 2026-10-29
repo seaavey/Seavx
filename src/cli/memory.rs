@@ -266,5 +266,5 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-#[path = "../../tests/cli/memory.rs"]
+#[path = "../tests/cli/memory.rs"]
 mod tests;

@@ -517,5 +517,5 @@ fn fit_spans(cell: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
 }
 
 #[cfg(test)]
-#[path = "../../tests/tui/markdown.rs"]
+#[path = "../tests/tui/markdown.rs"]
 mod tests;

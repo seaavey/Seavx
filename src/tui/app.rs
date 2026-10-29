@@ -1469,5 +1469,5 @@ pub(crate) fn test_app() -> App<'static> {
 }
 
 #[cfg(test)]
-#[path = "../../tests/tui/app.rs"]
+#[path = "../tests/tui/app.rs"]
 mod tests;
