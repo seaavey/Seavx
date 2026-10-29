@@ -710,9 +710,17 @@ impl ToolRegistry {
     }
 
     pub fn to_genai_tools(&self, mode: AgentMode) -> Vec<genai::chat::Tool> {
-        self.tools
+        let mut tools: Vec<Arc<dyn AgentTool>> = self
+            .tools
             .values()
             .filter(|tool| mode == AgentMode::Build || tool.is_read_only())
+            .cloned()
+            .collect();
+        // HashMap order varies per run; a stable list keeps the request prefix
+        // identical so prompt caching and log comparisons stay meaningful.
+        tools.sort_by_key(|tool| tool.name());
+        tools
+            .into_iter()
             .map(|tool| {
                 genai::chat::Tool::new(tool.name())
                     .with_description(tool.description())
