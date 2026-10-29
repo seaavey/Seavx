@@ -30,8 +30,8 @@ impl SkillManager {
         list
     }
 
-    /// Automatically save a synthesised skill into the project skills dir
-    pub fn save_skill(&self, name: &str, content: &str) -> Result<PathBuf, String> {
+    /// File a new skill would be written to, resolvable before it exists.
+    pub fn skill_path(&self, name: &str) -> Result<PathBuf, String> {
         let sanitized_name: String = name
             .chars()
             .map(|c| {
@@ -47,11 +47,18 @@ impl SkillManager {
             return Err("Invalid skill name".to_string());
         }
 
-        let skill_dir = self.roots[0].join(&sanitized_name);
-        std::fs::create_dir_all(&skill_dir)
+        Ok(self.roots[0].join(sanitized_name).join("SKILL.md"))
+    }
+
+    /// Automatically save a synthesised skill into the project skills dir
+    pub fn save_skill(&self, name: &str, content: &str) -> Result<PathBuf, String> {
+        let skill_file = self.skill_path(name)?;
+        let skill_dir = skill_file
+            .parent()
+            .ok_or_else(|| "Invalid skill name".to_string())?;
+        std::fs::create_dir_all(skill_dir)
             .map_err(|e| format!("Failed to create skill directory: {e}"))?;
 
-        let skill_file = skill_dir.join("SKILL.md");
         crate::atomic_file::write_atomic(
             &skill_file,
             content.as_bytes(),

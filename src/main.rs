@@ -1,5 +1,6 @@
 pub mod agent;
 mod atomic_file;
+mod checkpoint;
 mod cli;
 mod history;
 mod home;
