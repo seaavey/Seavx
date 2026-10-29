@@ -402,51 +402,68 @@ impl AgentTool for SearchFilesTool {
         let root = security.validate_path(&search_path)?;
 
         let pattern = parsed.pattern.clone();
-        let results = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
-            let mut matches = Vec::new();
-            let mut stack = vec![root];
+        let results =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<String>, usize), String> {
+                let mut matches = Vec::new();
+                let mut skipped = 0usize;
+                let mut stack = vec![root];
 
-            while let Some(current_dir) = stack.pop() {
-                let read_dir = match std::fs::read_dir(&current_dir) {
-                    Ok(rd) => rd,
-                    Err(_) => continue,
-                };
+                while let Some(current_dir) = stack.pop() {
+                    let read_dir = match std::fs::read_dir(&current_dir) {
+                        Ok(rd) => rd,
+                        Err(_) => continue,
+                    };
 
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    let file_name = path
-                        .file_name()
-                        .map(|s| s.to_string_lossy())
-                        .unwrap_or_default();
+                    for entry in read_dir.flatten() {
+                        let path = entry.path();
+                        let file_name = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy())
+                            .unwrap_or_default();
 
-                    // Skip hidden dirs, build artifacts and dependencies like every other walk.
-                    if crate::util::is_skipped(&file_name) {
-                        continue;
-                    }
-
-                    if path.is_dir() {
-                        stack.push(path);
-                    } else if path.is_file() {
-                        if target_mode == "files" {
-                            if file_name.contains(&pattern) {
-                                matches.push(path.display().to_string());
+                        // Policy before the skip list: a protected file is counted even
+                        // when it is hidden, while a protected directory is dropped
+                        // without a count because it is not a file result.
+                        if crate::agent::security::check_file(&path).is_err() {
+                            if path.is_file() {
+                                skipped += 1;
                             }
-                        } else {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                for (idx, line) in content.lines().enumerate() {
-                                    if line.contains(&pattern) {
-                                        matches.push(format!(
-                                            "{}:{}: {}",
-                                            path.display(),
-                                            idx + 1,
-                                            line.trim()
-                                        ));
-                                        if matches.len() >= 100 {
-                                            break;
+                            continue;
+                        }
+
+                        // Skip hidden dirs, build artifacts and dependencies like every other walk.
+                        if crate::util::is_skipped(&file_name) {
+                            continue;
+                        }
+
+                        if path.is_dir() {
+                            stack.push(path);
+                        } else if path.is_file() {
+                            if target_mode == "files" {
+                                if file_name.contains(&pattern) {
+                                    matches.push(path.display().to_string());
+                                }
+                            } else {
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    for (idx, line) in content.lines().enumerate() {
+                                        if line.contains(&pattern) {
+                                            matches.push(format!(
+                                                "{}:{}: {}",
+                                                path.display(),
+                                                idx + 1,
+                                                line.trim()
+                                            ));
+                                            if matches.len() >= 100 {
+                                                break;
+                                            }
                                         }
                                     }
                                 }
                             }
+                        }
+
+                        if matches.len() >= 100 {
+                            break;
                         }
                     }
 
@@ -455,26 +472,26 @@ impl AgentTool for SearchFilesTool {
                     }
                 }
 
-                if matches.len() >= 100 {
-                    break;
-                }
-            }
+                Ok((matches, skipped))
+            })
+            .await
+            .map_err(|e| format!("Search task failed: {e}"))??;
 
-            Ok(matches)
-        })
-        .await
-        .map_err(|e| format!("Search task failed: {e}"))??;
-
-        if results.is_empty() {
-            Ok(format!("No matches found for pattern '{}'", parsed.pattern))
+        let (results, skipped) = results;
+        let mut output = if results.is_empty() {
+            format!("No matches found for pattern '{}'", parsed.pattern)
         } else {
             let count = results.len();
             let mut output = results.join("\n");
             if count >= 100 {
                 output.push_str("\n[Truncated to 100 results]");
             }
-            Ok(output)
+            output
+        };
+        if skipped > 0 {
+            output.push_str(&format!("\n[{skipped} files skipped by policy]"));
         }
+        Ok(crate::agent::security::redact(&output))
     }
 }
 

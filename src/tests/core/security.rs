@@ -189,3 +189,62 @@ fn redact_masks_every_documented_shape() {
         "ordinary text"
     );
 }
+
+/// Fixture for the search tests: one ordinary hit, and three protected ones.
+fn search_workspace() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    for rel in ["notes.md", "deploy.pem", ".env", ".git/config"] {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "PRIVATE_KEY here\n").unwrap();
+    }
+    dir
+}
+
+#[tokio::test]
+async fn search_skips_protected_files_and_counts_them() {
+    let dir = search_workspace();
+    let security = WorkspaceSecurity::new(dir.path());
+    let output = crate::agent::tools::ToolRegistry::with_default_tools()
+        .get("search_files")
+        .unwrap()
+        .execute(serde_json::json!({ "pattern": "PRIVATE_KEY" }), &security)
+        .await
+        .unwrap();
+
+    assert!(
+        output.contains("notes.md"),
+        "an ordinary hit must stay: {output}"
+    );
+    for leaked in ["deploy.pem", ".env", ".git"] {
+        assert!(!output.contains(leaked), "{leaked} leaked: {output}");
+    }
+    assert!(
+        output.ends_with("[2 files skipped by policy]"),
+        "unexpected tail: {output}"
+    );
+}
+
+#[tokio::test]
+async fn search_over_only_protected_files_returns_no_lines() {
+    let dir = tempfile::TempDir::new().unwrap();
+    for rel in ["deploy.pem", ".env"] {
+        std::fs::write(dir.path().join(rel), "PRIVATE_KEY here\n").unwrap();
+    }
+    let security = WorkspaceSecurity::new(dir.path());
+    let output = crate::agent::tools::ToolRegistry::with_default_tools()
+        .get("search_files")
+        .unwrap()
+        .execute(serde_json::json!({ "pattern": "PRIVATE_KEY" }), &security)
+        .await
+        .unwrap();
+
+    assert!(
+        !output.contains("PRIVATE_KEY here"),
+        "a protected line leaked: {output}"
+    );
+    assert!(
+        output.ends_with("[2 files skipped by policy]"),
+        "unexpected output: {output}"
+    );
+}
