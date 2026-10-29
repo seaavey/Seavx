@@ -72,6 +72,8 @@ pub enum Segment {
 
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model and reasoning effort"),
+    ("/compact", "Summarize the session and free context"),
+    ("/config", "Show or edit effective configuration"),
     ("/plan", "Enter plan mode (read-only)"),
     ("/clear", "Clear session conversation output"),
     ("/help", "Show help and command palette"),
@@ -80,12 +82,6 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/memory", "Inspect persistent memory"),
     ("/exit", "Quit Seavx agent TUI"),
 ];
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanCommand {
-    Enter,
-    Exit,
-    Invalid,
-}
 
 /// Wrap-around previous index; no-op-safe when the list is empty.
 fn prev_index(sel: usize, len: usize) -> usize {
@@ -99,19 +95,6 @@ fn prev_index(sel: usize, len: usize) -> usize {
 /// Wrap-around next index; no-op-safe when the list is empty.
 fn next_index(sel: usize, len: usize) -> usize {
     if sel + 1 >= len { 0 } else { sel + 1 }
-}
-
-fn parse_plan_command(input: &str) -> Option<PlanCommand> {
-    let mut parts = input.split_whitespace();
-    if parts.next() != Some("/plan") {
-        return None;
-    }
-
-    match (parts.next(), parts.next()) {
-        (None, None) | (Some("on"), None) => Some(PlanCommand::Enter),
-        (Some("off"), None) => Some(PlanCommand::Exit),
-        _ => Some(PlanCommand::Invalid),
-    }
 }
 
 fn is_mode_shortcut(key: &KeyEvent) -> bool {
@@ -130,20 +113,6 @@ fn edits_text(key: &KeyEvent) -> bool {
         KeyCode::Backspace | KeyCode::Enter | KeyCode::Tab => true,
         _ => false,
     }
-}
-
-fn apply_plan_command(app: &mut App, input: &str) -> bool {
-    let Some(command) = parse_plan_command(input) else {
-        return false;
-    };
-
-    app.input = new_input();
-    match command {
-        PlanCommand::Enter => app.request_mode(AgentMode::Plan),
-        PlanCommand::Exit => app.request_mode(AgentMode::Build),
-        PlanCommand::Invalid => app.push_mode_notice("Usage: /plan [on|off]"),
-    }
-    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +164,8 @@ pub struct App<'a> {
     pub prompt_tokens: i32,
     pub status: AgentState,
     pub session_title: Option<String>,
+    /// Summary retained from `/compact` and prepended to later requests.
+    pub session_context: Option<String>,
     pub should_quit: bool,
     pub config: crate::agent::engine::AgentConfig,
     pub mode: AgentMode,
@@ -270,6 +241,7 @@ impl<'a> App<'a> {
             prompt_tokens: 0,
             status: AgentState::Idle,
             session_title: None,
+            session_context: None,
             should_quit: false,
             config,
             mode: AgentMode::Build,
@@ -346,6 +318,102 @@ impl<'a> App<'a> {
     pub fn clear_transcript(&mut self) {
         self.revision += 1;
         self.segments.clear();
+        self.session_context = None;
+    }
+
+    /// Replace the transcript with the compacted session block and remember
+    /// the summary for later requests.
+    pub fn apply_compaction(&mut self, result: crate::tui::compact::CompactResult) {
+        self.session_context = Some(result.summary.clone());
+        self.revision += 1;
+
+        let text = format!(
+            "Session compacted\n\nBefore: ~{} lines, ~{} tokens (estimated)\nAfter:  ~{} lines, ~{} tokens (estimated)\n\n{}",
+            result.before_lines,
+            result.before_chars.div_ceil(4),
+            result.after_lines,
+            result.after_chars.div_ceil(4),
+            result.summary
+        );
+        self.segments = vec![Segment::Text(text)];
+        self.scroll = 0;
+        self.auto_scroll = true;
+    }
+
+    /// Append a command report, stripped of terminal control characters.
+    pub fn push_notice(&mut self, text: impl Into<String>) {
+        let text = crate::tui::commands::sanitize(&text.into());
+        self.push_text(&format!("\n{text}\n"));
+        self.scroll = self.line_count();
+        self.auto_scroll = true;
+    }
+
+    /// Open the cached-model picker. Returns `false` when the cache is empty.
+    pub fn open_model_picker(&mut self) -> bool {
+        let models = cached_models(self);
+        if models.is_empty() {
+            self.set_text("No cached models found. Run `seavx model` once to populate cache.");
+            self.scroll = 0;
+            self.auto_scroll = true;
+            return false;
+        }
+
+        let current_idx = models
+            .iter()
+            .position(|m| *m == self.config.model)
+            .unwrap_or(0);
+        self.modal = Some(ModalSelection::Model {
+            models,
+            selected: current_idx,
+        });
+        true
+    }
+
+    /// Switch the model, optionally with a reasoning effort, and persist it.
+    pub fn set_model(&mut self, target: &str, effort: Option<&str>) {
+        let models = cached_models(self);
+        let resolved_model = if let Ok(num) = target.parse::<usize>()
+            && num > 0
+            && num <= models.len()
+        {
+            models[num - 1].clone()
+        } else {
+            target.to_string()
+        };
+
+        let config_path = crate::cli::config::workspace_config_path(std::path::Path::new("."));
+        let mut errors = Vec::new();
+        if let Err(error) = crate::cli::config::set_value(
+            &config_path,
+            crate::cli::config::ConfigKey::Model,
+            &resolved_model,
+        ) {
+            errors.push(error);
+        }
+        if let Some(effort) = effort
+            && let Err(error) = crate::cli::config::set_value(
+                &config_path,
+                crate::cli::config::ConfigKey::ReasoningEffort,
+                effort,
+            )
+        {
+            errors.push(error);
+        }
+
+        self.config = crate::agent::engine::AgentConfig::load(std::path::Path::new("."));
+
+        let mut message = format!(
+            "Switched model to: {}\nEffort: {}\nSaved to .seavx/config.toml",
+            self.config.model,
+            self.config.reasoning_effort.as_deref().unwrap_or("none")
+        );
+        for error in errors {
+            message.push_str(&format!("\n{error}"));
+        }
+
+        self.set_text(message);
+        self.scroll = 0;
+        self.auto_scroll = true;
     }
 
     /// Remember a submitted prompt; slash commands and repeats are not worth recalling.
@@ -688,6 +756,60 @@ impl<'a> App<'a> {
     }
 }
 
+/// Apply the event-loop effects a command asked for.
+fn apply_command_effect(
+    app: &mut App,
+    effect: crate::tui::commands::CommandEffect,
+    tx: &mpsc::UnboundedSender<Action>,
+) {
+    use crate::tui::commands::CommandEffect;
+
+    match effect {
+        CommandEffect::Handled => {}
+        CommandEffect::Quit => app.should_quit = true,
+        CommandEffect::OpenModelPicker => {
+            app.open_model_picker();
+        }
+        CommandEffect::RunDoctor { offline } => {
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            let options = crate::cli::doctor::DoctorOptions {
+                offline,
+                workspace_root: std::path::PathBuf::from("."),
+                home: crate::home::dir(),
+            };
+            tokio::spawn(async move {
+                let report = crate::cli::doctor::run(options).await;
+                let _ = tx.send(Action::DoctorDone(report));
+            });
+        }
+        CommandEffect::RunCompact { instructions } => {
+            let transcript = crate::tui::compact::transcript_from_segments(&app.segments);
+            if crate::tui::compact::is_too_short(&transcript) {
+                app.push_notice(format!(
+                    "Transcript is too short to compact ({} lines).",
+                    transcript.lines().count()
+                ));
+                return;
+            }
+
+            app.status = AgentState::Compacting;
+            let tx = tx.clone();
+            let config = app.config.clone();
+            tokio::spawn(async move {
+                let summarizer = crate::tui::compact::ModelSummarizer::from_config(&config);
+                let result = crate::tui::compact::run_compaction(
+                    &transcript,
+                    instructions.as_deref(),
+                    &summarizer,
+                )
+                .await;
+                let _ = tx.send(Action::CompactDone { result });
+            });
+        }
+    }
+}
+
 /// Ends the turn however the worker exits, panic included, so the UI never
 /// stays stuck on `thinking`.
 struct DoneGuard(mpsc::UnboundedSender<Action>);
@@ -703,24 +825,6 @@ pub struct AtPopupLayout {
     pub area: Rect,
     pub window_start: usize,
     pub max_visible: usize,
-}
-
-/// Open the model-selection modal from cached models, or show a "no cache" hint.
-fn open_model_modal(app: &mut App, models: Vec<String>) {
-    if !models.is_empty() {
-        let current_idx = models
-            .iter()
-            .position(|m| *m == app.config.model)
-            .unwrap_or(0);
-        app.modal = Some(ModalSelection::Model {
-            models,
-            selected: current_idx,
-        });
-    } else {
-        app.set_text("No cached models found. Run `seavx model` once to populate cache.");
-        app.scroll = 0;
-        app.auto_scroll = true;
-    }
 }
 
 /// Cached models for the configured gateway; empty when the cache is cold.
@@ -741,6 +845,7 @@ pub async fn run_agent_worker(
     tx: mpsc::UnboundedSender<Action>,
     is_first_turn: bool,
     mode: AgentMode,
+    session_context: Option<String>,
 ) {
     tokio::spawn(async move {
         let _done = DoneGuard(tx.clone());
@@ -774,8 +879,9 @@ pub async fn run_agent_worker(
         }
 
         let tx_clone = tx.clone();
+        let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
         let result = runtime
-            .execute_task(&prompt, mode, move |evt| {
+            .execute_task(&task, mode, move |evt| {
                 if let Some(rest) = evt.strip_prefix("USAGE:") {
                     let parts: Vec<&str> = rest.split(':').collect();
                     if parts.len() == 2 {
@@ -868,7 +974,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
         app.remember_prompt(&prompt);
         app.push_text(&format!("User: {prompt}\n\n"));
         app.status = AgentState::Thinking;
-        run_agent_worker(prompt, tx.clone(), true, AgentMode::Build).await;
+        run_agent_worker(prompt, tx.clone(), true, AgentMode::Build, None).await;
     }
 
     while !app.should_quit {
@@ -1147,30 +1253,12 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                             KeyCode::Enter => {
                                 let (selected_cmd, _) =
                                     filtered_cmds[app.slash_selected.min(filtered_cmds.len() - 1)];
-                                if selected_cmd == "/model" {
-                                    app.input = new_input();
-                                    let models = cached_models(&app);
-                                    open_model_modal(&mut app, models);
-                                    continue;
-                                } else if selected_cmd == "/plan" {
-                                    app.input = new_input();
-                                    app.request_mode(AgentMode::Plan);
-                                    continue;
-                                } else if selected_cmd == "/clear" {
-                                    app.input = new_input();
-                                    app.clear_transcript();
-                                    app.session_title = None;
-                                    app.scroll = 0;
-                                    continue;
-                                } else if selected_cmd == "/exit" {
-                                    app.should_quit = true;
-                                    continue;
-                                } else {
-                                    app.input = new_input();
-                                    app.input.insert_str(format!("{selected_cmd} "));
-                                    app.refresh_ghost();
-                                    continue;
+                                app.input = new_input();
+                                if let Some(command) = crate::tui::commands::parse(selected_cmd) {
+                                    let effect = crate::tui::commands::execute(&mut app, command);
+                                    apply_command_effect(&mut app, effect, &tx);
                                 }
+                                continue;
                             }
                             _ => {}
                         }
@@ -1241,52 +1329,16 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                             let lines = app.input.lines().to_vec();
                             let prompt = lines.join("\n").trim().to_string();
                             if !prompt.is_empty() {
-                                if apply_plan_command(&mut app, &prompt) {
-                                    continue;
-                                }
-
-                                let is_model_cmd =
-                                    prompt == "/model" || prompt.starts_with("/model ");
-                                if is_model_cmd {
-                                    let parts: Vec<&str> = prompt.split_whitespace().collect();
+                                if prompt.starts_with('/') {
                                     app.input = new_input();
-
-                                    let models = cached_models(&app);
-
-                                    if parts.len() == 1 || (parts.len() == 2 && parts[1] == "list")
-                                    {
-                                        open_model_modal(&mut app, models);
-                                    } else {
-                                        let target_arg = parts[1];
-                                        let resolved_model = if let Ok(num) =
-                                            target_arg.parse::<usize>()
-                                            && num > 0
-                                            && num <= models.len()
-                                        {
-                                            models[num - 1].clone()
-                                        } else {
-                                            target_arg.to_string()
-                                        };
-
-                                        let new_effort = parts.get(2).map(|s| s.to_string());
-                                        app.config.model = resolved_model.clone();
-                                        if let Some(ref eff) = new_effort {
-                                            app.config.reasoning_effort = Some(eff.clone());
-                                        }
-
-                                        let _ = app.config.save(std::path::Path::new("."));
-
-                                        app.set_text(format!(
-                                            "Switched model to: {}\nEffort: {}\nSaved to .seavx/config.toml",
-                                            app.config.model,
-                                            app.config
-                                                .reasoning_effort
-                                                .as_deref()
-                                                .unwrap_or("none")
-                                        ));
-                                        app.scroll = 0;
-                                        app.auto_scroll = true;
-                                    }
+                                    let command = crate::tui::commands::parse(&prompt)
+                                        .unwrap_or_else(|| {
+                                            crate::tui::commands::SlashCommand::Unknown(
+                                                prompt.clone(),
+                                            )
+                                        });
+                                    let effect = crate::tui::commands::execute(&mut app, command);
+                                    apply_command_effect(&mut app, effect, &tx);
                                     continue;
                                 }
 
@@ -1300,7 +1352,14 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                 app.status = AgentState::Thinking;
                                 app.input = new_input();
                                 let is_first_turn = app.session_title.is_none();
-                                run_agent_worker(prompt, tx.clone(), is_first_turn, app.mode).await;
+                                run_agent_worker(
+                                    prompt,
+                                    tx.clone(),
+                                    is_first_turn,
+                                    app.mode,
+                                    app.session_context.clone(),
+                                )
+                                .await;
                             }
                         }
                         _ => {
@@ -1350,6 +1409,19 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                 }
                 Action::AgentDone => {
                     app.status = AgentState::Idle;
+                }
+                Action::DoctorDone(report) => {
+                    app.status = AgentState::Idle;
+                    app.push_notice(crate::cli::doctor::render(&report));
+                }
+                Action::CompactDone { result } => {
+                    app.status = AgentState::Idle;
+                    match result {
+                        Ok(result) => app.apply_compaction(result),
+                        Err(error) => {
+                            app.push_notice(format!("Compaction failed: {error}"));
+                        }
+                    }
                 }
             }
         }

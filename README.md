@@ -101,6 +101,29 @@ seavx model
 seavx model openai/gpt-4o-mini --effort highx
 ```
 
+### TUI Slash Commands
+
+Type `/` in the interactive prompt to list and run these commands:
+
+| Command | Description |
+| --- | --- |
+| `/model [model] [effort]` | Switch model and reasoning effort, or open the picker. |
+| `/compact [focus]` | Summarize the session and keep the summary as context. |
+| `/config` | Show the effective configuration and where each value comes from. |
+| `/config path` | Show workspace and global config paths and which one is active. |
+| `/config get <key>` | Show one effective value with its source. |
+| `/config set [--global] <key> <value>` | Validate and persist one key. |
+| `/config unset [--global] <key>` | Remove one key. |
+| `/plan [on\|off]` | Enter or leave Plan Mode. |
+| `/clear` | Clear the transcript and any compacted context. |
+| `/help` | Show help and the command palette. |
+| `/init` | Create `.seavx/config.toml` with defaults. |
+| `/doctor [--offline]` | Check config, key, endpoint, cache, workspace, memory, and skills. |
+| `/memory [show\|project\|user\|skills\|path]` | Inspect persistent memory and installed skills. |
+| `/exit` | Quit the TUI. |
+
+`/config` never writes `api_key`; use `seavx setup providers` to change keys. Config writes preserve comments and unknown keys and are atomic.
+
 ---
 
 ## 🛡️ Built-in Capabilities & Security

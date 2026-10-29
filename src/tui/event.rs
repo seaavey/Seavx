@@ -1,5 +1,7 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
+use crate::cli::doctor::DoctorReport;
+
 #[derive(Debug)]
 pub enum Action {
     Tick,
@@ -14,6 +16,10 @@ pub enum Action {
         prompt_tokens: i32,
     },
     AgentDone,
+    DoctorDone(DoctorReport),
+    CompactDone {
+        result: Result<crate::tui::compact::CompactResult, String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -22,4 +28,6 @@ pub enum AgentState {
     Thinking,
     Streaming,
     ExecutingTool(String),
+    Checking,
+    Compacting,
 }
