@@ -345,12 +345,47 @@ fn mode_change_is_rejected_while_busy_and_says_so() {
 }
 
 #[test]
-fn switching_modes_does_not_write_to_the_transcript() {
+fn switching_modes_prints_one_line() {
     let mut app = test_app();
     app.toggle_mode();
+    assert!(transcript(&app).contains("Plan mode enabled — writes are disabled"));
+    // BackTab is the same call, so the shortcut cannot go silent again.
     app.toggle_mode();
+    assert!(transcript(&app).contains("Build mode enabled"));
+
+    let mut plan = test_app();
+    plan.mode = AgentMode::Plan;
+    run_command(&mut plan, "/plan off");
+    assert!(transcript(&plan).contains("Build mode enabled"));
+}
+
+#[test]
+fn repeating_the_mode_command_says_it_is_already_active() {
+    let mut app = test_app();
+    run_command(&mut app, "/plan");
+    assert!(transcript(&app).contains("Plan mode enabled — writes are disabled"));
+    run_command(&mut app, "/plan");
+    assert_eq!(app.mode, AgentMode::Plan);
+    assert!(transcript(&app).contains("Plan mode is already active"));
+
+    run_command(&mut app, "/plan off");
+    assert!(transcript(&app).contains("Build mode enabled"));
+    run_command(&mut app, "/plan off");
     assert_eq!(app.mode, AgentMode::Build);
-    assert!(app.segments.is_empty());
+    assert!(transcript(&app).contains("Build mode is already active"));
+}
+
+#[test]
+fn a_bare_slash_is_a_noop_through_the_enter_path() {
+    let mut app = test_app();
+    app.input.insert_str("/");
+    assert!(matches!(app.enter_action("/"), EnterAction::Nothing));
+    assert_eq!(typed(&app), "", "the bare slash is dropped");
+    assert!(app.segments.is_empty(), "no notice, no row");
+    assert_eq!(app.status, AgentState::Idle, "no agent call");
+
+    // The parser alone already answers None; the Enter path must agree.
+    assert_eq!(crate::tui::commands::parse("/"), None);
 }
 
 #[test]
@@ -358,8 +393,11 @@ fn second_plan_command_is_idempotent() {
     let mut app = test_app();
     run_command(&mut app, "/plan");
     run_command(&mut app, "/plan");
-    assert_eq!(app.mode, AgentMode::Plan);
-    assert!(app.segments.is_empty(), "no notice for a no-op switch");
+    assert_eq!(app.mode, AgentMode::Plan, "the mode does not flip back");
+    assert!(
+        transcript(&app).contains("Plan mode is already active"),
+        "the repeat explains itself instead of doing nothing silently"
+    );
 }
 
 #[test]

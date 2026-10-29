@@ -206,6 +206,16 @@ pub struct TurnRequest {
     pub cancel: crate::agent::cancel::CancelToken,
 }
 
+/// What Enter does with the line in the prompt.
+pub enum EnterAction {
+    /// A parsed slash command, ready for `commands::execute`.
+    Command(crate::tui::commands::SlashCommand),
+    /// A prompt for the agent.
+    Turn(String),
+    /// Nothing: an empty line, or a bare `/` that is not a command.
+    Nothing,
+}
+
 /// A permission question and the channel its answer travels back on.
 pub struct PendingPermission {
     pub request: crate::agent::permissions::PermissionRequest,
@@ -411,6 +421,23 @@ impl<'a> App<'a> {
         self.session_context = None;
     }
 
+    /// Enter: a slash line is a command, anything else is a turn. A bare `/`
+    /// clears the input and does nothing else — never a notice, never a call.
+    pub fn enter_action(&mut self, line: &str) -> EnterAction {
+        let prompt = line.trim();
+        if prompt.is_empty() {
+            return EnterAction::Nothing;
+        }
+        if !prompt.starts_with('/') {
+            return EnterAction::Turn(prompt.to_string());
+        }
+        self.input = new_input();
+        match crate::tui::commands::parse(prompt) {
+            Some(command) => EnterAction::Command(command),
+            None => EnterAction::Nothing,
+        }
+    }
+
     /// Show the prompt and hand the worker everything it needs. The user row is
     /// written by the worker, so the UI thread never waits on SQLite.
     pub fn submit_turn(&mut self, prompt: &str) -> Option<TurnRequest> {
@@ -460,9 +487,24 @@ impl<'a> App<'a> {
     /// Switch modes for the user's `/plan` or shortcut, explaining a refusal so
     /// a switch that cannot happen is never silent.
     pub fn request_mode(&mut self, mode: AgentMode) {
-        if !self.set_mode(mode) && self.mode != mode {
-            self.push_mode_notice("Cannot switch mode while a task is running");
+        if self.mode == mode {
+            // A repeat is information, not a refusal: say what is already true.
+            let label = match mode {
+                AgentMode::Plan => "Plan mode is already active",
+                AgentMode::Build => "Build mode is already active",
+            };
+            self.push_mode_notice(label);
+            return;
         }
+        if !self.set_mode(mode) {
+            self.push_mode_notice("Cannot switch mode while a task is running");
+            return;
+        }
+        let label = match mode {
+            AgentMode::Plan => "Plan mode enabled — writes are disabled",
+            AgentMode::Build => "Build mode enabled",
+        };
+        self.push_mode_notice(label);
     }
 
     pub fn toggle_mode(&mut self) {
@@ -1690,33 +1732,28 @@ pub async fn start_tui(
                         }
                         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                             let lines = app.input.lines().to_vec();
-                            let prompt = lines.join("\n").trim().to_string();
-                            if !prompt.is_empty() {
-                                if prompt.starts_with('/') {
-                                    app.input = new_input();
-                                    let command = crate::tui::commands::parse(&prompt)
-                                        .unwrap_or_else(|| {
-                                            crate::tui::commands::SlashCommand::Unknown(
-                                                prompt.clone(),
-                                            )
-                                        });
+                            let prompt = lines.join("\n");
+                            match app.enter_action(&prompt) {
+                                EnterAction::Command(command) => {
                                     let effect = crate::tui::commands::execute(&mut app, command);
                                     apply_command_effect(&mut app, effect, &tx);
                                     continue;
                                 }
-
+                                EnterAction::Nothing => continue,
                                 // One Enter: one request, one new user row. The
                                 // worker writes the row before it sends.
-                                if let Some(request) = app.submit_turn(&prompt) {
-                                    let is_first_turn = app.session_title.is_none();
-                                    run_agent_worker(
-                                        request,
-                                        tx.clone(),
-                                        is_first_turn,
-                                        app.mode,
-                                        app.session_context.clone(),
-                                    )
-                                    .await;
+                                EnterAction::Turn(prompt) => {
+                                    if let Some(request) = app.submit_turn(&prompt) {
+                                        let is_first_turn = app.session_title.is_none();
+                                        run_agent_worker(
+                                            request,
+                                            tx.clone(),
+                                            is_first_turn,
+                                            app.mode,
+                                            app.session_context.clone(),
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                         }
