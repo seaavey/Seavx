@@ -173,6 +173,38 @@ fn lex(command: &str, substitutions: &mut Vec<String>) -> Result<Vec<String>, ()
             Some(q) => {
                 if ch == q {
                     quote = None;
+                } else if q == '"' && ch == '`' {
+                    // A backtick still substitutes inside double quotes.
+                    let mut body = String::new();
+                    loop {
+                        match chars.next() {
+                            Some('`') | None => break,
+                            Some(c) => body.push(c),
+                        }
+                    }
+                    substitutions.push(body);
+                } else if q == '"' && ch == '$' && chars.peek() == Some(&'(') {
+                    // So does $(...); single quotes are the only inert form.
+                    chars.next();
+                    let mut depth = 1;
+                    let mut body = String::new();
+                    for c in chars.by_ref() {
+                        match c {
+                            '(' => {
+                                depth += 1;
+                                body.push(c);
+                            }
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                                body.push(c);
+                            }
+                            _ => body.push(c),
+                        }
+                    }
+                    substitutions.push(body);
                 } else {
                     current.push(ch);
                 }
@@ -347,10 +379,19 @@ fn segment_kind(
     }
 
     if program == "git" {
-        return match args.first().map(String::as_str) {
-            Some(sub) if GIT_READ_ONLY.contains(&sub) => ActionKind::Read,
-            Some("branch") if args.iter().any(|arg| arg == "--list") => ActionKind::Read,
-            Some("remote") if args.iter().any(|arg| arg == "-v") => ActionKind::Read,
+        let subcommand = args.first().map(String::as_str);
+        let read_only = subcommand.is_some_and(|sub| GIT_READ_ONLY.contains(&sub))
+            || (subcommand == Some("branch") && args.iter().any(|arg| arg == "--list"))
+            || (subcommand == Some("remote") && args.iter().any(|arg| arg == "-v"));
+        if read_only {
+            // A blob named in the revision syntax is outside the path policy:
+            // git show HEAD:.env reads what cat .env may not.
+            if args.iter().any(|arg| names_protected_path(arg)) {
+                return ActionKind::Execute;
+            }
+            return ActionKind::Read;
+        }
+        return match subcommand {
             Some("remote") if args.iter().any(|arg| arg == "update") => ActionKind::Network,
             Some(sub) if GIT_NETWORK.contains(&sub) => ActionKind::Network,
             _ => ActionKind::Execute,
@@ -358,7 +399,9 @@ fn segment_kind(
     }
     if program == "cargo" {
         return match args.first().map(String::as_str) {
-            Some("test" | "build" | "check" | "fmt" | "clippy") => ActionKind::Read,
+            // fmt rewrites the tree, so it is a workspace write. The other build
+            // verbs run build scripts and test code: they execute, and ask.
+            Some("fmt") => ActionKind::Write,
             _ => ActionKind::Execute,
         };
     }
@@ -378,6 +421,12 @@ fn segment_kind(
             if check_file(&resolved).is_err() {
                 return ActionKind::Destructive;
             }
+            // The shell follows the path, so a name check is not containment: a
+            // read operand outside the workspace asks instead of allowing.
+            if !within_allowed_roots(home, security, &resolved) {
+                class.unanalysable = true;
+                return ActionKind::Execute;
+            }
         }
     }
 
@@ -388,6 +437,13 @@ fn segment_kind(
         return ActionKind::Read;
     }
     ActionKind::Execute
+}
+
+/// Whether a git argument names a protected path, including the `rev:path`
+/// form, so a read-only subcommand cannot print a credential from a blob.
+fn names_protected_path(arg: &str) -> bool {
+    let candidate = arg.rsplit_once(':').map(|(_, path)| path).unwrap_or(arg);
+    check_file(Path::new(candidate)).is_err()
 }
 
 fn is_recursive_force(arg: &str) -> bool {
@@ -434,12 +490,19 @@ fn writer_kind(
         class.unanalysable = true;
         return ActionKind::Execute;
     };
-    // Sources are reads, so a protected source still refuses the command.
+    // Sources are reads: a protected one refuses the command, and one outside
+    // the workspace asks instead of silently moving host data.
     for source in paths {
-        let protected =
-            resolve(home, source, security).is_some_and(|resolved| check_file(&resolved).is_err());
-        if protected {
+        let Some(resolved) = resolve(home, source, security) else {
+            class.unanalysable = true;
+            return ActionKind::Execute;
+        };
+        if check_file(&resolved).is_err() {
             return ActionKind::Destructive;
+        }
+        if !within_allowed_roots(home, security, &resolved) {
+            class.unanalysable = true;
+            return ActionKind::Execute;
         }
     }
     destination_kind(home, destination, security, class).unwrap_or(ActionKind::Write)
@@ -471,6 +534,12 @@ fn destination_kind(
     Some(ActionKind::Execute)
 }
 
+/// A read is only safe when it stays in the workspace or an allowed global
+/// root; the shell resolves the path, so the canonical form decides.
+fn within_allowed_roots(home: Option<&Path>, security: &WorkspaceSecurity, path: &Path) -> bool {
+    security.contains(path) || global_root_for(home, path).is_some()
+}
+
 fn resolve(home: Option<&Path>, token: &str, security: &WorkspaceSecurity) -> Option<PathBuf> {
     let token = token.trim_matches(|c| c == '\'' || c == '"');
     if token.contains(['$', '*', '?', '`', '(', ')']) {
@@ -494,7 +563,7 @@ pub fn filter_output(text: &str, security: &WorkspaceSecurity) -> (String, usize
     let mut kept: Vec<&str> = Vec::new();
     let mut withheld = 0usize;
     for line in text.lines() {
-        let prefix = line.split(':').next().unwrap_or_default().trim();
+        let prefix = output_prefix(line).trim();
         let allowed = !prefix.is_empty() && {
             let path = if Path::new(prefix).is_absolute() {
                 PathBuf::from(prefix)
@@ -515,4 +584,31 @@ pub fn filter_output(text: &str, security: &WorkspaceSecurity) -> (String, usize
         out.push_str(&format!("\n[{withheld} lines withheld by policy]"));
     }
     (out, withheld)
+}
+
+/// The path prefix of one output line. A line number is the anchor, so a colon
+/// inside the path (a Windows drive, a quoted name) does not become the prefix.
+pub(crate) fn output_prefix(line: &str) -> &str {
+    let mut index = line.len();
+    while let Some(position) = line[..index].rfind(':') {
+        let rest = &line[position + 1..];
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 && line[position + 1 + digits..].starts_with(':') {
+            return &line[..position];
+        }
+        index = position;
+    }
+    // `path:content` with no line number: a drive path keeps its colon.
+    let bytes = line.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return match line[2..].find(':') {
+            Some(position) => &line[..2 + position],
+            None => line,
+        };
+    }
+    line.split(':').next().unwrap_or_default()
 }
