@@ -10,3 +10,9 @@
 - `skill_view`: Load a skill's full SKILL.md on demand (metadata index is already in context).
 - `skill_write`: Create a new skill or fully rewrite an existing one.
 - `skill_patch`: Surgical fix inside an existing skill via exact string replacement.
+
+## Editing contracts
+
+- `edit_file` replaces a snippet that occurs exactly once. If it occurs more than once the call fails with the count and up to three sample lines; add context or pass `replace_all: true`. An empty `old_string` is refused, and `old_string == new_string` is a no-op.
+- `apply_patch` takes a unified diff (`--- a/<path>`, `+++ b/<path>`, `@@ -start,count +start,count @@`). Every hunk must match exactly at the announced line number; a mismatch, a reversed or overlapping hunk, or a `..`/absolute header refuses the whole patch and writes nothing. Creation uses `--- /dev/null` with `-0,0`; deletion is not supported. On success it reports `+N -M` per file.
+- Every write is checkpointed before it happens, so `/undo` restores the previous bytes (and removes files the tool created). A batch is one unit: it lands fully, is restored to its pre-batch bytes, or reports a checkpoint path to restore by hand.

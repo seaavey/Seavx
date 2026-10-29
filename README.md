@@ -161,13 +161,15 @@ permitted_actions = ["execute"]   # execute, network — only these are liftable
 - **Coding Tools**:
   - `read_file`: Line pagination (offset/limit) & truncation guards.
   - `write_file`: Safe directory creation and atomic file writing.
-  - `edit_file`: Precise search-and-replace patching.
+  - `edit_file`: Precise search-and-replace. A snippet that occurs more than once is refused with the count and up to three samples; pass `replace_all: true` to change every occurrence.
+  - `apply_patch`: Strict unified diff over one or more files, applied in memory first and committed as one unit. Exact context only — no fuzz, no 3-way merge.
   - `search_files`: Fast in-process grep & filename globbing (ignores `.git`, `target`, `node_modules`).
   - `run_command`: Bounded execution with 30s timeout.
   - `save_memory`: Singularity-gated persistence with confidence scoring.
   - `skill_view`: On-demand progressive disclosure skill loader.
   - `skill_write`: Create or fully rewrite a skill.
   - `skill_patch`: Exact string replacement inside an existing skill.
+- **Batched edits**: one `apply_patch` call writes all its files or none. Each file is capped at 16 MB, a batch at 64 files and 128 MB of staged bytes; the checkpoint store keeps the newest 200 batches and never evicts a live one. Batch atomicity holds while the process lives; a crash is reported at the next start (`batch interrupted: …`) and undone with `/undo`. Nothing is rolled back automatically.
 - **Autonomous Self-Improvement**: Post-task workflow evaluator with ≥ 75% confidence singularity gate, persisting reusable workflows to `.seavx/skills/`.
 
 ---
