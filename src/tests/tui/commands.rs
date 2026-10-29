@@ -49,12 +49,12 @@ fn busy_app_rejects_clear_but_allows_help_and_exit() {
 }
 
 #[test]
-fn every_palette_entry_parses_to_a_handled_command() {
+fn every_registry_entry_parses_to_a_handled_command() {
     use crate::agent::engine::AgentMode;
     use crate::cli::config::ConfigAction;
     use crate::cli::memory::MemoryView;
 
-    // One row per palette entry: the command the palette offers must parse to
+    // One row per registry entry: the command the palette offers must parse to
     // exactly this variant, so autocomplete can never suggest a dead command.
     let expected = [
         (
@@ -78,6 +78,7 @@ fn every_palette_entry_parses_to_a_handled_command() {
             },
         ),
         ("/clear", SlashCommand::Clear),
+        ("/new", SlashCommand::Clear),
         ("/help", SlashCommand::Help),
         ("/init", SlashCommand::Init),
         ("/doctor", SlashCommand::Doctor { offline: false }),
@@ -91,11 +92,17 @@ fn every_palette_entry_parses_to_a_handled_command() {
         ("/exit", SlashCommand::Exit),
     ];
 
-    let palette: Vec<&str> = SLASH_COMMANDS.iter().map(|(name, _)| *name).collect();
-    let pinned: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
-    assert_eq!(palette, pinned, "palette and parser table drifted");
+    assert_eq!(
+        COMMANDS.len(),
+        expected.len(),
+        "registry and parser drifted"
+    );
 
     for (name, expected_command) in expected {
+        assert!(
+            COMMANDS.iter().any(|spec| spec.name == name),
+            "{name} is missing from the registry"
+        );
         let parsed = parse(name).unwrap_or_else(|| panic!("{name} does not parse"));
         assert!(
             !matches!(parsed, SlashCommand::Unknown(_)),
@@ -106,10 +113,99 @@ fn every_palette_entry_parses_to_a_handled_command() {
 }
 
 #[test]
-fn help_lists_every_palette_entry() {
+fn every_handled_command_appears_in_the_registry() {
+    use crate::agent::engine::AgentMode;
+    use crate::cli::config::ConfigAction;
+    use crate::cli::memory::MemoryView;
+
+    // Every variant the parser can produce from a name must be reachable from
+    // the table; a variant with no row is a command nobody can type.
+    let handled: Vec<&str> = vec![
+        "/model", "/compact", "/config", "/plan", "/clear", "/new", "/help", "/init", "/doctor",
+        "/memory", "/undo", "/exit",
+    ];
+    for name in handled {
+        let parsed = parse(name).expect("a registered name parses");
+        assert!(
+            !matches!(parsed, SlashCommand::Unknown(_)),
+            "{name} is registered but not handled"
+        );
+    }
+
+    // And the reverse: a name the table does not carry is unknown, not silent.
+    for absent in ["/sessions", "/nope", "/clear now"] {
+        assert!(
+            !COMMANDS.iter().any(|spec| spec.name == absent),
+            "{absent} should not be registered yet"
+        );
+    }
+    assert!(matches!(parse("/nope"), Some(SlashCommand::Unknown(_))));
+
+    // The variants are all constructible, so the list above cannot go stale.
+    let _ = [
+        SlashCommand::Model {
+            target: None,
+            effort: None,
+        },
+        SlashCommand::Compact { instructions: None },
+        SlashCommand::Config {
+            action: ConfigAction::Show,
+        },
+        SlashCommand::Plan {
+            mode: AgentMode::Build,
+        },
+        SlashCommand::Clear,
+        SlashCommand::Help,
+        SlashCommand::Init,
+        SlashCommand::Doctor { offline: true },
+        SlashCommand::Memory {
+            view: MemoryView::Path,
+        },
+        SlashCommand::Undo,
+        SlashCommand::Exit,
+    ];
+}
+
+#[test]
+fn the_palette_is_the_table() {
+    let palette = palette();
+    let expected: Vec<(&str, &str)> = COMMANDS
+        .iter()
+        .map(|spec| (spec.name, spec.summary))
+        .collect();
+    assert_eq!(palette, expected, "the palette is the table, in order");
+
+    let mut names: Vec<&str> = palette.iter().map(|(name, _)| *name).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), palette.len(), "no duplicate command names");
+
+    // Pinned order: the menu is what the user learns.
+    let order: Vec<&str> = palette.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        order,
+        vec![
+            "/model", "/compact", "/config", "/plan", "/clear", "/new", "/help", "/init",
+            "/doctor", "/memory", "/undo", "/exit"
+        ]
+    );
+}
+
+#[test]
+fn help_lists_every_palette_entry_with_its_usage() {
     let help = help_text();
-    for (command, _) in crate::tui::app::SLASH_COMMANDS {
-        assert!(help.contains(command), "missing {command} in {help}");
+    for spec in COMMANDS {
+        assert!(help.contains(spec.name), "missing {} in {help}", spec.name);
+        assert!(
+            help.contains(spec.usage),
+            "missing usage {} in {help}",
+            spec.usage
+        );
+        assert!(
+            help.contains(spec.summary),
+            "missing summary {} in {help}",
+            spec.summary
+        );
     }
 }
 
@@ -270,7 +366,7 @@ fn parses_plan_forms() {
 
 #[test]
 fn undo_is_registered_and_dispatchable() {
-    let palette: Vec<&str> = SLASH_COMMANDS.iter().map(|(name, _)| *name).collect();
+    let palette: Vec<&str> = palette().into_iter().map(|(name, _)| name).collect();
     assert!(palette.contains(&"/undo"), "{palette:?}");
     assert_eq!(parse("/undo"), Some(SlashCommand::Undo));
 

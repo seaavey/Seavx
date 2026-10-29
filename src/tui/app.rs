@@ -86,20 +86,6 @@ pub enum Segment {
     Thinking(String),
 }
 
-pub const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/model", "Switch model and reasoning effort"),
-    ("/compact", "Summarize the session and free context"),
-    ("/config", "Show or edit effective configuration"),
-    ("/plan", "Enter plan mode (read-only)"),
-    ("/clear", "Clear session conversation output"),
-    ("/help", "Show help and command palette"),
-    ("/init", "Initialize workspace configuration"),
-    ("/doctor", "Check environment and health"),
-    ("/memory", "Inspect persistent memory"),
-    ("/undo", "Restore files from the latest checkpoint"),
-    ("/exit", "Quit Seavx agent TUI"),
-];
-
 /// Wrap-around previous index; no-op-safe when the list is empty.
 fn prev_index(sel: usize, len: usize) -> usize {
     if sel == 0 {
@@ -941,9 +927,8 @@ impl<'a> App<'a> {
         if !input.starts_with('/') || input.contains(' ') {
             return Vec::new();
         }
-        SLASH_COMMANDS
-            .iter()
-            .copied()
+        crate::tui::commands::palette()
+            .into_iter()
             .filter(|(cmd, _)| cmd.starts_with(&input))
             .collect()
     }

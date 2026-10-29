@@ -120,7 +120,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     // 4b. Inline Slash Command Auto-complete Menu
     let matches = app.slash_matches();
     if !matches.is_empty() && !app.popups_dismissed() {
-        // Two border rows plus one row per command; SLASH_COMMANDS is short enough to fit.
+        // Two border rows plus one row per command; the table is short enough to fit.
         let menu_height = matches.len() as u16 + 2;
         let menu_width = 62.min(frame.area().width.saturating_sub(4));
         let menu_y = chunks[3].y.saturating_sub(menu_height);
