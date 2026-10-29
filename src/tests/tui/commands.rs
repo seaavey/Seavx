@@ -325,6 +325,56 @@ fn parses_memory_views() {
 }
 
 #[test]
+fn clear_and_new_are_the_same_command() {
+    // One variant, one handler: the alias cannot drift from its target.
+    assert_eq!(parse("/new"), parse("/clear"));
+    assert_eq!(parse("/clear"), Some(SlashCommand::Clear));
+    assert_eq!(
+        COMMANDS
+            .iter()
+            .find(|spec| spec.name == "/new")
+            .expect("a registry row")
+            .id,
+        CommandId::New
+    );
+
+    for name in ["/clear", "/new"] {
+        let mut app = crate::tui::app::test_app();
+        app.push_text("answer");
+        app.session_id = Some(7);
+        app.session_title = Some("title".into());
+        app.session_context = Some("summary".into());
+        assert_eq!(
+            execute(&mut app, parse(name).expect("parses")),
+            CommandEffect::Handled
+        );
+        assert!(app.segments.is_empty(), "{name} clears the transcript");
+        assert_eq!(app.session_id, None, "{name} starts a new session");
+        assert!(app.session_title.is_none(), "{name} drops the title");
+        assert!(
+            app.session_context.is_none(),
+            "{name} clears the compaction context"
+        );
+    }
+
+    // Idle-only, with the same refusal for both spellings.
+    for name in ["/clear", "/new"] {
+        let mut app = crate::tui::app::test_app();
+        app.status = AgentState::Streaming;
+        app.session_id = Some(9);
+        assert_eq!(
+            execute(&mut app, parse(name).expect("parses")),
+            CommandEffect::Handled
+        );
+        assert!(app.segments.iter().any(|segment| matches!(
+            segment,
+            crate::tui::app::Segment::Text(text) if text.contains("Agent is busy")
+        )));
+        assert_eq!(app.session_id, Some(9), "{name} changes nothing while busy");
+    }
+}
+
+#[test]
 fn clear_resets_the_transcript_and_title() {
     let mut app = crate::tui::app::test_app();
     app.push_text("answer");

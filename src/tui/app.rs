@@ -407,6 +407,8 @@ impl<'a> App<'a> {
         self.session_title = None;
         self.session_id = None;
         self.read_only = None;
+        // The compaction context belongs to the session that produced it.
+        self.session_context = None;
     }
 
     /// Show the prompt and hand the worker everything it needs. The user row is
