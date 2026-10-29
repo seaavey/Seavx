@@ -22,6 +22,77 @@ fn set_preserves_comments_and_unknown_keys() {
 }
 
 #[test]
+fn the_model_picker_keeps_comments_and_unknown_keys() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(
+        &path,
+        "# keep me\nmodel = \"old\"\nreasoning_effort = \"low\"\ncustom = 1\n",
+    )
+    .unwrap();
+
+    // The `/model` picker and `seavx model` both land here.
+    set_model_and_effort(&path, "new-model", Some("high")).unwrap();
+
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# keep me"), "{text}");
+    assert!(text.contains("custom = 1"), "{text}");
+    assert!(text.contains("model = \"new-model\""), "{text}");
+    assert!(text.contains("reasoning_effort = \"high\""), "{text}");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the config stays owner-only");
+    }
+}
+
+#[test]
+fn model_with_an_invalid_effort_changes_nothing() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    let before = "# keep me\nmodel = \"old\"\nreasoning_effort = \"low\"\n";
+    fs::write(&path, before).unwrap();
+
+    let error = set_model_and_effort(&path, "new-model", Some("turbo")).unwrap_err();
+    assert!(error.contains("reasoning_effort"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        before,
+        "no partial write"
+    );
+
+    // The model alone is still writable, and the effort is untouched.
+    set_model_and_effort(&path, "new-model", None).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("model = \"new-model\""), "{text}");
+    assert!(text.contains("reasoning_effort = \"low\""), "{text}");
+}
+
+#[test]
+fn config_set_base_url_prints_no_userinfo_or_query() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+
+    let printed = set_value(
+        &path,
+        ConfigKey::BaseUrl,
+        "https://user:pass@host/v1?token=secret",
+    )
+    .unwrap();
+
+    assert!(printed.contains("host"), "{printed}");
+    assert!(printed.contains("(userinfo/query redacted)"), "{printed}");
+    assert!(!printed.contains("user:pass"), "{printed}");
+    assert!(!printed.contains("secret"), "{printed}");
+
+    // The file keeps the value the user typed; only the output is redacted.
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("user:pass@host"), "{text}");
+}
+
+#[test]
 fn rejects_invalid_values() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("config.toml");
