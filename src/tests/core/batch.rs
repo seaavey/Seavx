@@ -467,3 +467,65 @@ fn pruner_never_evicts_a_committing_or_partial_directory() {
     let error = prune(&root, 2 * 1024 * 1024 * 1024).unwrap_err();
     assert!(format!("{error}").contains("bytes"), "{error}");
 }
+
+#[test]
+fn preflight_refuses_a_protected_target() {
+    let ws = workspace(&[("notes.md", "n\n")]);
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").unwrap();
+    let security = WorkspaceSecurity::new(ws.path());
+
+    let error = commit(&security, vec![edit(ws.path(), ".env", "SECRET=2\n")]).unwrap_err();
+    assert!(format!("{error}").contains("Access denied"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join(".env")).unwrap(),
+        "SECRET=1\n"
+    );
+    assert!(checkpoint_dirs(ws.path()).is_empty());
+}
+
+#[test]
+fn the_interrupted_notice_reaches_the_transcript() {
+    use crate::checkpoint::InterruptedBatch;
+
+    let batch = InterruptedBatch {
+        checkpoint: PathBuf::from("/w/.seavx/checkpoints/1-2-0"),
+        entries: vec![
+            (PathBuf::from("/w/a.txt"), true),
+            (PathBuf::from("/w/b.txt"), false),
+        ],
+    };
+    let rendered = batch.render();
+    assert!(
+        rendered.contains("batch interrupted: 2 file(s) may differ"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("confirmed: /w/a.txt"), "{rendered}");
+    assert!(rendered.contains("unconfirmed: /w/b.txt"), "{rendered}");
+    assert!(rendered.ends_with("run /undo to restore"), "{rendered}");
+
+    // The TUI shows the same text through its notice sink.
+    let mut app = crate::tui::app::test_app();
+    app.push_notice(rendered);
+    let text = app
+        .segments
+        .iter()
+        .filter_map(|segment| match segment {
+            crate::tui::app::Segment::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(text.contains("batch interrupted"), "{text}");
+    assert!(text.contains("run /undo to restore"), "{text}");
+}
+
+#[test]
+fn a_rewrite_of_the_last_line_keeps_a_missing_trailing_newline() {
+    let patch =
+        crate::agent::patch::parse("--- a/f.txt\n+++ b/f.txt\n@@ -2,1 +2,1 @@\n-b\n+B\n").unwrap();
+
+    let (out, _) = crate::agent::patch::apply_to("a\nb", &patch[0]).unwrap();
+    assert_eq!(
+        out, "a\nB",
+        "the file had no trailing newline; it keeps none"
+    );
+}

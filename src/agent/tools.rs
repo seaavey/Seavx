@@ -868,8 +868,11 @@ impl AgentTool for ApplyPatchTool {
         let mut summary = Vec::new();
         let mut hunks = 0usize;
         for file in &files {
-            let requested = file.path.to_string_lossy();
-            let path = security.validate_path(&requested)?;
+            let requested = file
+                .path
+                .to_str()
+                .ok_or_else(|| format!("{}: path is not valid UTF-8", file.path.display()))?;
+            let path = security.validate_path(requested)?;
             let current = match crate::agent::security::read_verified(&path).await {
                 Ok(text) => text,
                 Err(_) if file.create => String::new(),

@@ -175,6 +175,9 @@ fn run(
                 edit.path.display()
             )));
         }
+        // Defence in depth: the tool validates too, but the commit itself must
+        // never stage a protected file.
+        security::check_file(&edit.path).map_err(BatchError::Preflight)?;
         if edit.content.len() as u64 > MAX_ATOMIC_BYTES {
             return Err(BatchError::Preflight(
                 "refusing to atomically rewrite a file over 16 MB".to_string(),

@@ -336,8 +336,18 @@ pub fn apply_to(content: &str, patch: &FilePatch) -> Result<(String, PatchStats)
         out.push_str(line);
     }
 
-    // Honour `\ No newline at end of file` on the final applied line.
-    if patch.hunks.last().is_some_and(|hunk| hunk.no_newline) && out.ends_with('\n') {
+    // The file's trailing newline is data: keep it missing when the last line
+    // was rewritten and the original had none, even if the diff omitted its
+    // marker.
+    let touched_end = cursor >= source.len();
+    let last_is_add = patch
+        .hunks
+        .last()
+        .and_then(|hunk| hunk.lines.last())
+        .is_some_and(|line| matches!(line, HunkLine::Add(_)));
+    let keep_missing = patch.hunks.last().is_some_and(|hunk| hunk.no_newline)
+        || (touched_end && last_is_add && !content.is_empty() && !content.ends_with('\n'));
+    if keep_missing && out.ends_with('\n') {
         out.pop();
     }
 
