@@ -1,4 +1,5 @@
 use crate::agent::engine::AgentMode;
+use crate::agent::permissions::ActionKind;
 use crate::agent::security::WorkspaceSecurity;
 use crate::atomic_file::{ModePolicy, write_atomic};
 use crate::checkpoint::{CheckpointInput, CheckpointStore, CheckpointTarget, EntryState};
@@ -8,7 +9,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[async_trait]
@@ -20,6 +21,18 @@ pub trait AgentTool: Send + Sync {
     /// Tools default to mutation. Only explicitly classified tools are safe in Plan Mode.
     fn is_read_only(&self) -> bool {
         false
+    }
+
+    /// What this call may do. Defaults to a workspace write; tools that never
+    /// mutate, and `run_command`, override it.
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Write
+    }
+
+    /// Where this call writes when the destination is chosen by the tool rather
+    /// than by `validate_path`, so the engine can classify a global write.
+    fn destination(&self, _args: &Value, _security: &WorkspaceSecurity) -> Option<PathBuf> {
+        None
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String>;
@@ -67,12 +80,14 @@ fn capture_checkpoint(security: &WorkspaceSecurity, path: &Path) -> Result<(), S
     let target = match path.strip_prefix(security.root()) {
         Ok(_) => CheckpointTarget::Workspace(path.to_path_buf()),
         Err(_) => {
-            let allowed_root = global_root_for(path).ok_or_else(|| {
-                format!(
-                    "Refusing to write outside the workspace: {}",
-                    path.display()
-                )
-            })?;
+            let allowed_root =
+                crate::agent::permissions::global_root_for(crate::home::dir().as_deref(), path)
+                    .ok_or_else(|| {
+                        format!(
+                            "Refusing to write outside the workspace: {}",
+                            path.display()
+                        )
+                    })?;
             CheckpointTarget::Global {
                 path: path.to_path_buf(),
                 allowed_root,
@@ -90,17 +105,6 @@ fn capture_checkpoint(security: &WorkspaceSecurity, path: &Path) -> Result<(), S
     )
     .map(|_| ())
     .map_err(|error| format!("Checkpoint failed: {error}"))
-}
-
-fn global_root_for(path: &Path) -> Option<std::path::PathBuf> {
-    let home = crate::home::dir()?;
-    let files = [home.join(".seavx/MEMORY.md"), home.join(".seavx/USER.md")];
-    if let Some(root) = files.into_iter().find(|root| root == path) {
-        return Some(root);
-    }
-    [home.join(".seavx/skills"), home.join(".agents/skills")]
-        .into_iter()
-        .find(|root| path.starts_with(root))
 }
 
 /// Read a file, replace the first occurrence of `old_string`, and write it back.
@@ -139,6 +143,10 @@ pub struct ReadFileTool;
 impl AgentTool for ReadFileTool {
     fn name(&self) -> &'static str {
         "read_file"
+    }
+
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Read
     }
 
     fn description(&self) -> &'static str {
@@ -262,6 +270,10 @@ impl AgentTool for ListDirectoryTool {
         "list_directory"
     }
 
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Read
+    }
+
     fn description(&self) -> &'static str {
         "List files and subdirectories in a workspace path"
     }
@@ -383,6 +395,10 @@ impl AgentTool for SearchFilesTool {
         "search_files"
     }
 
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Read
+    }
+
     fn description(&self) -> &'static str {
         "Search file contents (target='content', default) or match filenames (target='files') across the workspace"
     }
@@ -495,6 +511,25 @@ impl AgentTool for SearchFilesTool {
     }
 }
 
+/// The file `save_memory` writes, shared by `execute` and the permission check.
+fn memory_target(
+    security: &WorkspaceSecurity,
+    target: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let user_target = target == Some("user");
+    let is_debug = crate::util::is_debug();
+    let path = match (user_target, is_debug) {
+        (true, true) => security.root().join(".seavx").join("USER.md"),
+        (true, false) => crate::home::dir()
+            .ok_or_else(|| "home directory not set".to_string())?
+            .join(".seavx")
+            .join("USER.md"),
+        (false, true) => security.root().join(".seavx").join("MEMORY.md"),
+        (false, false) => security.root().join("MEMORY.md"),
+    };
+    Ok(path)
+}
+
 // 7. save_memory
 #[derive(Deserialize, JsonSchema)]
 struct SaveMemoryArgs {
@@ -538,6 +573,14 @@ impl AgentTool for SaveMemoryTool {
         "save_memory"
     }
 
+    fn destination(
+        &self,
+        args: &Value,
+        security: &WorkspaceSecurity,
+    ) -> Option<std::path::PathBuf> {
+        memory_target(security, args.get("target").and_then(Value::as_str)).ok()
+    }
+
     fn description(&self) -> &'static str {
         "Save a durable lesson/preference with confidence score (0-100%). Rejects if confidence < 70%."
     }
@@ -573,30 +616,11 @@ impl AgentTool for SaveMemoryTool {
             }
         }
 
-        let is_debug = crate::util::is_debug();
-
         let target = parsed.target.unwrap_or_else(|| "project".to_string());
-        let target_file = if target == "user" {
-            if is_debug {
-                // In debug mode, save USER.md locally inside repo .seavx/USER.md
-                let seavx_dir = security.root().join(".seavx");
-                let _ = tokio::fs::create_dir_all(&seavx_dir).await;
-                seavx_dir.join("USER.md")
-            } else {
-                let home =
-                    crate::home::dir().ok_or_else(|| "home directory not set".to_string())?;
-                let dir = home.join(".seavx");
-                let _ = tokio::fs::create_dir_all(&dir).await;
-                dir.join("USER.md")
-            }
-        } else if is_debug {
-            // In debug mode, save project memory under .seavx/MEMORY.md
-            let seavx_dir = security.root().join(".seavx");
-            let _ = tokio::fs::create_dir_all(&seavx_dir).await;
-            seavx_dir.join("MEMORY.md")
-        } else {
-            security.root().join("MEMORY.md")
-        };
+        let target_file = memory_target(security, Some(&target))?;
+        if let Some(dir) = target_file.parent() {
+            let _ = tokio::fs::create_dir_all(dir).await;
+        }
 
         let existing = tokio::fs::read_to_string(&target_file)
             .await
@@ -635,6 +659,17 @@ impl AgentTool for SaveMemoryTool {
     }
 }
 
+/// Where a skill write lands: the existing file when it exists, else the path the
+/// manager would create.
+fn skill_destination(args: &Value, security: &WorkspaceSecurity) -> Option<std::path::PathBuf> {
+    let name = args.get("name").and_then(Value::as_str)?;
+    find_skill_file(security, name).ok().or_else(|| {
+        crate::agent::skills::SkillManager::new(security.root())
+            .skill_path(name)
+            .ok()
+    })
+}
+
 fn find_skill_file(security: &WorkspaceSecurity, name: &str) -> Result<std::path::PathBuf, String> {
     crate::agent::skills::SkillManager::new(security.root())
         .list_skills()
@@ -656,6 +691,10 @@ pub struct SkillViewTool;
 impl AgentTool for SkillViewTool {
     fn name(&self) -> &'static str {
         "skill_view"
+    }
+
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Read
     }
 
     fn description(&self) -> &'static str {
@@ -692,6 +731,14 @@ pub struct SkillWriteTool;
 impl AgentTool for SkillWriteTool {
     fn name(&self) -> &'static str {
         "skill_write"
+    }
+
+    fn destination(
+        &self,
+        args: &Value,
+        security: &WorkspaceSecurity,
+    ) -> Option<std::path::PathBuf> {
+        skill_destination(args, security)
     }
 
     fn description(&self) -> &'static str {
@@ -736,6 +783,14 @@ pub struct SkillPatchTool;
 impl AgentTool for SkillPatchTool {
     fn name(&self) -> &'static str {
         "skill_patch"
+    }
+
+    fn destination(
+        &self,
+        args: &Value,
+        security: &WorkspaceSecurity,
+    ) -> Option<std::path::PathBuf> {
+        skill_destination(args, security)
     }
 
     fn description(&self) -> &'static str {

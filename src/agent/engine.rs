@@ -1,3 +1,6 @@
+use crate::agent::permissions::{
+    self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
+};
 use crate::agent::prompt::{PLAN_POLICY, load_system_prompt};
 use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
@@ -427,6 +430,7 @@ impl AgentRuntime {
         &self,
         task: &str,
         mode: AgentMode,
+        confirm: &dyn Confirmer,
         mut event_sink: impl FnMut(&str) + Send,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let system_prompt = self
@@ -548,9 +552,17 @@ impl AgentRuntime {
                 let (result_str, is_err) = match self.registry.get_for_mode(tool_name, mode) {
                     Ok(tool) => {
                         let args = call.fn_arguments.clone();
-                        match tool.execute(args, &self.security).await {
-                            Ok(res) => (res, false),
-                            Err(err) => (format!("Error executing {tool_name}: {err}"), true),
+                        let kind = tool.classify(&args, &self.security);
+                        let detail = tool
+                            .destination(&args, &self.security)
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| args_summary.clone());
+                        match self.gate(confirm, kind, tool_name, &detail).await {
+                            Ok(()) => match tool.execute(args, &self.security).await {
+                                Ok(res) => (res, false),
+                                Err(err) => (format!("Error executing {tool_name}: {err}"), true),
+                            },
+                            Err(denied) => (denied, true),
                         }
                     }
                     Err(err) => (format!("Error executing {tool_name}: {err}"), true),
@@ -597,6 +609,67 @@ impl AgentRuntime {
                     .to_string(),
             )
         }
+    }
+
+    /// One place decides a tool call: the matrix, then the human, then the
+    /// answer's persistence. A denial is a tool result, never a turn failure.
+    async fn gate(
+        &self,
+        confirm: &dyn Confirmer,
+        kind: ActionKind,
+        tool: &str,
+        detail: &str,
+    ) -> Result<(), String> {
+        let denied = || format!("Permission denied: {}", kind.effect(detail));
+        match permissions::decide(self.permission_mode(), &self.permitted_kinds(), kind) {
+            Verdict::Allow => return Ok(()),
+            Verdict::Deny => return Err(denied()),
+            Verdict::Ask => {}
+        }
+
+        let answer = confirm
+            .confirm(PermissionRequest::new(kind, tool, detail))
+            .await;
+        let path = crate::cli::config::workspace_config_path(self.security.root());
+        match answer {
+            Answer::Once => Ok(()),
+            Answer::Category => match crate::cli::config::append_permitted(&path, kind) {
+                Ok(kinds) => {
+                    tracing::info!(action = %kind.name(), ?kinds, "permitted action recorded");
+                    Ok(())
+                }
+                // The user answered; a config that cannot record it must not
+                // turn an approval into a denial.
+                Err(error) => {
+                    tracing::warn!(%error, action = %kind.name(), "could not record permitted action");
+                    Ok(())
+                }
+            },
+            Answer::Unrestricted => {
+                if let Err(error) = crate::cli::config::set_value(
+                    &path,
+                    crate::cli::config::ConfigKey::ToolPermissions,
+                    "allow",
+                ) {
+                    tracing::warn!(%error, "could not persist tool_permissions");
+                }
+                Ok(())
+            }
+            Answer::Deny => Err(denied()),
+        }
+    }
+
+    /// An invalid mode asks rather than allowing: a broken config must not widen
+    /// permissions.
+    fn permission_mode(&self) -> PermissionMode {
+        permissions::parse_mode(&self.config.tool_permissions).unwrap_or_else(|error| {
+            tracing::warn!(%error, "tool_permissions is invalid; asking");
+            PermissionMode::Ask
+        })
+    }
+
+    fn permitted_kinds(&self) -> Vec<ActionKind> {
+        permissions::parse_permitted(&self.config.permitted_actions).unwrap_or_default()
     }
 
     /// The only place tool activity is logged, so redaction cannot be forgotten

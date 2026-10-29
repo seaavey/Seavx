@@ -248,3 +248,119 @@ async fn search_over_only_protected_files_returns_no_lines() {
         "unexpected output: {output}"
     );
 }
+
+#[test]
+fn the_matrix_answers_every_cell() {
+    use crate::agent::permissions::*;
+
+    let table = [
+        (PermissionMode::Deny, ActionKind::Read, Verdict::Allow),
+        (PermissionMode::Deny, ActionKind::Write, Verdict::Deny),
+        (PermissionMode::Deny, ActionKind::GlobalWrite, Verdict::Deny),
+        // `deny` refuses every command that is not an allowlisted read; those
+        // classify as `Read`, so an `Execute` cell here is a denial.
+        (PermissionMode::Deny, ActionKind::Execute, Verdict::Deny),
+        (PermissionMode::Deny, ActionKind::Network, Verdict::Deny),
+        (PermissionMode::Ask, ActionKind::Read, Verdict::Allow),
+        (PermissionMode::Ask, ActionKind::Write, Verdict::Allow),
+        (PermissionMode::Ask, ActionKind::GlobalWrite, Verdict::Ask),
+        (PermissionMode::Ask, ActionKind::Execute, Verdict::Ask),
+        (PermissionMode::Ask, ActionKind::Network, Verdict::Ask),
+        (PermissionMode::Ask, ActionKind::Destructive, Verdict::Deny),
+        (PermissionMode::Allow, ActionKind::Read, Verdict::Allow),
+        (PermissionMode::Allow, ActionKind::Write, Verdict::Allow),
+        (PermissionMode::Allow, ActionKind::GlobalWrite, Verdict::Ask),
+        (PermissionMode::Allow, ActionKind::Execute, Verdict::Allow),
+        (PermissionMode::Allow, ActionKind::Network, Verdict::Allow),
+        (
+            PermissionMode::Allow,
+            ActionKind::Destructive,
+            Verdict::Deny,
+        ),
+    ];
+    for (mode, kind, expected) in table {
+        assert_eq!(decide(mode, &[], kind), expected, "{mode:?}/{kind:?}");
+    }
+
+    // `permitted_actions` lifts execute and network in `ask` mode only …
+    assert_eq!(
+        decide(
+            PermissionMode::Ask,
+            &[ActionKind::Network],
+            ActionKind::Network
+        ),
+        Verdict::Allow
+    );
+    assert_eq!(
+        decide(
+            PermissionMode::Ask,
+            &[ActionKind::Execute],
+            ActionKind::Execute
+        ),
+        Verdict::Allow
+    );
+    // … never the global-write floor, in any mode.
+    assert_eq!(
+        decide(
+            PermissionMode::Allow,
+            &[ActionKind::GlobalWrite],
+            ActionKind::GlobalWrite
+        ),
+        Verdict::Ask
+    );
+    assert_eq!(
+        decide(
+            PermissionMode::Ask,
+            &[ActionKind::GlobalWrite],
+            ActionKind::GlobalWrite
+        ),
+        Verdict::Ask
+    );
+
+    // A config naming a non-liftable kind is a validation error.
+    assert!(parse_permitted(&["global-write".to_string()]).is_err());
+    assert!(parse_permitted(&["destructive".to_string()]).is_err());
+    assert_eq!(
+        parse_permitted(&["execute".to_string(), "network".to_string()]).unwrap(),
+        vec![ActionKind::Execute, ActionKind::Network]
+    );
+    assert_eq!(parse_mode("ask").unwrap(), PermissionMode::Ask);
+    assert!(parse_mode("sometimes").is_err());
+}
+
+#[test]
+fn target_classification_names_the_three_cases() {
+    use crate::agent::permissions::{ActionKind, classify_target_with_home};
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let security = WorkspaceSecurity::new(workspace.path());
+
+    let inside = workspace.path().join("notes.md");
+    assert_eq!(
+        classify_target_with_home(Some(home.path()), &security, &inside).unwrap(),
+        ActionKind::Write
+    );
+
+    let memory = home.path().join(".seavx/USER.md");
+    assert_eq!(
+        classify_target_with_home(Some(home.path()), &security, &memory).unwrap(),
+        ActionKind::GlobalWrite
+    );
+    let skill = home.path().join(".agents/skills/x/SKILL.md");
+    assert_eq!(
+        classify_target_with_home(Some(home.path()), &security, &skill).unwrap(),
+        ActionKind::GlobalWrite
+    );
+
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    assert!(
+        classify_target_with_home(
+            Some(home.path()),
+            &security,
+            &elsewhere.path().join("x.txt")
+        )
+        .is_err(),
+        "an unlisted outside path must not classify"
+    );
+}

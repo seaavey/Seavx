@@ -146,12 +146,17 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Executing task: {task}\n");
             let result = runtime
-                .execute_task(&task, agent::engine::AgentMode::Build, |evt| {
-                    // Reasoning blocks are a TUI concern; headless runs skip them.
-                    if !evt.starts_with("THINKING:") {
-                        println!("{evt}");
-                    }
-                })
+                .execute_task(
+                    &task,
+                    agent::engine::AgentMode::Build,
+                    &agent::permissions::DenyingConfirmer,
+                    |evt| {
+                        // Reasoning blocks are a TUI concern; headless runs skip them.
+                        if !evt.starts_with("THINKING:") {
+                            println!("{evt}");
+                        }
+                    },
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 

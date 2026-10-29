@@ -419,6 +419,44 @@ pub fn set_value(path: &Path, key: ConfigKey, raw: &str) -> Result<String, Strin
     Ok(value)
 }
 
+/// Add one liftable kind to `permitted_actions`, idempotently, through the one
+/// writer. Returns the list as stored, so the caller can name it.
+pub fn append_permitted(
+    path: &Path,
+    kind: crate::agent::permissions::ActionKind,
+) -> Result<Vec<String>, String> {
+    let kind = kind.name();
+    if !LIFTABLE_ACTIONS.contains(&kind) {
+        return Err(format!(
+            "{kind} is not liftable into permitted_actions; global writes and destructive actions always ask"
+        ));
+    }
+
+    let mut stored: Vec<String> = Vec::new();
+    update_config(path, |document| {
+        stored = document
+            .get("permitted_actions")
+            .and_then(|item| item.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !stored.iter().any(|value| value == kind) {
+            stored.push(kind.to_string());
+        }
+        let mut array = toml_edit::Array::new();
+        for value in &stored {
+            array.push(value.as_str());
+        }
+        document["permitted_actions"] = toml_edit::value(array);
+        Ok(())
+    })?;
+    Ok(stored)
+}
+
 /// Remove one key. Returns `false` when it was not present.
 pub fn unset_value(path: &Path, key: ConfigKey) -> Result<bool, String> {
     if !key.is_writable() {
