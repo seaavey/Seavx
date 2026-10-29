@@ -433,6 +433,7 @@ fn stored(
 fn loaded(messages: Vec<crate::session::StoredMessage>) -> crate::session::LoadedSession {
     crate::session::LoadedSession {
         id: 7,
+        slug: "svx-00000007".to_string(),
         workspace: crate::session::workspace_key(),
         title: Some("restored".to_string()),
         model: Some("fake-model".to_string()),
@@ -769,4 +770,79 @@ fn a_title_for_another_session_does_not_rename_this_one() {
 
     assert!(app.apply_title(Some(2), "this session".to_string()));
     assert_eq!(app.session_title.as_deref(), Some("this session"));
+}
+
+#[test]
+fn the_resume_picker_lists_this_workspaces_sessions_newest_first() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let workspace = crate::session::workspace_key();
+    let mut app = test_app();
+
+    assert!(
+        !app.open_session_picker(&store),
+        "an empty store opens no modal"
+    );
+    assert!(app.modal.is_none());
+
+    for prompt in ["first prompt", "second prompt"] {
+        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt).unwrap();
+    }
+
+    assert!(app.open_session_picker(&store));
+    let Some(ModalSelection::Session { rows, selected }) = app.modal.clone() else {
+        panic!("expected the session picker, got {:?}", app.modal);
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(selected, 0, "the newest session starts highlighted");
+    assert!(rows[0].starts_with("1  svx-"), "{}", rows[0]);
+    assert!(rows[0].contains("second prompt"), "{}", rows[0]);
+    assert!(rows[1].contains("first prompt"), "{}", rows[1]);
+}
+
+#[test]
+fn quitting_is_never_blocked_by_a_pending_permission() {
+    let mut app = test_app();
+    let (reply, _answer) = tokio::sync::oneshot::channel();
+    app.pending_permission = Some(PendingPermission {
+        request: crate::agent::permissions::PermissionRequest::new(
+            crate::agent::permissions::ActionKind::Write,
+            "write_file",
+            "notes.txt",
+        ),
+        reply,
+    });
+
+    let ctrl = |code: KeyCode| KeyEvent::new(code, KeyModifiers::CONTROL);
+    assert!(
+        quit_shortcut(&mut app, &ctrl(KeyCode::Char('d'))),
+        "Ctrl+D quits while a question is on screen"
+    );
+    assert!(app.should_quit);
+    // The question was not answered: the dropped reply is the denial.
+    assert!(app.pending_permission.is_some());
+
+    let mut app = test_app();
+    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('q'))));
+    assert!(app.should_quit);
+}
+
+#[test]
+fn ctrl_c_needs_a_second_press_and_a_plain_key_is_not_a_shortcut() {
+    let mut app = test_app();
+    let ctrl = |code: KeyCode| KeyEvent::new(code, KeyModifiers::CONTROL);
+
+    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('c'))));
+    assert!(!app.should_quit, "one press only warns");
+    assert!(app.toast.is_some());
+
+    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('c'))));
+    assert!(app.should_quit, "the second press exits");
+
+    let mut app = test_app();
+    assert!(!quit_shortcut(
+        &mut app,
+        &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+    ));
+    assert!(!app.should_quit, "a bare d is still text");
 }

@@ -270,7 +270,9 @@ fn the_matrix_answers_every_cell() {
         (PermissionMode::Deny, ActionKind::Execute, Verdict::Deny),
         (PermissionMode::Deny, ActionKind::Network, Verdict::Deny),
         (PermissionMode::Ask, ActionKind::Read, Verdict::Allow),
-        (PermissionMode::Ask, ActionKind::Write, Verdict::Allow),
+        // A workspace write asks like a command: nothing is written before the
+        // human answers, so the default mode never edits a file silently.
+        (PermissionMode::Ask, ActionKind::Write, Verdict::Ask),
         (PermissionMode::Ask, ActionKind::GlobalWrite, Verdict::Ask),
         (PermissionMode::Ask, ActionKind::Execute, Verdict::Ask),
         (PermissionMode::Ask, ActionKind::Network, Verdict::Ask),
@@ -290,7 +292,7 @@ fn the_matrix_answers_every_cell() {
         assert_eq!(decide(mode, &[], kind), expected, "{mode:?}/{kind:?}");
     }
 
-    // `permitted_actions` lifts execute and network in `ask` mode only …
+    // `permitted_actions` lifts write, execute and network in `ask` mode only …
     assert_eq!(
         decide(
             PermissionMode::Ask,
@@ -823,4 +825,63 @@ fn a_symlinked_directory_is_not_inside_the_workspace() {
     assert!(security.contains(&dir.path().join("notes.md")));
     assert!(!security.contains(outside.path()));
     assert!(!security.contains(&dir.path().join("../escape.txt")));
+}
+
+#[tokio::test]
+async fn a_workspace_write_asks_before_anything_is_written() {
+    use crate::agent::permissions::{ActionKind, Answer};
+
+    let (_dir, runtime) = runtime_with("ask", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Once);
+    runtime
+        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .await
+        .expect("an approval lets the write through");
+    let seen = confirmer.seen();
+    assert_eq!(seen.len(), 1, "the default mode asks for a write");
+    assert_eq!(seen[0].kind, ActionKind::Write);
+    assert!(
+        seen[0].effect.contains("inside the workspace"),
+        "{:?}",
+        seen[0]
+    );
+
+    // A refusal stops the tool before it runs.
+    let (_dir, runtime) = runtime_with("ask", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    let error = runtime
+        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .await
+        .unwrap_err();
+    assert!(error.contains("Permission denied"), "{error}");
+
+    // `permitted_actions = ["write"]` is the way to stop being asked.
+    let (_dir, runtime) = runtime_with("ask", &["write"]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    runtime
+        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .await
+        .expect("a lifted kind does not ask");
+    assert!(confirmer.seen().is_empty());
+
+    // `allow` mode never asks for a workspace write.
+    let (_dir, runtime) = runtime_with("allow", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    runtime
+        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .await
+        .expect("allow mode writes without a question");
+    assert!(confirmer.seen().is_empty());
+}
+
+#[test]
+fn write_is_liftable_into_permitted_actions() {
+    use crate::agent::permissions::{ActionKind, parse_permitted};
+
+    assert_eq!(
+        parse_permitted(&["write".to_string()]).unwrap(),
+        vec![ActionKind::Write]
+    );
+    let error = parse_permitted(&["global-write".to_string()]).unwrap_err();
+    assert!(error.contains("not liftable"), "{error}");
 }

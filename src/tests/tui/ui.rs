@@ -247,3 +247,94 @@ fn the_footer_marks_an_unrecognised_model_as_assumed() {
     assert!(text.contains("/128k"), "{text}");
     assert!(!text.contains("(assumed)"), "{text}");
 }
+
+#[test]
+fn streamed_reasoning_deltas_stay_in_one_paragraph() {
+    let mut app = test_app();
+    // The engine emits one delta per token, none of them ending in a newline.
+    for delta in ["Saya ", "perlu ", "memeriksa ", "berkas ", "ini."] {
+        app.push_thinking(delta);
+    }
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String { (0..100).map(|x| buffer[(x, y)].symbol()).collect() };
+
+    let thinking_y = (0..24)
+        .find(|y| row(*y).contains("thinking"))
+        .expect("thinking header");
+    assert_eq!(
+        row(thinking_y + 1).trim_end(),
+        "  │ Saya perlu memeriksa berkas ini.",
+        "a delta joins the open block instead of starting a line"
+    );
+}
+
+#[test]
+fn reasoning_uses_the_whole_width_of_a_wide_terminal() {
+    let mut app = test_app();
+    app.push_thinking(&"kata ".repeat(80));
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String { (0..120).map(|x| buffer[(x, y)].symbol()).collect() };
+
+    let thinking_y = (0..24)
+        .find(|y| row(*y).contains("thinking"))
+        .expect("thinking header");
+    let first = row(thinking_y + 1);
+    assert!(
+        first.trim_end().chars().count() > 100,
+        "a wide pane is used, not a narrow column: {first:?}"
+    );
+}
+
+#[test]
+fn a_pending_permission_renders_a_box_above_the_composer() {
+    let mut app = test_app();
+    let (reply, _answer) = tokio::sync::oneshot::channel();
+    app.pending_permission = Some(crate::tui::app::PendingPermission {
+        request: crate::agent::permissions::PermissionRequest::new(
+            crate::agent::permissions::ActionKind::Write,
+            "write_file",
+            "notes.txt",
+        ),
+        reply,
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String { (0..90).map(|x| buffer[(x, y)].symbol()).collect() };
+
+    let title_y = (0..24)
+        .find(|y| row(*y).contains("permission"))
+        .expect("the box title");
+    assert!(
+        row(title_y).trim_start().starts_with('┌'),
+        "a bordered box, not a bare line: {:?}",
+        row(title_y)
+    );
+    assert!(
+        row(title_y + 1).contains("write_file") && row(title_y + 1).contains("notes.txt"),
+        "the tool and its effect share the first row: {:?}",
+        row(title_y + 1)
+    );
+    for key in ["y", "a", "u", "n"] {
+        assert!(
+            row(title_y + 2).contains(&format!(" {key} ")),
+            "the {key} answer is offered: {:?}",
+            row(title_y + 2)
+        );
+    }
+    assert!(
+        row(title_y + 3).trim_start().starts_with('└'),
+        "a closed box"
+    );
+
+    // The status bar keeps its own row: the box no longer paints over it.
+    let status_y = (0..24)
+        .find(|y| row(*y).contains("ready"))
+        .expect("status bar");
+    assert!(!row(status_y).contains("permission"), "{:?}", row(status_y));
+}

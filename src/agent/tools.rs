@@ -485,12 +485,11 @@ impl AgentTool for RunCommandTool {
         let recursive = class.segments.iter().any(|segment| {
             crate::agent::shell::RECURSIVE_READERS.contains(&segment.program.as_str())
         });
-        let (stdout, withheld) = if recursive {
+        let stdout = if recursive {
             crate::agent::shell::filter_output(&stdout, security)
         } else {
-            (stdout, 0)
+            stdout
         };
-        let _ = withheld;
 
         let mut text = format!(
             "exit: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
@@ -511,7 +510,8 @@ impl AgentTool for RunCommandTool {
 
 /// Wall-clock ceiling for one command; the child is killed when it expires.
 pub(crate) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Per-stream ceiling, split evenly between the head and the tail.
+/// Per-stream ceiling, in characters, split evenly between the head and the
+/// tail.
 const STREAM_CAP: usize = 32 * 1024;
 const STREAM_HALF: usize = 16 * 1024;
 
@@ -574,7 +574,11 @@ pub(crate) async fn run_shell(
     let mut child = shell
         .spawn()
         .map_err(|e| format!("Process execution failed: {e}"))?;
-    let pid = child.id().unwrap_or_default();
+    // kill_tree signals the negated pid as a process group; a fallback of 0
+    // would signal this process's own group, so a missing id is an error.
+    let pid = child
+        .id()
+        .ok_or_else(|| "Process execution failed: the child has no pid".to_string())?;
 
     // The pipes are drained while the child runs: a chatty command must not
     // block on a full pipe before we ever look at the cancel token.
@@ -678,21 +682,25 @@ fn take_buffer(buffer: &std::sync::Mutex<Vec<u8>>) -> Vec<u8> {
 }
 
 /// Keep a bounded head and tail so a chatty command cannot flood the context.
+/// Counted in characters, so the two halves and the reported omission agree for
+/// multi-byte output.
 fn cap_stream(text: &str) -> String {
+    // Byte length is an upper bound on the character count, so this avoids the
+    // allocation for every command that stayed inside the cap.
     if text.len() <= STREAM_CAP {
         return text.to_string();
     }
-    let head: String = text.chars().take(STREAM_HALF).collect();
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(STREAM_HALF)
-        .collect::<Vec<char>>()
-        .into_iter()
-        .rev()
+    let characters: Vec<char> = text.chars().collect();
+    if characters.len() <= STREAM_CAP {
+        return text.to_string();
+    }
+    let head: String = characters.iter().take(STREAM_HALF).collect();
+    let tail: String = characters
+        .iter()
+        .skip(characters.len() - STREAM_HALF)
         .collect();
-    let omitted = text.len().saturating_sub(head.len() + tail.len());
-    format!("{head}\n[{omitted} bytes omitted]\n{tail}")
+    let omitted = characters.len() - STREAM_HALF * 2;
+    format!("{head}\n[{omitted} chars omitted]\n{tail}")
 }
 
 /// One file's content is only searched when it is this small: a match in a

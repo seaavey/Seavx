@@ -90,6 +90,7 @@ fn every_registry_entry_parses_to_a_handled_command() {
         ),
         ("/undo", SlashCommand::Undo),
         ("/sessions", SlashCommand::Sessions { index: None }),
+        ("/resume", SlashCommand::Resume),
         ("/exit", SlashCommand::Exit),
     ];
 
@@ -134,6 +135,7 @@ fn every_handled_command_appears_in_the_registry() {
         "/memory",
         "/undo",
         "/sessions",
+        "/resume",
         "/exit",
     ];
     for name in handled {
@@ -209,6 +211,7 @@ fn the_palette_is_the_table() {
             "/memory",
             "/undo",
             "/sessions",
+            "/resume",
             "/exit"
         ]
     );
@@ -505,9 +508,9 @@ fn sessions_lists_the_workspace_and_resumes_by_number() {
     // Newest first: number 1 is the session created last.
     let lines: Vec<&str> = listing.lines().collect();
     // Numbered row, then its title on the following line.
-    assert!(lines[1].trim_start().starts_with("1  id"), "{listing}");
+    assert!(lines[1].trim_start().starts_with("1  svx-"), "{listing}");
     assert!(lines[2].trim().contains("second prompt"), "{listing}");
-    assert!(lines[3].trim_start().starts_with("2  id"), "{listing}");
+    assert!(lines[3].trim_start().starts_with("2  svx-"), "{listing}");
     assert!(lines[4].trim().contains("first prompt"), "{listing}");
 
     let first = crate::cli::sessions::resume_by_number(&store, &workspace, 1).expect("resumes");
@@ -557,5 +560,17 @@ fn the_readme_command_table_matches_the_registry() {
     assert_eq!(
         names, registered,
         "the README command table and the registry drifted; the palette is generated from the registry"
+    );
+}
+
+#[test]
+fn resume_opens_the_session_picker_and_takes_no_arguments() {
+    assert_eq!(parse("/resume"), Some(SlashCommand::Resume));
+    assert!(matches!(parse("/resume 2"), Some(SlashCommand::Unknown(_))));
+
+    let mut app = crate::tui::app::test_app();
+    assert_eq!(
+        execute(&mut app, SlashCommand::Resume),
+        CommandEffect::OpenSessionPicker
     );
 }

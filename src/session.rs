@@ -14,8 +14,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Serde format of a message payload. Bumped only if `genai` changes its
 /// `ChatMessage` shape; a mismatch opens the session read-only.
 pub const PAYLOAD_FORMAT: &str = "genai-chat-v1";
-/// Schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Schema version this build understands. 2 added the `slug` column; `migrate`
+/// adds it to a v1 file and names every existing row.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Total budget for one write: three attempts, 100 ms and 200 ms waits.
 pub const WRITE_BUDGET: Duration = Duration::from_secs(5);
@@ -76,6 +77,8 @@ impl TurnState {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: i64,
+    /// The `svx-…` name the user types; `id` stays the key the tables join on.
+    pub slug: String,
     pub title: String,
     pub updated_at: i64,
     pub messages: usize,
@@ -96,6 +99,8 @@ pub struct StoredMessage {
 #[derive(Debug, Clone)]
 pub struct LoadedSession {
     pub id: i64,
+    /// The `svx-…` name this session is addressed by.
+    pub slug: String,
     pub workspace: String,
     pub title: Option<String>,
     pub model: Option<String>,
@@ -293,6 +298,38 @@ pub fn title_from(prompt: &str) -> String {
         .collect()
 }
 
+/// A short, human-typed session id: `svx-` and eight lowercase hex digits. It
+/// is random, not sequential, so it says nothing about how many sessions exist.
+fn new_slug() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(nanos);
+    hasher.write_u32(std::process::id());
+    format!("svx-{:08x}", hasher.finish() as u32)
+}
+
+/// The one `INSERT` behind `create`; kept out of the closure so a slug
+/// collision can be retried without repeating the statement.
+fn insert_session(
+    connection: &Connection,
+    slug: &str,
+    workspace: &str,
+    title: Option<&str>,
+    model: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT INTO sessions(slug, workspace, title, model, payload_format, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
+        params![slug, workspace, title, model, PAYLOAD_FORMAT, now],
+    )
+}
+
 fn has_text(message: &ChatMessage) -> bool {
     message
         .content
@@ -394,6 +431,7 @@ pub fn export_json(session: &LoadedSession) -> String {
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL DEFAULT '',
     workspace TEXT NOT NULL,
     title TEXT,
     model TEXT,
@@ -427,6 +465,8 @@ pub enum SessionError {
     Unavailable(String),
     /// No session with this id.
     Unknown(i64),
+    /// No session with this slug or numeric id.
+    UnknownKey(String),
     /// The session predates this build's payload format or payload.
     ReadOnly(String),
     /// The write itself broke an ordering invariant; a programming error.
@@ -444,6 +484,7 @@ impl std::fmt::Display for SessionError {
             ),
             SessionError::Unavailable(detail) => write!(f, "session store unavailable: {detail}"),
             SessionError::Unknown(id) => write!(f, "unknown session {id}"),
+            SessionError::UnknownKey(key) => write!(f, "unknown session {key}"),
             SessionError::ReadOnly(reason) => write!(f, "session is read-only: {reason}"),
             SessionError::Refused(detail) => write!(f, "session write refused: {detail}"),
             SessionError::Busy => write!(
@@ -466,6 +507,24 @@ impl From<rusqlite::Error> for SessionError {
 pub struct SessionStore {
     connection: Connection,
 }
+
+/// The WAL and its shared-memory index are created by SQLite, not by this
+/// module, so their mode follows the umask instead of the database's `0600`.
+#[cfg(unix)]
+fn tighten_sidecars(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let sidecar = PathBuf::from(name);
+        if sidecar.exists() {
+            let _ = std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_sidecars(_path: &Path) {}
 
 impl SessionStore {
     /// The default location for this run.
@@ -506,9 +565,14 @@ impl SessionStore {
         connection.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=2000;",
         )?;
+        // SQLite creates the WAL and its index itself, with the umask's mode.
+        // They carry the same payloads as the database, so an existing one is
+        // made owner-only, before and after the migration writes through it.
+        tighten_sidecars(path);
 
         let store = Self { connection };
         store.migrate()?;
+        tighten_sidecars(path);
         Ok(store)
     }
 
@@ -524,6 +588,36 @@ impl SessionStore {
 
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute_batch(SCHEMA)?;
+
+        // A v1 file already has the table, so `CREATE TABLE IF NOT EXISTS`
+        // could not add the column: alter it, then name every existing row.
+        let mut columns = transaction.prepare("PRAGMA table_info(sessions)")?;
+        let names: Vec<String> = columns
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        drop(columns);
+        if !names.iter().any(|name| name == "slug") {
+            transaction
+                .execute_batch("ALTER TABLE sessions ADD COLUMN slug TEXT NOT NULL DEFAULT ''")?;
+        }
+        // After the column, never in `SCHEMA`: an index on a column the v1
+        // table does not have yet would fail the whole batch.
+        transaction.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS sessions_slug ON sessions(slug) WHERE slug <> ''",
+        )?;
+
+        let mut unnamed = transaction.prepare("SELECT id FROM sessions WHERE slug = ''")?;
+        let pending: Vec<i64> = unnamed
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        drop(unnamed);
+        for id in pending {
+            transaction.execute(
+                "UPDATE sessions SET slug = ?1 WHERE id = ?2",
+                params![new_slug(), id],
+            )?;
+        }
+
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         Ok(())
@@ -543,13 +637,46 @@ impl SessionStore {
     ) -> Result<i64, SessionError> {
         let now = crate::util::epoch_secs() as i64;
         self.write(|connection| {
-            connection.execute(
-                "INSERT INTO sessions(workspace, title, model, payload_format, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)",
-                params![workspace, title, model, PAYLOAD_FORMAT, now],
-            )?;
+            // The unique index turns a collision into an error instead of two
+            // sessions sharing a name; one retry with a fresh slug is enough.
+            let mut slug = new_slug();
+            let mut inserted = insert_session(connection, &slug, workspace, title, model, now);
+            if let Err(rusqlite::Error::SqliteFailure(error, _)) = &inserted
+                && error.code == rusqlite::ErrorCode::ConstraintViolation
+            {
+                slug = new_slug();
+                inserted = insert_session(connection, &slug, workspace, title, model, now);
+            }
+            inserted?;
             Ok(connection.last_insert_rowid())
         })
+    }
+
+    /// Resolve the id a user typed: the `svx-…` slug, or a bare number from a
+    /// build that had no slugs.
+    pub fn id_for(&self, key: &str) -> Result<i64, SessionError> {
+        let key = key.trim();
+        let by_slug = self
+            .connection
+            .query_row("SELECT id FROM sessions WHERE slug = ?1", [key], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?;
+        if let Some(id) = by_slug {
+            return Ok(id);
+        }
+
+        if let Ok(id) = key.parse::<i64>() {
+            let exists = self
+                .connection
+                .query_row("SELECT 1 FROM sessions WHERE id = ?1", [id], |_| Ok(()))
+                .optional()?;
+            if exists.is_some() {
+                return Ok(id);
+            }
+        }
+
+        Err(SessionError::UnknownKey(key.to_string()))
     }
 
     /// The one row a submitted prompt writes; never rewritten afterwards.
@@ -599,24 +726,31 @@ impl SessionStore {
     /// first, each with its derived turn state.
     pub fn list(&self, workspace: &str) -> Result<Vec<SessionSummary>, SessionError> {
         let mut statement = self.connection.prepare(
-            "SELECT s.id, s.title, s.updated_at, COUNT(m.id)
+            "SELECT s.id, s.slug, s.title, s.updated_at, COUNT(m.id)
              FROM sessions s JOIN messages m ON m.session_id = s.id
              WHERE s.workspace = ?1
              GROUP BY s.id
              HAVING COUNT(m.id) > 0
              ORDER BY s.updated_at DESC, s.id DESC",
         )?;
-        let rows: Vec<(i64, Option<String>, i64, i64)> = statement
+        let rows: Vec<(i64, String, Option<String>, i64, i64)> = statement
             .query_map([workspace], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })?
             .collect::<Result<_, _>>()?;
         drop(statement);
 
         let mut summaries = Vec::with_capacity(rows.len());
-        for (id, title, updated_at, messages) in rows {
+        for (id, slug, title, updated_at, messages) in rows {
             summaries.push(SessionSummary {
                 id,
+                slug,
                 title: title.unwrap_or_default(),
                 updated_at,
                 messages: messages as usize,
@@ -632,17 +766,18 @@ impl SessionStore {
         let header = self
             .connection
             .query_row(
-                "SELECT workspace, title, model, payload_format, total_tokens, prompt_tokens
+                "SELECT slug, workspace, title, model, payload_format, total_tokens, prompt_tokens
                  FROM sessions WHERE id = ?1",
                 [id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 },
             )
@@ -650,10 +785,10 @@ impl SessionStore {
             .ok_or(SessionError::Unknown(id))?;
 
         let messages = self.rows(id)?;
-        let mut read_only = (header.3 != PAYLOAD_FORMAT).then(|| {
+        let mut read_only = (header.4 != PAYLOAD_FORMAT).then(|| {
             format!(
                 "payload format {} does not match {}",
-                header.3, PAYLOAD_FORMAT
+                header.4, PAYLOAD_FORMAT
             )
         });
         if read_only.is_none()
@@ -669,14 +804,15 @@ impl SessionStore {
 
         Ok(LoadedSession {
             id,
-            workspace: header.0,
-            title: header.1,
-            model: header.2,
-            payload_format: header.3,
+            slug: header.0,
+            workspace: header.1,
+            title: header.2,
+            model: header.3,
+            payload_format: header.4,
             read_only,
             messages,
-            total_tokens: header.4,
-            prompt_tokens: header.5,
+            total_tokens: header.5,
+            prompt_tokens: header.6,
         })
     }
 

@@ -114,12 +114,26 @@ fn database_and_directory_are_owner_only() {
     std::fs::write(&path, b"").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    let _store = SessionStore::open_at(&path).unwrap();
+    let store = SessionStore::open_at(&path).unwrap();
+    // A write is what makes SQLite create the WAL and its shared-memory index.
+    store.create("/tmp/ws", Some("model"), None).unwrap();
 
     let mode =
         |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&seavx), 0o700);
     assert_eq!(mode(&path), 0o600);
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let sidecar = std::path::PathBuf::from(name);
+        // The WAL exists after the write; the index may already be gone.
+        if suffix == "-wal" {
+            assert!(sidecar.exists(), "the write created a WAL");
+        }
+        if sidecar.exists() {
+            assert_eq!(mode(&sidecar), 0o600, "{suffix} is owner-only");
+        }
+    }
 }
 
 #[test]
@@ -392,6 +406,7 @@ fn stored(seq: i64, role: &str, status: MessageStatus, message: &ChatMessage) ->
 fn loaded(messages: Vec<StoredMessage>) -> LoadedSession {
     LoadedSession {
         id: 1,
+        slug: "svx-00000001".to_string(),
         workspace: "/ws".to_string(),
         title: None,
         model: None,
@@ -1184,4 +1199,93 @@ fn stored_payloads_round_trip_every_message_shape() {
         outcome.omitted, 0,
         "nothing was dropped by the resume window"
     );
+}
+
+#[test]
+fn every_session_gets_a_short_svx_slug() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let first = store.create("/ws", None, None).unwrap();
+    let second = store.create("/ws", None, None).unwrap();
+
+    let mut slugs = Vec::new();
+    for id in [first, second] {
+        let slug = store.load(id).unwrap().slug;
+        assert_eq!(slug.len(), 12, "svx- plus eight hex digits: {slug}");
+        assert!(slug.starts_with("svx-"), "{slug}");
+        assert!(
+            slug[4..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "lowercase hex only: {slug}"
+        );
+        slugs.push(slug);
+    }
+    assert_ne!(slugs[0], slugs[1], "two sessions never share a name");
+}
+
+#[test]
+fn a_slug_and_a_bare_number_both_resolve_to_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    let slug = store.load(id).unwrap().slug;
+
+    assert_eq!(store.id_for(&slug).unwrap(), id);
+    assert_eq!(
+        store.id_for(&id.to_string()).unwrap(),
+        id,
+        "a number typed out of habit still resolves"
+    );
+    assert!(matches!(
+        store.id_for("svx-00000000"),
+        Err(SessionError::UnknownKey(_))
+    ));
+    assert!(matches!(
+        store.id_for("999999"),
+        Err(SessionError::UnknownKey(_))
+    ));
+}
+
+#[test]
+fn a_v1_file_gains_a_slug_for_every_existing_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace TEXT NOT NULL,
+                    title TEXT,
+                    model TEXT,
+                    payload_format TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO sessions(workspace, payload_format, status, created_at, updated_at)
+                VALUES ('/ws', 'genai-chat-v1', 'active', 1, 1);
+                PRAGMA user_version = 1;",
+            )
+            .unwrap();
+    }
+
+    let store = SessionStore::open_at(&path).unwrap();
+    let slug: String = store
+        .connection()
+        .query_row("SELECT slug FROM sessions WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(slug.starts_with("svx-"), "the row is named: {slug}");
+
+    let version: u32 = store
+        .connection()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
 }

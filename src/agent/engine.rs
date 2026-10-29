@@ -9,7 +9,10 @@ use crate::agent::tools::ToolRegistry;
 use crate::session::MessageStatus;
 use genai::Client;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort, ToolResponse};
+use genai::chat::{
+    ChatMessage, ChatOptions, ChatRequest, ContentPart, MessageContent, ReasoningEffort, ToolCall,
+    ToolResponse,
+};
 use genai::resolver::{AuthData, Endpoint};
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +59,17 @@ pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx
 
 /// Turn budget a new config starts with. An existing file keeps its own value.
 pub const DEFAULT_MAX_TURNS: usize = 100;
+
+/// Model a new config starts with. An existing file keeps its own value.
+pub const DEFAULT_MODEL: &str = "openai/gpt-4o-mini";
+
+fn default_model() -> String {
+    DEFAULT_MODEL.to_string()
+}
+
+fn default_max_turns() -> usize {
+    DEFAULT_MAX_TURNS
+}
 
 /// Endpoint used when the config does not set `base_url`.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
@@ -112,11 +126,19 @@ impl ConfigReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
+    // Every field has a default so a hand-written file that sets only one key
+    // is merged with the built-in values instead of failing to parse.
+    #[serde(default = "default_model")]
     pub model: String,
+    #[serde(default = "default_max_turns")]
     pub max_turns: usize,
+    #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
     pub system_prompt: Option<String>,
     /// `deny` | `ask` | `allow`, kept raw so an invalid value is reported with
     /// the file that holds it instead of being coerced to a silent default.
@@ -148,7 +170,7 @@ impl AgentConfig {
     /// Build the built-in defaults from an injected environment, so tests
     /// never depend on the caller's real variables.
     fn from_env(env: impl Fn(&str) -> Option<String>) -> Self {
-        let model = env("SEAVX_MODEL").unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+        let model = env("SEAVX_MODEL").unwrap_or_else(default_model);
         let base_url = env("SEAVX_BASE_URL");
         let api_key = env("SEAVX_API_KEY")
             .or_else(|| env("OPENAI_API_KEY"))
@@ -341,8 +363,10 @@ impl AgentConfig {
                                 }
                             }
                         }
-                        // The file replaces the whole default config, matching
-                        // `load`: keys it omits do not inherit fallback envs.
+                        // A key the file omits takes the built-in default: a
+                        // partial file must not be discarded, and it must not
+                        // silently inherit the fallback API-key variables
+                        // either, which would make the file's origin a lie.
                         config = parsed;
                     }
                     Err(error) => parse_error = Some(first_line(&error.to_string())),
@@ -565,6 +589,58 @@ fn cancelled(turn_state: &mut TurnState) -> TurnError {
     TurnError::Cancelled
 }
 
+/// A copy of the message with every string the model produced masked, for the
+/// transcript and the session. The request keeps the original: a tool result is
+/// matched to its call by the arguments that were sent, so masking them there
+/// would break the replay.
+fn redacted_for_display(message: &ChatMessage) -> ChatMessage {
+    let parts: Vec<ContentPart> = message
+        .content
+        .parts()
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text(text) => ContentPart::Text(security::redact(text)),
+            ContentPart::ToolCall(call) => ContentPart::ToolCall(ToolCall {
+                fn_arguments: redacted_value(&call.fn_arguments),
+                ..call.clone()
+            }),
+            other => other.clone(),
+        })
+        .collect();
+    ChatMessage {
+        role: message.role.clone(),
+        content: MessageContent::from_parts(parts),
+        options: message.options.clone(),
+    }
+}
+
+/// Mask every string inside a JSON value, keeping the shape so the transcript
+/// still shows which argument was redacted.
+fn redacted_value(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(security::redact(text)),
+        Value::Array(items) => Value::Array(items.iter().map(redacted_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), redacted_value(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// A loop that stops early still ends with one assistant row, so a resumed
+/// session can see why the turn ended instead of a completed turn with no
+/// answer. The reason is already redacted by the caller.
+fn report_stopped(
+    on_message: &mut impl FnMut(&ChatMessage, MessageStatus),
+    text: String,
+) -> String {
+    on_message(&ChatMessage::assistant(&text), MessageStatus::Complete);
+    text
+}
+
 /// A cancelled turn always leaves one assistant row: `cancelled` with no text,
 /// `partial` with what arrived.
 fn report_cancelled(on_message: &mut impl FnMut(&ChatMessage, MessageStatus), received: &str) {
@@ -713,8 +789,8 @@ impl AgentRuntime {
                 Ok(answer)
             }
             Err(TurnError::Cancelled) => {
-                // Cancelling is reported, never skipped: the TUI reads it.
-                turn.transition(TurnStatus::Cancelling);
+                // `cancelled()` already moved the state to `Cancelling`; this is
+                // the one edge left, and it is reported because the TUI reads it.
                 turn.transition(TurnStatus::Cancelled);
                 Err(std::io::Error::other("the turn was cancelled").into())
             }
@@ -746,7 +822,8 @@ impl AgentRuntime {
         mut on_message: impl FnMut(&ChatMessage, MessageStatus),
     ) -> Result<String, TurnError> {
         if cancel.is_cancelled() {
-            return Err(TurnError::Cancelled);
+            // The same reporting path every other cancel uses.
+            return Err(cancelled(turn_state));
         }
         let summarizer: std::sync::Arc<dyn crate::tui::compact::Summarizer> = match &self.summarizer
         {
@@ -853,15 +930,15 @@ impl AgentRuntime {
                     if !spent {
                         return Err(TurnError::Failed(error));
                     }
-                    if let Some(trigger) = trigger {
-                        chat_req = match trigger {
-                            RetryTrigger::ReplayRejection => halve_turns(&chat_req),
-                            RetryTrigger::CapacityError => {
-                                self.aggressive_request(&retry_history, task, mode, &*summarizer)
-                                    .await
-                            }
-                            RetryTrigger::StreamUnavailable => chat_req.clone(),
-                        };
+                    match trigger {
+                        Some(RetryTrigger::ReplayRejection) => chat_req = halve_turns(&chat_req),
+                        Some(RetryTrigger::CapacityError) => {
+                            chat_req = self
+                                .aggressive_request(&retry_history, task, mode, &*summarizer)
+                                .await
+                        }
+                        // The same request, unstreamed: nothing to rebuild.
+                        Some(RetryTrigger::StreamUnavailable) | None => {}
                     }
                     // A failure here is the turn's failure: it never buys a
                     // second retry.
@@ -929,7 +1006,12 @@ impl AgentRuntime {
 
             let assistant_msg = response.clone().into_assistant_message_for_tool_use();
             if let Some(msg) = assistant_msg {
-                on_message(&msg, crate::session::MessageStatus::Complete);
+                // The model writes the arguments, so they may carry a secret:
+                // the transcript and the session get the masked copy.
+                on_message(
+                    &redacted_for_display(&msg),
+                    crate::session::MessageStatus::Complete,
+                );
                 chat_req = chat_req.append_message(msg);
             }
 
@@ -939,8 +1021,14 @@ impl AgentRuntime {
                 let tool_name = &call.fn_name;
                 let signature = format!("{tool_name}({})", call.fn_arguments);
                 if last_action.as_deref() == Some(signature.as_str()) {
-                    tracing::warn!(action = %security::redact(&signature), "repeated action stopped the loop");
-                    return Ok(format!("stopped: {signature} repeated twice"));
+                    // The reason reaches the transcript, so it is masked here
+                    // rather than only in the log line.
+                    let reason = security::redact(&signature);
+                    tracing::warn!(action = %reason, "repeated action stopped the loop");
+                    return Ok(report_stopped(
+                        &mut on_message,
+                        format!("stopped: {reason} repeated twice"),
+                    ));
                 }
                 last_action = Some(signature);
 
@@ -1008,8 +1096,9 @@ impl AgentRuntime {
 
                 if is_err {
                     if last_failure.as_deref() == Some(result_str.as_str()) {
-                        return Ok(format!(
-                            "stopped: the same error repeated twice: {result_str}"
+                        return Ok(report_stopped(
+                            &mut on_message,
+                            format!("stopped: the same error repeated twice: {result_str}"),
                         ));
                     }
                     last_failure = Some(result_str.clone());

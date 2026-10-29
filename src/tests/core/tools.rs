@@ -305,7 +305,7 @@ async fn command_output_is_capped_and_environment_is_cleared() {
 
     let big = run("yes x | head -c 200000").await.unwrap();
     assert!(
-        big.contains("bytes omitted"),
+        big.contains("chars omitted"),
         "a 200 KB stream must be capped: {}",
         &big[big.len().saturating_sub(120)..]
     );

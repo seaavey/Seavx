@@ -129,6 +129,8 @@ pub enum ModalSelection {
         options: Vec<&'static str>,
         selected: usize,
     },
+    /// One row per stored session, newest first: the order `/sessions <n>` reads.
+    Session { rows: Vec<String>, selected: usize },
 }
 
 /// Cached markdown render of the whole transcript, invalidated by `revision`.
@@ -553,14 +555,13 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Append a reasoning block; consecutive reasoning merges into one block.
+    /// Append reasoning. A stream sends one delta per token, so a delta joins
+    /// the open block instead of starting a line: a newline per delta turned a
+    /// paragraph into a column of one-word rows.
     pub fn push_thinking(&mut self, text: &str) {
         self.revision += 1;
         match self.segments.last_mut() {
-            Some(Segment::Thinking(buf)) => {
-                buf.push('\n');
-                buf.push_str(text);
-            }
+            Some(Segment::Thinking(buf)) => buf.push_str(text),
             _ => self.segments.push(Segment::Thinking(text.to_string())),
         }
     }
@@ -658,6 +659,27 @@ impl<'a> App<'a> {
             models,
             selected: current_idx,
         });
+        true
+    }
+
+    /// Open the session picker from this store's listing for the current
+    /// workspace. Returns `false` when there is nothing to pick, so the caller
+    /// can say so instead of opening an empty modal.
+    pub fn open_session_picker(&mut self, store: &crate::session::SessionStore) -> bool {
+        let rows = match crate::cli::sessions::session_rows(store, &crate::session::workspace_key())
+        {
+            Ok(rows) if rows.is_empty() => {
+                self.push_notice("No sessions yet. Start one by sending a prompt.");
+                return false;
+            }
+            Ok(rows) => rows,
+            Err(error) => {
+                self.push_notice(format!("Sessions unavailable: {error}"));
+                return false;
+            }
+        };
+
+        self.modal = Some(ModalSelection::Session { rows, selected: 0 });
         true
     }
 
@@ -1037,6 +1059,56 @@ impl<'a> App<'a> {
     }
 }
 
+/// The three ways out of the TUI, checked before anything that could swallow a
+/// key: `Ctrl+D`/`Ctrl+Q` quit at once, `Ctrl+C` needs a second press within
+/// 1.5 s. Returns `true` when the key was consumed.
+fn quit_shortcut(app: &mut App, key: &KeyEvent) -> bool {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char('d') | KeyCode::Char('q') => {
+            app.should_quit = true;
+            true
+        }
+        KeyCode::Char('c') => {
+            if let Some(prev) = app.last_ctrl_c
+                && prev.elapsed() < std::time::Duration::from_millis(1500)
+            {
+                app.should_quit = true;
+                return true;
+            }
+            app.last_ctrl_c = Some(std::time::Instant::now());
+            app.toast = Some((
+                "Press Ctrl+C again to exit".to_string(),
+                std::time::Instant::now(),
+            ));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Load one session off the event loop and hand it back as an action. Both
+/// `/sessions <n>` and the `/resume` picker go through here, so a number means
+/// the same thing in both.
+fn spawn_session_resume(app: &mut App, tx: &mpsc::UnboundedSender<Action>, number: u32) {
+    app.status = AgentState::Checking;
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = crate::session::SessionStore::open()
+            .map_err(|error| error.to_string())
+            .and_then(|store| {
+                crate::cli::sessions::resume_by_number(
+                    &store,
+                    &crate::session::workspace_key(),
+                    number,
+                )
+            });
+        let _ = tx.send(Action::SessionResume(result));
+    });
+}
+
 /// Apply the event-loop effects a command asked for.
 fn apply_command_effect(
     app: &mut App,
@@ -1064,11 +1136,11 @@ fn apply_command_effect(
                 let _ = tx.send(Action::DoctorDone(report));
             });
         }
-        CommandEffect::RunSessions { index } => {
-            app.status = AgentState::Checking;
-            let tx = tx.clone();
-            tokio::task::spawn_blocking(move || match index {
-                None => {
+        CommandEffect::RunSessions { index } => match index {
+            None => {
+                app.status = AgentState::Checking;
+                let tx = tx.clone();
+                tokio::task::spawn_blocking(move || {
                     let result = crate::session::SessionStore::open()
                         .map_err(|error| error.to_string())
                         .and_then(|store| {
@@ -1078,21 +1150,16 @@ fn apply_command_effect(
                             )
                         });
                     let _ = tx.send(Action::SessionsListed(result));
-                }
-                Some(number) => {
-                    let result = crate::session::SessionStore::open()
-                        .map_err(|error| error.to_string())
-                        .and_then(|store| {
-                            crate::cli::sessions::resume_by_number(
-                                &store,
-                                &crate::session::workspace_key(),
-                                number,
-                            )
-                        });
-                    let _ = tx.send(Action::SessionResume(result));
-                }
-            });
-        }
+                });
+            }
+            Some(number) => spawn_session_resume(app, tx, number),
+        },
+        CommandEffect::OpenSessionPicker => match crate::session::SessionStore::open() {
+            Ok(store) => {
+                app.open_session_picker(&store);
+            }
+            Err(error) => app.push_notice(format!("Sessions unavailable: {error}")),
+        },
         CommandEffect::RunUndo => {
             app.status = AgentState::Checking;
             let tx = tx.clone();
@@ -1486,6 +1553,13 @@ pub async fn start_tui(
                     }
                 }
                 Action::Key(key) => {
+                    // Quitting is never blocked. A pending question is answered by
+                    // dropping its reply, which the confirmer treats as a denial, so
+                    // Ctrl+D cannot approve anything on the way out.
+                    if quit_shortcut(&mut app, &key) {
+                        continue;
+                    }
+
                     // A pending question owns the next key: y/a/u answer it, n/Esc
                     // denies. Nothing else runs until it is resolved.
                     if app.pending_permission.is_some() {
@@ -1503,35 +1577,6 @@ pub async fn start_tui(
                             None => app.push_notice("Answer the permission prompt: y / a / u / n"),
                         }
                         continue;
-                    }
-
-                    // Ctrl+C double press exit with confirmation toast
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
-                        if let Some(prev) = app.last_ctrl_c
-                            && prev.elapsed() < std::time::Duration::from_millis(1500)
-                        {
-                            app.should_quit = true;
-                            continue;
-                        }
-                        app.last_ctrl_c = Some(std::time::Instant::now());
-                        app.toast = Some((
-                            "Press Ctrl+C again to exit".to_string(),
-                            std::time::Instant::now(),
-                        ));
-                        continue;
-                    }
-
-                    // Global Ctrl shortcuts (Ctrl+D, Ctrl+Q) for immediate exit
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        match key.code {
-                            KeyCode::Char('d') | KeyCode::Char('q') => {
-                                app.should_quit = true;
-                                continue;
-                            }
-                            _ => {}
-                        }
                     }
 
                     // Modal Key Interceptor (Arrow selection + Enter)
@@ -1663,6 +1708,33 @@ pub async fn start_tui(
                                     app.scroll = 0;
                                     app.auto_scroll = true;
                                     app.modal = None;
+                                }
+                                _ => {}
+                            },
+                            ModalSelection::Session { rows, selected } => match key.code {
+                                KeyCode::Esc => {
+                                    app.modal = None;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let new_sel = prev_index(selected, rows.len());
+                                    app.modal = Some(ModalSelection::Session {
+                                        rows,
+                                        selected: new_sel,
+                                    });
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let new_sel = next_index(selected, rows.len());
+                                    app.modal = Some(ModalSelection::Session {
+                                        rows,
+                                        selected: new_sel,
+                                    });
+                                }
+                                KeyCode::Enter => {
+                                    app.modal = None;
+                                    // Rows are the `/sessions` order, so the index is the number.
+                                    if selected < rows.len() {
+                                        spawn_session_resume(&mut app, &tx, (selected + 1) as u32);
+                                    }
                                 }
                                 _ => {}
                             },

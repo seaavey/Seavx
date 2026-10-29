@@ -26,6 +26,7 @@ pub enum CommandId {
     Memory,
     Undo,
     Sessions,
+    Resume,
     Exit,
 }
 
@@ -113,6 +114,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         id: CommandId::Sessions,
     },
     CommandSpec {
+        name: "/resume",
+        usage: "/resume",
+        summary: "Pick a stored session and resume it",
+        id: CommandId::Resume,
+    },
+    CommandSpec {
         name: "/exit",
         usage: "/exit",
         summary: "Quit Seavx agent TUI",
@@ -160,6 +167,8 @@ pub enum SlashCommand {
     Sessions {
         index: Option<u32>,
     },
+    /// Open the session picker: the same list as `/sessions`, chosen with arrows.
+    Resume,
     Unknown(String),
 }
 
@@ -172,6 +181,7 @@ pub enum CommandEffect {
     RunCompact { instructions: Option<String> },
     RunUndo,
     RunSessions { index: Option<u32> },
+    OpenSessionPicker,
 }
 
 /// Parse one line of input. Returns `None` when the line is not a slash
@@ -230,6 +240,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             ["--offline"] => SlashCommand::Doctor { offline: true },
             _ => SlashCommand::Unknown(trimmed.to_string()),
         },
+        CommandId::Resume => no_args(&args, trimmed, SlashCommand::Resume),
         CommandId::Sessions => match args.as_slice() {
             [] => SlashCommand::Sessions { index: None },
             [number] => match number.parse::<u32>() {
@@ -377,6 +388,7 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },
         SlashCommand::Undo => CommandEffect::RunUndo,
         SlashCommand::Sessions { index } => CommandEffect::RunSessions { index },
+        SlashCommand::Resume => CommandEffect::OpenSessionPicker,
         SlashCommand::Init => {
             match config::init_workspace(std::path::Path::new(".")) {
                 Ok((path, true)) => {

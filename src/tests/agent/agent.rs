@@ -1075,6 +1075,7 @@ mod repeated_actions {
             Box::new(fake.clone()),
         );
 
+        let mut messages: Vec<(String, crate::session::MessageStatus)> = Vec::new();
         let result = runtime
             .execute_task(
                 "look around",
@@ -1083,7 +1084,12 @@ mod repeated_actions {
                 &crate::agent::permissions::DenyingConfirmer,
                 &crate::agent::cancel::CancelToken::new(),
                 |_| {},
-                |_, _| {},
+                |message, status| {
+                    messages.push((
+                        message.content.first_text().unwrap_or_default().to_string(),
+                        status,
+                    ));
+                },
             )
             .await
             .result
@@ -1094,10 +1100,121 @@ mod repeated_actions {
             "the reason names the tool and its arguments: {result}"
         );
         assert!(result.contains("repeated twice"), "{result}");
+        let (last, status) = messages
+            .last()
+            .expect("a stopped turn still leaves an assistant row");
+        assert_eq!(*status, crate::session::MessageStatus::Complete);
+        assert_eq!(
+            last, &result,
+            "the session stores the same reason the user sees"
+        );
         assert_eq!(
             fake.requests().len(),
             2,
             "the loop stops instead of asking a third time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_call_does_not_echo_a_secret_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        for call_id in ["call_one", "call_two"] {
+            fake.push(response(MessageContent::from_tool_calls(vec![tool_call(
+                call_id,
+                "list_directory",
+                "sk-live-abcdefgh",
+            )])));
+        }
+
+        let mut config = AgentConfig::load(temp.path());
+        config.model = "fake-model".to_string();
+        config.max_turns = 10;
+        config.system_prompt = Some("system prompt".to_string());
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let mut last = String::new();
+        let result = runtime
+            .execute_task(
+                "look around",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |message, _| {
+                    last = message.content.first_text().unwrap_or_default().to_string();
+                },
+            )
+            .await
+            .result
+            .unwrap();
+
+        // The reason is shown and stored, so the argument is masked in both.
+        assert!(!result.contains("sk-live-abcdefgh"), "{result}");
+        assert!(result.contains("[redacted]"), "{result}");
+        assert_eq!(last, result, "the stored row is masked too");
+    }
+}
+
+#[cfg(test)]
+mod transcript_redaction {
+    use super::engine_seam::{FakeBackend, response};
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
+    use crate::agent::security::WorkspaceSecurity;
+    use genai::chat::{ChatMessage, MessageContent};
+
+    #[tokio::test]
+    async fn a_tool_call_argument_is_masked_in_the_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            serde_json::from_value(serde_json::json!({
+                "call_id": "call_one",
+                "fn_name": "list_directory",
+                "fn_arguments": { "path": "sk-live-abcdefgh" },
+            }))
+            .unwrap(),
+        ])));
+        fake.push(response(MessageContent::from_text("done")));
+
+        let mut config = AgentConfig::load(temp.path());
+        config.model = "fake-model".to_string();
+        config.max_turns = 4;
+        config.system_prompt = Some("system prompt".to_string());
+        let runtime =
+            AgentRuntime::with_backend(config, WorkspaceSecurity::new(temp.path()), Box::new(fake));
+
+        let mut seen: Vec<String> = Vec::new();
+        let answer = runtime
+            .execute_task(
+                "look around",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |message, _| seen.push(format!("{message:?}")),
+            )
+            .await
+            .result
+            .unwrap();
+
+        assert_eq!(answer, "done");
+        assert!(!seen.is_empty(), "the turn reported messages");
+        for message in &seen {
+            assert!(
+                !message.contains("sk-live-abcdefgh"),
+                "a tool-call argument reached the transcript: {message}"
+            );
+        }
+        assert!(
+            seen.iter().any(|message| message.contains("[redacted]")),
+            "the argument was masked, not dropped: {seen:?}"
         );
     }
 }

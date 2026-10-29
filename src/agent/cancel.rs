@@ -6,10 +6,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// How often a waiting turn re-checks the token. A poll interval keeps the
-/// token a plain `Clone` handle with no task to outlive the turn.
-const POLL: Duration = Duration::from_millis(20);
+use tokio::sync::Notify;
 
 /// How long a killed group gets between `SIGTERM` and `SIGKILL`.
 pub const TERM_GRACE: Duration = Duration::from_millis(200);
@@ -20,6 +17,9 @@ pub const REAP_WINDOW: Duration = Duration::from_secs(2);
 #[derive(Clone, Default)]
 pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
+    /// Wakes every future waiting on the token, so a cancel is seen at once
+    /// instead of on the next poll.
+    notify: Arc<Notify>,
     /// The last killed process tree, recorded by the tool that sent the signal
     /// so the turn can report what the OS said.
     killed: Arc<Mutex<Option<(u32, Cleanup)>>>,
@@ -46,16 +46,22 @@ impl CancelToken {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        // `notify_waiters` wakes the futures already parked; `notify_one` leaves
+        // a permit for one that has checked the flag but not yet polled.
+        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Resolves once the token is set, immediately if it already is.
+    /// Resolves once the token is set, immediately if it already is. The flag
+    /// is re-read after every wake, so a cancel that races the registration is
+    /// never missed.
     pub async fn cancelled(&self) {
         while !self.is_cancelled() {
-            tokio::time::sleep(POLL).await;
+            self.notify.notified().await;
         }
     }
 }

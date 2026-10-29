@@ -5,6 +5,7 @@ Source Reference: https://github.com/anthropics/skills/tree/main/skills/skill-cr
 These rules govern how skills must be authored, validated, and structured in Seavx.
 
 ## 1. Anatomy of a Skill Directory
+
 ```text
 .seavx/skills/<skill-name>/
 ├── SKILL.md          (Required)
@@ -15,6 +16,7 @@ These rules govern how skills must be authored, validated, and structured in Sea
 ```
 
 ## 2. Three-Level Progressive Disclosure
+
 1. **Metadata Tier (Always in context)**:
    - Frontmatter `name` and `description` only.
    - `description` must contain both **WHAT** it does and **EXACT TRIGGERS** for when to load it.
@@ -25,7 +27,9 @@ These rules govern how skills must be authored, validated, and structured in Sea
    - Large API references or scripts under `references/` or `scripts/`.
 
 ## 3. Frontmatter Specification
+
 Every `SKILL.md` must start with exact YAML frontmatter:
+
 ```yaml
 ---
 name: kebab-case-skill-name
@@ -35,6 +39,7 @@ confidence: 85%
 ```
 
 ## 4. Writing & Hygiene Patterns
+
 - Use imperative, concise instructions ("Run cargo test", not "You should consider running cargo test").
 - No generic AI commentary or filler ("antislop" standards).
 - State clear inputs, step-by-step commands, expected outputs, and known pitfalls/failure recovery.
