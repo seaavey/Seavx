@@ -153,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
                 .execute_task(
                     &task,
                     agent::engine::AgentMode::Build,
+                    Vec::new(),
                     &agent::permissions::DenyingConfirmer,
                     |evt| {
                         // Reasoning blocks are a TUI concern; headless runs skip them.
@@ -160,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
                             println!("{evt}");
                         }
                     },
+                    // `seavx exec` stays session-free: no row is ever written.
+                    |_| {},
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;

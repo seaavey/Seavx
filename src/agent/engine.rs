@@ -6,7 +6,9 @@ use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
 use genai::Client;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort, ToolResponse};
+use genai::chat::{
+    ChatMessage, ChatOptions, ChatRequest, ChatResponse, ReasoningEffort, ToolResponse,
+};
 use genai::resolver::{AuthData, Endpoint};
 
 use serde::{Deserialize, Serialize};
@@ -344,8 +346,37 @@ fn apply_env_overrides(
     }
 }
 
+/// One request, one response. The only place the engine talks to a provider, so
+/// a test can script turns without a network.
+#[async_trait::async_trait]
+pub trait ChatBackend: Send + Sync {
+    async fn send(
+        &self,
+        model: &str,
+        request: ChatRequest,
+        options: Option<&ChatOptions>,
+    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+struct GenaiBackend {
+    client: Client,
+}
+
+#[async_trait::async_trait]
+impl ChatBackend for GenaiBackend {
+    async fn send(
+        &self,
+        model: &str,
+        request: ChatRequest,
+        options: Option<&ChatOptions>,
+    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.client.exec_chat(model, request, options).await?)
+    }
+}
+
 pub struct AgentRuntime {
     client: Client,
+    backend: Box<dyn ChatBackend>,
     registry: ToolRegistry,
     security: WorkspaceSecurity,
     config: AgentConfig,
@@ -393,12 +424,28 @@ impl AgentRuntime {
         let client = builder
             .build()
             .unwrap_or_else(|_| Client::new().expect("Failed to initialize genai Client"));
+        let backend = Box::new(GenaiBackend {
+            client: client.clone(),
+        });
         Self {
             client,
+            backend,
             registry: ToolRegistry::with_default_tools(),
             security,
             config,
         }
+    }
+
+    /// Swap the provider seam; only tests use it, production always talks genai.
+    #[cfg(test)]
+    pub(crate) fn with_backend(
+        config: AgentConfig,
+        security: WorkspaceSecurity,
+        backend: Box<dyn ChatBackend>,
+    ) -> Self {
+        let mut runtime = Self::new(config, security);
+        runtime.backend = backend;
+        runtime
     }
 
     pub fn client(&self) -> &Client {
@@ -430,8 +477,10 @@ impl AgentRuntime {
         &self,
         task: &str,
         mode: AgentMode,
+        history: Vec<ChatMessage>,
         confirm: &dyn Confirmer,
         mut event_sink: impl FnMut(&str) + Send,
+        mut on_message: impl FnMut(&ChatMessage),
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let system_prompt = self
             .config
@@ -443,8 +492,11 @@ impl AgentRuntime {
 
         let mut chat_req = ChatRequest::default()
             .with_tools(self.registry.to_genai_tools(mode))
-            .append_message(ChatMessage::system(&system_prompt))
-            .append_message(ChatMessage::user(task));
+            .append_message(ChatMessage::system(&system_prompt));
+        for message in history {
+            chat_req = chat_req.append_message(message);
+        }
+        chat_req = chat_req.append_message(ChatMessage::user(task));
 
         tracing::info!(model = %self.config.model, "Starting Seavx agent task");
 
@@ -467,8 +519,8 @@ impl AgentRuntime {
             );
 
             let response = self
-                .client
-                .exec_chat(&self.config.model, chat_req.clone(), Some(&chat_options))
+                .backend
+                .send(&self.config.model, chat_req.clone(), Some(&chat_options))
                 .await?;
 
             // Track real usage tokens from provider response
@@ -488,6 +540,11 @@ impl AgentRuntime {
             let tool_calls = response.tool_calls();
             if tool_calls.is_empty() {
                 let final_text = response.clone().into_first_text().unwrap_or_default();
+
+                // The filler is not model output: only real text is reported.
+                if !final_text.trim().is_empty() {
+                    on_message(&ChatMessage::assistant(&final_text));
+                }
 
                 let return_text = if !final_text.trim().is_empty() {
                     final_text
@@ -512,6 +569,7 @@ impl AgentRuntime {
 
             let assistant_msg = response.clone().into_assistant_message_for_tool_use();
             if let Some(msg) = assistant_msg {
+                on_message(&msg);
                 chat_req = chat_req.append_message(msg);
             }
 
@@ -581,10 +639,10 @@ impl AgentRuntime {
 
                 event_sink(&format!("Output:\n{truncated_preview}"));
 
-                chat_req = chat_req.append_message(ChatMessage::from(ToolResponse::new(
-                    call.call_id.clone(),
-                    result_str,
-                )));
+                let tool_message =
+                    ChatMessage::from(ToolResponse::new(call.call_id.clone(), result_str));
+                on_message(&tool_message);
+                chat_req = chat_req.append_message(tool_message);
             }
         }
 
@@ -596,12 +654,13 @@ impl AgentRuntime {
             .append_message(ChatMessage::user(final_prompt));
 
         let response = self
-            .client
-            .exec_chat(&self.config.model, forced_req, Some(&chat_options))
+            .backend
+            .send(&self.config.model, forced_req, Some(&chat_options))
             .await?;
 
         let final_text = response.into_first_text().unwrap_or_default();
         if !final_text.trim().is_empty() {
+            on_message(&ChatMessage::assistant(&final_text));
             Ok(final_text)
         } else {
             Ok(

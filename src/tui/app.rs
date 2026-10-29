@@ -974,26 +974,33 @@ pub async fn run_agent_worker(
         let tx_clone = tx.clone();
         let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
         let result = runtime
-            .execute_task(&task, mode, &TuiConfirmer::new(tx.clone()), move |evt| {
-                if let Some(rest) = evt.strip_prefix("USAGE:") {
-                    let parts: Vec<&str> = rest.split(':').collect();
-                    if parts.len() == 2 {
-                        let total = parts[0].parse::<i32>().unwrap_or(0);
-                        let prompt = parts[1].parse::<i32>().unwrap_or(0);
-                        let _ = tx_clone.send(Action::AgentUsage {
-                            total_tokens: total,
-                            prompt_tokens: prompt,
-                        });
+            .execute_task(
+                &task,
+                mode,
+                Vec::new(),
+                &TuiConfirmer::new(tx.clone()),
+                move |evt| {
+                    if let Some(rest) = evt.strip_prefix("USAGE:") {
+                        let parts: Vec<&str> = rest.split(':').collect();
+                        if parts.len() == 2 {
+                            let total = parts[0].parse::<i32>().unwrap_or(0);
+                            let prompt = parts[1].parse::<i32>().unwrap_or(0);
+                            let _ = tx_clone.send(Action::AgentUsage {
+                                total_tokens: total,
+                                prompt_tokens: prompt,
+                            });
+                        }
+                    } else if evt.starts_with("Tool: ") {
+                        let tool_label = evt.strip_prefix("Tool: ").unwrap_or(evt);
+                        let _ = tx_clone.send(Action::AgentToolStart(tool_label.to_string()));
+                    } else if let Some(thoughts) = evt.strip_prefix("THINKING:") {
+                        let _ = tx_clone.send(Action::AgentThinking(thoughts.to_string()));
+                    } else if let Some(note) = evt.strip_prefix("System: ") {
+                        let _ = tx_clone.send(Action::AgentToken(format!("\n  {note}\n")));
                     }
-                } else if evt.starts_with("Tool: ") {
-                    let tool_label = evt.strip_prefix("Tool: ").unwrap_or(evt);
-                    let _ = tx_clone.send(Action::AgentToolStart(tool_label.to_string()));
-                } else if let Some(thoughts) = evt.strip_prefix("THINKING:") {
-                    let _ = tx_clone.send(Action::AgentThinking(thoughts.to_string()));
-                } else if let Some(note) = evt.strip_prefix("System: ") {
-                    let _ = tx_clone.send(Action::AgentToken(format!("\n  {note}\n")));
-                }
-            })
+                },
+                |_| {},
+            )
             .await;
 
         match result {
