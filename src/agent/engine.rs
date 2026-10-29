@@ -7,7 +7,8 @@ use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort, ToolRe
 use genai::resolver::{AuthData, Endpoint};
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Minimum evaluator confidence before an auto-distilled workflow is persisted as a skill.
 pub const SKILL_CONFIDENCE_THRESHOLD: u8 = 75;
@@ -50,6 +51,53 @@ pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx
 /// Endpoint used when the config does not set `base_url`.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
 
+/// Config keys that can appear in a config file, in display order.
+pub const CONFIG_KEYS: [&str; 6] = [
+    "model",
+    "base_url",
+    "api_key",
+    "reasoning_effort",
+    "max_turns",
+    "system_prompt",
+];
+
+/// Environment overrides that win over the file, paired with the key they set.
+const ENV_OVERRIDES: [(&str, &str); 4] = [
+    ("model", "SEAVX_MODEL"),
+    ("base_url", "SEAVX_BASE_URL"),
+    ("api_key", "SEAVX_API_KEY"),
+    ("reasoning_effort", "SEAVX_REASONING_EFFORT"),
+];
+
+/// Where an effective configuration value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOrigin {
+    Default,
+    Workspace,
+    Global,
+    Env(&'static str),
+}
+
+/// Paths and provenance for the configuration loaded alongside it.
+#[derive(Debug, Clone)]
+pub struct ConfigReport {
+    pub workspace_path: PathBuf,
+    pub global_path: Option<PathBuf>,
+    pub active_path: Option<PathBuf>,
+    pub active_origin: ConfigOrigin,
+    pub parse_error: Option<String>,
+    pub origins: BTreeMap<&'static str, ConfigOrigin>,
+}
+
+impl ConfigReport {
+    pub fn origin(&self, key: &str) -> ConfigOrigin {
+        self.origins
+            .get(key)
+            .copied()
+            .unwrap_or(ConfigOrigin::Default)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub model: String,
@@ -62,14 +110,20 @@ pub struct AgentConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        let model =
-            std::env::var("SEAVX_MODEL").unwrap_or_else(|_| "openai/gpt-4o-mini".to_string());
-        let base_url = std::env::var("SEAVX_BASE_URL").ok();
-        let api_key = std::env::var("SEAVX_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .ok();
-        let reasoning_effort = std::env::var("SEAVX_REASONING_EFFORT").ok();
+        Self::from_env(|name| std::env::var(name).ok())
+    }
+}
+
+impl AgentConfig {
+    /// Build the built-in defaults from an injected environment, so tests
+    /// never depend on the caller's real variables.
+    fn from_env(env: impl Fn(&str) -> Option<String>) -> Self {
+        let model = env("SEAVX_MODEL").unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+        let base_url = env("SEAVX_BASE_URL");
+        let api_key = env("SEAVX_API_KEY")
+            .or_else(|| env("OPENAI_API_KEY"))
+            .or_else(|| env("ANTHROPIC_API_KEY"));
+        let reasoning_effort = env("SEAVX_REASONING_EFFORT");
         Self {
             model,
             max_turns: 1000,
@@ -130,41 +184,98 @@ pub fn normalize_base_url(url: &str) -> (String, Vec<AdapterKind>) {
 
 impl AgentConfig {
     pub fn load(workspace_root: &Path) -> Self {
-        let mut config = Self::default();
+        Self::load_with_report(workspace_root).0
+    }
 
-        // 1. Check workspace .seavx/config.toml
-        let local_config = workspace_root.join(".seavx/config.toml");
-        let path = if local_config.exists() {
-            Some(local_config)
+    /// Load the effective config together with the paths and provenance that
+    /// `/config` and `seavx doctor` report.
+    pub fn load_with_report(workspace_root: &Path) -> (Self, ConfigReport) {
+        Self::load_with_report_env(workspace_root, |name| std::env::var(name).ok())
+    }
+
+    /// Testable core of [`Self::load_with_report`]. Mirrors `load` exactly:
+    /// a workspace file shadows the global file entirely, and `SEAVX_*`
+    /// overrides win over both.
+    pub(crate) fn load_with_report_env(
+        workspace_root: &Path,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> (Self, ConfigReport) {
+        Self::load_with_report_home(workspace_root, crate::home::dir().as_deref(), env)
+    }
+
+    /// Like [`Self::load_with_report_env`], but the home directory is injected
+    /// so callers such as `doctor` can keep tests away from the real home.
+    pub(crate) fn load_with_report_home(
+        workspace_root: &Path,
+        home: Option<&Path>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> (Self, ConfigReport) {
+        let workspace_path = workspace_root.join(".seavx/config.toml");
+        let global_path = home.map(|home| home.join(".seavx/config.toml"));
+
+        let workspace_exists = workspace_path.exists();
+        let global_exists = global_path.as_ref().is_some_and(|path| path.exists());
+        let active_path = if workspace_exists {
+            Some(workspace_path.clone())
+        } else if global_exists {
+            global_path.clone()
         } else {
-            crate::util::global_config_path().filter(|global| global.exists())
+            None
+        };
+        let active_origin = if workspace_exists {
+            ConfigOrigin::Workspace
+        } else if active_path.is_some() {
+            ConfigOrigin::Global
+        } else {
+            ConfigOrigin::Default
         };
 
-        if let Some(cfg_path) = path
-            && let Ok(content) = std::fs::read_to_string(cfg_path)
-            && let Ok(parsed) = toml::from_str::<AgentConfig>(&content)
-        {
-            config = parsed;
+        let mut config = Self::from_env(&env);
+        let mut origins = BTreeMap::new();
+        for (key, variable) in ENV_OVERRIDES {
+            if env(variable).is_some() {
+                origins.insert(key, ConfigOrigin::Env(variable));
+            }
         }
 
-        // Environment override takes highest precedence if provided
-        if let Ok(m) = std::env::var("SEAVX_MODEL") {
-            config.model = m;
+        let mut parse_error = None;
+
+        if let Some(path) = &active_path {
+            match std::fs::read_to_string(path) {
+                Ok(content) => match toml::from_str::<Self>(&content) {
+                    Ok(parsed) => {
+                        if let Ok(value) = content.parse::<toml::Value>()
+                            && let Some(table) = value.as_table()
+                        {
+                            for key in CONFIG_KEYS {
+                                if table.contains_key(key) {
+                                    origins.insert(key, active_origin);
+                                }
+                            }
+                        }
+                        // The file replaces the whole default config, matching
+                        // `load`: keys it omits do not inherit fallback envs.
+                        config = parsed;
+                    }
+                    Err(error) => parse_error = Some(first_line(&error.to_string())),
+                },
+                Err(error) => parse_error = Some(first_line(&error.to_string())),
+            }
         }
 
-        if let Ok(b) = std::env::var("SEAVX_BASE_URL") {
-            config.base_url = Some(b);
-        }
+        apply_env_overrides(&mut config, &mut origins, &env);
 
-        if let Ok(k) = std::env::var("SEAVX_API_KEY") {
-            config.api_key = Some(k);
-        }
-
-        if let Ok(r) = std::env::var("SEAVX_REASONING_EFFORT") {
-            config.reasoning_effort = Some(r);
-        }
-
-        config
+        (
+            config,
+            ConfigReport {
+                workspace_path,
+                global_path,
+                active_path,
+                active_origin,
+                parse_error,
+                origins,
+            },
+        )
     }
 
     /// Persist as pretty TOML under the workspace's `.seavx/config.toml`,
@@ -181,6 +292,32 @@ impl AgentConfig {
         let toml_str =
             toml::to_string_pretty(self).map_err(|e| std::io::Error::other(e.to_string()))?;
         std::fs::write(path, toml_str)
+    }
+}
+
+/// Only the first line of a parser error is safe to show: later lines echo the
+/// offending source, which may be an `api_key`.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().trim().to_string()
+}
+
+fn apply_env_overrides(
+    config: &mut AgentConfig,
+    origins: &mut BTreeMap<&'static str, ConfigOrigin>,
+    env: impl Fn(&str) -> Option<String>,
+) {
+    for (key, variable) in ENV_OVERRIDES {
+        let Some(value) = env(variable) else {
+            continue;
+        };
+        match key {
+            "model" => config.model = value,
+            "base_url" => config.base_url = Some(value),
+            "api_key" => config.api_key = Some(value),
+            "reasoning_effort" => config.reasoning_effort = Some(value),
+            _ => {}
+        }
+        origins.insert(key, ConfigOrigin::Env(variable));
     }
 }
 
