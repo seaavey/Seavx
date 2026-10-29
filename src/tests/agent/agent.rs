@@ -569,3 +569,246 @@ mod engine_seam {
         assert_eq!(messages[4].content.first_text(), Some("now"));
     }
 }
+
+#[cfg(test)]
+mod context_budget {
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
+    use crate::agent::security::WorkspaceSecurity;
+    use crate::tui::compact::Summarizer;
+    use genai::chat::{ChatMessage, ChatRequest};
+
+    /// A summary that passes the quality gate.
+    pub fn valid_summary() -> String {
+        format!(
+            "# Goals\n{}\n# Decisions\nkeep going\n# Files\nsrc/agent/engine.rs\n# Pending\nnone",
+            "continue the task without losing the plan".repeat(4)
+        )
+    }
+
+    struct ScriptedSummarizer {
+        calls: std::sync::atomic::AtomicUsize,
+        response: Result<String, String>,
+    }
+
+    impl ScriptedSummarizer {
+        fn ok(summary: String) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                response: Ok(summary),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                response: Err("provider said no".to_string()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Summarizer for ScriptedSummarizer {
+        async fn summarize(&self, _prompt: String) -> Result<String, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.response.clone()
+        }
+    }
+
+    fn runtime(workspace: &std::path::Path) -> AgentRuntime {
+        let mut config = AgentConfig::load(workspace);
+        config.model = "deepseek-chat".to_string(); // 128k window
+        config.max_turns = 4;
+        config.system_prompt = Some("system prompt".to_string());
+        AgentRuntime::new(config, WorkspaceSecurity::new(workspace))
+    }
+
+    /// Twelve turns of ~10 000 estimated tokens: 120k over a 102.4k budget.
+    fn over_budget_history() -> Vec<ChatMessage> {
+        let mut history = Vec::new();
+        for index in 0..12 {
+            history.push(ChatMessage::user(format!("question {index}")));
+            history.push(ChatMessage::assistant("x".repeat(40_000)));
+        }
+        history
+    }
+
+    fn notices() -> Vec<String> {
+        Vec::new()
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_history_compacts_once_and_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        let summarizer = ScriptedSummarizer::ok(valid_summary());
+        let mut notices = notices();
+        let mut sink = |notice: &str| notices.push(notice.to_string());
+
+        let request = runtime
+            .prepare_request(
+                over_budget_history(),
+                "current task",
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+
+        assert!(summarizer.calls() >= 2, "chunk calls plus a merge");
+        let summary_message = request
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .content
+                    .first_text()
+                    .is_some_and(|text| text.contains("# SESSION CONTEXT (compacted)"))
+            })
+            .expect("a summary message enters the request");
+        assert_eq!(
+            summary_message.role,
+            genai::chat::ChatRole::User,
+            "the summary is a user message, never a mid-conversation system one"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("context compacted")),
+            "{notices:?}"
+        );
+        assert!(
+            request
+                .messages
+                .last()
+                .and_then(|message| message.content.first_text())
+                == Some("current task"),
+            "the newest instruction is never lost"
+        );
+        assert!(
+            crate::agent::budget::estimate_tokens(&request) <= 102_400,
+            "the compacted request fits the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_summarizer_drops_older_turns_and_says_why() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        let summarizer = ScriptedSummarizer::failing();
+        let mut notices = notices();
+        let mut sink = |notice: &str| notices.push(notice.to_string());
+
+        let request = runtime
+            .prepare_request(
+                over_budget_history(),
+                "current task",
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+
+        let failing = notices
+            .iter()
+            .find(|notice| notice.contains("compaction failed"))
+            .unwrap_or_else(|| panic!("{notices:?}"));
+        assert!(failing.contains("provider said no"), "{failing}");
+        assert!(failing.contains("older turns dropped"), "{failing}");
+        assert!(
+            !request.messages.iter().any(|message| message
+                .content
+                .first_text()
+                .is_some_and(|text| text.contains("# SESSION CONTEXT"))),
+            "no summary enters a request that failed to summarize"
+        );
+        assert_eq!(
+            request.messages.last().unwrap().content.first_text(),
+            Some("current task")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_summary_that_still_does_not_fit_shrinks_then_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        // Well-formed but far too large: ~100 000 estimated tokens.
+        let huge = format!(
+            "# Goals\n{}\n# Decisions\nx\n# Files\nx\n# Pending\nx",
+            "y".repeat(400_000)
+        );
+        let summarizer = ScriptedSummarizer::ok(huge);
+        let mut notices = notices();
+        let mut sink = |notice: &str| notices.push(notice.to_string());
+
+        let request = runtime
+            .prepare_request(
+                over_budget_history(),
+                "current task",
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+
+        assert!(
+            summarizer.calls() >= 4,
+            "one attempt plus three 10 % shrinks: {}",
+            summarizer.calls()
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("older turns dropped")
+                    || notice.contains("sending the newest turn anyway")),
+            "the drop is never silent: {notices:?}"
+        );
+        assert_eq!(
+            request.messages.len(),
+            4,
+            "system, the newest turn, the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_newest_turn_is_sent_with_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        let summarizer = ScriptedSummarizer::ok(valid_summary());
+        let mut notices = notices();
+        let mut sink = |notice: &str| notices.push(notice.to_string());
+
+        let history = vec![
+            ChatMessage::user("huge question"),
+            ChatMessage::assistant("z".repeat(480_000)),
+        ];
+        let request: ChatRequest = runtime
+            .prepare_request(
+                history,
+                "current task",
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+
+        assert_eq!(summarizer.calls(), 0, "nothing older exists to summarize");
+        let warning = notices
+            .iter()
+            .find(|notice| notice.contains("sending the newest turn anyway"))
+            .unwrap_or_else(|| panic!("{notices:?}"));
+        assert!(warning.contains("deepseek-chat"), "{warning}");
+        assert!(
+            warning.contains("102400"),
+            "names the estimate budget: {warning}"
+        );
+        assert_eq!(
+            request.messages[2].content.first_text(),
+            Some("z".repeat(480_000).as_str()),
+            "the oversized message is never truncated"
+        );
+    }
+}

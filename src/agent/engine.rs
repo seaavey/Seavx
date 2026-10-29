@@ -527,21 +527,10 @@ impl AgentRuntime {
         mut event_sink: impl FnMut(&str) + Send,
         mut on_message: impl FnMut(&ChatMessage),
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let system_prompt = self
-            .config
-            .system_prompt
-            .clone()
-            .unwrap_or_else(|| load_system_prompt(self.security.root()));
-
-        let system_prompt = with_mode_policy(system_prompt, mode);
-
-        let mut chat_req = ChatRequest::default()
-            .with_tools(self.registry.to_genai_tools(mode))
-            .append_message(ChatMessage::system(&system_prompt));
-        for message in history {
-            chat_req = chat_req.append_message(message);
-        }
-        chat_req = chat_req.append_message(ChatMessage::user(task));
+        let summarizer = crate::tui::compact::ModelSummarizer::from_config(&self.config);
+        let mut chat_req = self
+            .prepare_request(history, task, mode, &summarizer, &mut event_sink)
+            .await;
 
         tracing::info!(model = %self.config.model, "Starting Seavx agent task");
 
@@ -713,6 +702,108 @@ impl AgentRuntime {
                     .to_string(),
             )
         }
+    }
+
+    /// Assemble the request for one turn and compact it before it is sent.
+    /// `mode` belongs here because the estimate must cover the exported tool
+    /// schemas: the budget is spent on the request that actually goes out.
+    pub(crate) async fn prepare_request(
+        &self,
+        history: Vec<ChatMessage>,
+        task: &str,
+        mode: AgentMode,
+        summarizer: &dyn crate::tui::compact::Summarizer,
+        event_sink: &mut impl FnMut(&str),
+    ) -> ChatRequest {
+        use crate::agent::budget::{
+            compact, estimate_tokens, keep_recent_budget, request_budget, window_start,
+        };
+
+        let limit = model_context_limit(&self.config.model);
+        let budget = request_budget(limit.tokens);
+        let request = self.chat_request(None, &history, task, mode);
+        if estimate_tokens(&request) <= budget {
+            return request;
+        }
+
+        // One compaction, then at most three 10 % shrinks while the summary
+        // itself keeps the request over the budget.
+        let mut keep = keep_recent_budget(limit.tokens);
+        for _ in 0..=3 {
+            match compact(&history, keep, summarizer).await {
+                Ok(compaction) => {
+                    let candidate = self.chat_request(
+                        Some(&compaction.summary),
+                        &compaction.history,
+                        task,
+                        mode,
+                    );
+                    let after = estimate_tokens(&candidate);
+                    if after <= budget {
+                        event_sink(&format!(
+                            "System: context compacted ({} → {after} tokens est.)",
+                            compaction.before
+                        ));
+                        return candidate;
+                    }
+                }
+                Err(error) => {
+                    // A bad summary is worse than none: drop the older turns.
+                    let split = window_start(&history, keep);
+                    if split > 0 {
+                        event_sink(&format!(
+                            "System: compaction failed ({error}); older turns dropped"
+                        ));
+                        return self.chat_request(None, &history[split..], task, mode);
+                    }
+                    break;
+                }
+            }
+            keep = keep.saturating_sub(keep / 10);
+        }
+
+        // Last resort: the newest turn alone, never truncated.
+        let split = window_start(&history, 0);
+        let request = self.chat_request(None, &history[split..], task, mode);
+        let estimate = estimate_tokens(&request);
+        if estimate > budget {
+            event_sink(&format!(
+                "System: {estimate} tokens exceeds the {budget} budget for {}; sending the newest turn anyway",
+                self.config.model
+            ));
+        } else {
+            event_sink("System: compaction did not fit the budget; older turns dropped");
+        }
+        request
+    }
+
+    fn chat_request(
+        &self,
+        summary: Option<&str>,
+        history: &[ChatMessage],
+        task: &str,
+        mode: AgentMode,
+    ) -> ChatRequest {
+        let system_prompt = self
+            .config
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| load_system_prompt(self.security.root()));
+        let system_prompt = with_mode_policy(system_prompt, mode);
+
+        let mut request = ChatRequest::default()
+            .with_tools(self.registry.to_genai_tools(mode))
+            .append_message(ChatMessage::system(&system_prompt));
+        if let Some(summary) = summary {
+            request = request.append_message(ChatMessage::user(format!(
+                "{}\n{summary}",
+                crate::tui::compact::SESSION_CONTEXT_BANNER
+            )));
+        }
+        for message in history {
+            request = request.append_message(message.clone());
+        }
+        request.append_message(ChatMessage::user(task))
     }
 
     /// One place decides a tool call: the matrix, then the human, then the
