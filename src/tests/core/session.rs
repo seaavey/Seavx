@@ -1,6 +1,7 @@
 use crate::session::{
-    LoadedSession, MessageStatus, PAYLOAD_FORMAT, RESUME_BUDGET_BYTES, SCHEMA_VERSION,
-    SessionError, SessionStore, StoredMessage, TurnState, WRITE_BUDGET, replay,
+    INTERRUPTED_RESULT, LoadedSession, MessageStatus, PAYLOAD_FORMAT, RESUME_BUDGET_BYTES,
+    SCHEMA_VERSION, SessionError, SessionStore, StoredMessage, TurnState, WRITE_BUDGET,
+    export_json, render_text, replay,
 };
 use genai::chat::{ChatMessage, MessageContent, ToolCall, ToolResponse};
 
@@ -602,4 +603,140 @@ fn a_pending_row_is_never_rewritten_by_replay() {
         .query_row("SELECT status FROM messages", [], |row| row.get(0))
         .unwrap();
     assert_eq!(status, "complete", "replay never rewrites the stored row");
+}
+
+#[test]
+fn a_payload_format_mismatch_opens_read_only() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    store.record_user(id, "old prompt").unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE sessions SET payload_format = 'genai-0.6' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+
+    let loaded = store.load(id).unwrap();
+    let reason = loaded.read_only.clone().expect("read-only with a reason");
+    assert!(reason.contains("genai-0.6"), "{reason}");
+    assert!(
+        !render_text(&loaded).is_empty(),
+        "the transcript still renders"
+    );
+
+    let before = row_count(&store);
+    let error = store
+        .record_message(id, &ChatMessage::assistant("new"), MessageStatus::Complete)
+        .unwrap_err();
+    assert!(matches!(error, SessionError::ReadOnly(_)), "{error}");
+    assert_eq!(row_count(&store), before, "no row is written read-only");
+}
+
+#[test]
+fn recovery_writes_exactly_one_interrupted_row_per_missing_call() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    store.record_user(id, "go").unwrap();
+    store
+        .record_message(
+            id,
+            &call_message(vec![
+                tool_call("call_a", "read_file"),
+                tool_call("call_b", "read_file"),
+            ]),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+    store
+        .record_message(id, &result_message("call_a", "ok"), MessageStatus::Complete)
+        .unwrap();
+
+    assert_eq!(store.record_recovery(id).unwrap(), 1);
+    assert_eq!(
+        store.record_recovery(id).unwrap(),
+        0,
+        "a second recovery adds nothing"
+    );
+
+    let loaded = store.load(id).unwrap();
+    let recovered: Vec<&StoredMessage> = loaded
+        .messages
+        .iter()
+        .filter(|row| row.status == MessageStatus::Interrupted)
+        .collect();
+    assert_eq!(recovered.len(), 1);
+    assert!(recovered[0].payload.contains(INTERRUPTED_RESULT));
+
+    let outcome = replay(&loaded);
+    assert!(outcome.synthetic.is_empty(), "the synthetic row is stored");
+    let last = outcome.history.last().unwrap();
+    assert_eq!(last.content.tool_responses()[0].call_id, "call_b");
+    assert!(
+        export_json(&loaded).contains(INTERRUPTED_RESULT),
+        "the model's view and the export agree"
+    );
+}
+
+#[test]
+fn export_stays_valid_json_with_an_unparseable_payload() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    store.record_user(id, "kept").unwrap();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+             VALUES (?1, 99, 'assistant', 'complete', 'not json', 0)",
+            [id],
+        )
+        .unwrap();
+
+    let loaded = store.load(id).unwrap();
+    assert!(loaded.read_only.is_some());
+    let value: serde_json::Value = serde_json::from_str(&export_json(&loaded)).unwrap();
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["session"]["id"], id);
+    let rows = value["messages"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row["error"] == "unparseable message" && row["seq"] == 99),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|row| row["seq"] == 1), "readable rows stay");
+}
+
+#[test]
+fn a_full_transcript_renders_even_when_a_row_is_unreadable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    store.record_user(id, "keep me").unwrap();
+    store
+        .record_message(id, &assistant_text("answer"), MessageStatus::Complete)
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+             VALUES (?1, 99, 'assistant', 'complete', 'not json', 0)",
+            [id],
+        )
+        .unwrap();
+
+    let rendered = render_text(&store.load(id).unwrap());
+    assert!(rendered.contains("User: keep me"), "{rendered}");
+    assert!(rendered.contains("answer"), "{rendered}");
+    assert!(
+        rendered.contains("[unreadable message #99 (format mismatch)]"),
+        "{rendered}"
+    );
 }

@@ -273,6 +273,88 @@ fn text_of(payload: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// The TUI's transcript shape, one stored row at a time. A row that does not
+/// parse still renders, from its stored seq, so a read-only session stays
+/// readable.
+pub fn render_text(session: &LoadedSession) -> String {
+    let mut out = String::new();
+    for row in &session.messages {
+        match serde_json::from_str::<ChatMessage>(&row.payload) {
+            Ok(message) => out.push_str(&render_message(&message)),
+            Err(_) => out.push_str(&format!(
+                "[unreadable message #{} (format mismatch)]\n\n",
+                row.seq
+            )),
+        }
+    }
+    out
+}
+
+/// The same shape for a list of messages already parsed (a replayed history).
+pub fn render_messages(messages: &[ChatMessage]) -> String {
+    messages.iter().map(render_message).collect()
+}
+
+fn render_message(message: &ChatMessage) -> String {
+    let mut out = String::new();
+    if let Some(text) = message
+        .content
+        .first_text()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        if message.role == ChatRole::User {
+            out.push_str(&format!("User: {text}\n\n"));
+        } else {
+            out.push_str(&format!("{text}\n\n"));
+        }
+    }
+    for call in message.content.tool_calls() {
+        out.push_str(&format!("⚡ {}({})\n\n", call.fn_name, call.fn_arguments));
+    }
+    for response in message.content.tool_responses() {
+        out.push_str(&format!("{}\n\n", response.content.trim()));
+    }
+    out
+}
+
+/// `{"version":1,"session":{…},"messages":[…]}`; an unreadable payload becomes
+/// an error object instead of failing the whole export.
+pub fn export_json(session: &LoadedSession) -> String {
+    let messages: Vec<serde_json::Value> = session
+        .messages
+        .iter()
+        .map(
+            |row| match serde_json::from_str::<serde_json::Value>(&row.payload) {
+                Ok(payload) => serde_json::json!({
+                    "seq": row.seq,
+                    "role": row.role,
+                    "status": row.status.as_str(),
+                    "created_at": row.created_at,
+                    "payload": payload,
+                }),
+                Err(_) => serde_json::json!({ "error": "unparseable message", "seq": row.seq }),
+            },
+        )
+        .collect();
+
+    serde_json::json!({
+        "version": 1,
+        "session": {
+            "id": session.id,
+            "workspace": session.workspace,
+            "title": session.title,
+            "model": session.model,
+            "payload_format": session.payload_format,
+            "total_tokens": session.total_tokens,
+            "prompt_tokens": session.prompt_tokens,
+            "read_only": session.read_only,
+        },
+        "messages": messages,
+    })
+    .to_string()
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -560,6 +642,41 @@ impl SessionStore {
             total_tokens: header.4,
             prompt_tokens: header.5,
         })
+    }
+
+    /// Write the synthetic interrupted result for every tool call of the last
+    /// assistant row that never got a result. Idempotent, never rewrites a row.
+    pub fn record_recovery(&self, session: i64) -> Result<usize, SessionError> {
+        let loaded = self.load(session)?;
+        if let Some(reason) = loaded.read_only {
+            return Err(SessionError::ReadOnly(reason));
+        }
+        let Some(last) = loaded
+            .messages
+            .iter()
+            .rposition(|row| row.role == "assistant")
+        else {
+            return Ok(0);
+        };
+        let answered: Vec<String> = loaded.messages[last + 1..]
+            .iter()
+            .filter(|row| row.role == "tool")
+            .filter_map(|row| response_call_id(&row.payload))
+            .collect();
+
+        let mut written = 0;
+        for call_id in call_ids(&loaded.messages[last].payload) {
+            if answered.contains(&call_id) {
+                continue;
+            }
+            self.record_message(
+                session,
+                &ChatMessage::from(ToolResponse::new(call_id, INTERRUPTED_RESULT)),
+                MessageStatus::Interrupted,
+            )?;
+            written += 1;
+        }
+        Ok(written)
     }
 
     fn rows(&self, session: i64) -> Result<Vec<StoredMessage>, SessionError> {
