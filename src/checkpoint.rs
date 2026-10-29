@@ -66,6 +66,8 @@ pub(crate) struct RestoreEntry {
 pub(crate) struct CheckpointError {
     prefix: &'static str,
     detail: String,
+    /// Targets already written back when a restore failed halfway.
+    restored: Vec<PathBuf>,
 }
 
 impl CheckpointError {
@@ -73,7 +75,18 @@ impl CheckpointError {
         Self {
             prefix: "checkpoint incomplete",
             detail: error.detail.clone(),
+            restored: error.restored.clone(),
         }
+    }
+
+    fn with_restored(mut self, restored: &[PathBuf]) -> Self {
+        self.restored = restored.to_vec();
+        self
+    }
+
+    /// The paths this failed restore already changed, so the user is told what moved.
+    pub(crate) fn restored(&self) -> &[PathBuf] {
+        &self.restored
     }
 }
 
@@ -89,6 +102,7 @@ fn reject(message: impl std::fmt::Display) -> CheckpointError {
     CheckpointError {
         prefix: "checkpoint rejected",
         detail: message.to_string(),
+        restored: Vec::new(),
     }
 }
 
@@ -178,34 +192,46 @@ impl CheckpointStore {
 fn restore(checkpoint: &Path, entries: Vec<RestoreEntry>) -> Result<Vec<PathBuf>, CheckpointError> {
     let mut restored = Vec::new();
     for entry in entries {
-        match entry.state {
-            EntryState::Created => {
-                if entry.target.exists() {
-                    std::fs::remove_file(&entry.target)
-                        .map_err(|error| reject(format!("{}: {error}", entry.target.display())))?;
-                }
-            }
-            EntryState::Modified => {
-                let backup = entry.backup.as_ref().ok_or_else(|| {
-                    reject(format!(
-                        "{}: modified entry without a backup",
-                        entry.target.display()
-                    ))
-                })?;
-                let bytes = std::fs::read(backup)
-                    .map_err(|error| reject(format!("{}: {error}", backup.display())))?;
-                write_atomic(&entry.target, &bytes, ModePolicy::Preserve)
-                    .map_err(|error| reject(format!("{}: {error}", entry.target.display())))?;
-            }
-            EntryState::Skipped => continue,
+        if entry.state == EntryState::Skipped {
+            continue;
+        }
+        if let Err(error) = restore_entry(&entry) {
+            // The caller has to see which targets already moved; the checkpoint
+            // stays on disk so the command can be retried.
+            return Err(error.with_restored(&restored));
         }
         restored.push(entry.target);
     }
 
-    // Only a complete restore removes the checkpoint, so a failure stays retryable.
+    // Only a complete restore removes the checkpoint.
     std::fs::remove_dir_all(checkpoint)
         .map_err(|error| reject(format!("{}: {error}", checkpoint.display())))?;
     Ok(restored)
+}
+
+fn restore_entry(entry: &RestoreEntry) -> Result<(), CheckpointError> {
+    match entry.state {
+        EntryState::Created => {
+            if entry.target.exists() {
+                std::fs::remove_file(&entry.target)
+                    .map_err(|error| reject(format!("{}: {error}", entry.target.display())))?;
+            }
+        }
+        EntryState::Modified => {
+            let backup = entry.backup.as_ref().ok_or_else(|| {
+                reject(format!(
+                    "{}: modified entry without a backup",
+                    entry.target.display()
+                ))
+            })?;
+            let bytes = std::fs::read(backup)
+                .map_err(|error| reject(format!("{}: {error}", backup.display())))?;
+            write_atomic(&entry.target, &bytes, ModePolicy::Preserve)
+                .map_err(|error| reject(format!("{}: {error}", entry.target.display())))?;
+        }
+        EntryState::Skipped => {}
+    }
+    Ok(())
 }
 
 fn latest_checkpoint(workspace: &Path) -> Option<PathBuf> {
@@ -363,7 +389,9 @@ fn resolve_target(
         if target.is_absolute() || !plain {
             return Err(reject(format!("unsafe workspace path: {path}")));
         }
-        return Ok(workspace.join(target));
+        let target = workspace.join(target);
+        ensure_real_ancestors(workspace, &target)?;
+        return Ok(target);
     }
 
     let root = Path::new(scope);
@@ -382,7 +410,41 @@ fn resolve_target(
         )));
     }
 
-    Ok(target.to_path_buf())
+    let target = target.to_path_buf();
+    ensure_real_ancestors(root, &target)?;
+    Ok(target)
+}
+
+/// A clean relative path is not enough: a rename through a symlinked directory
+/// lands outside the workspace or the allowed global root. Every existing
+/// ancestor below the root must be a real directory; a missing one is fine,
+/// because the writer creates it.
+fn ensure_real_ancestors(root: &Path, target: &Path) -> Result<(), CheckpointError> {
+    let mut current = target.parent();
+    while let Some(ancestor) = current {
+        if ancestor == root || !ancestor.starts_with(root) || ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(reject(format!(
+                    "{} has a symlinked ancestor {}",
+                    target.display(),
+                    ancestor.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(reject(format!(
+                    "{} has a non-directory ancestor {}",
+                    target.display(),
+                    ancestor.display()
+                )));
+            }
+            _ => {}
+        }
+        current = ancestor.parent();
+    }
+    Ok(())
 }
 
 fn validate_backup(

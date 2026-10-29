@@ -363,3 +363,109 @@ fn undo_restores_allowed_global_target_under_temp_home() {
     assert_eq!(restored, vec![user_memory.clone()]);
     assert_eq!(fs::read_to_string(&user_memory).unwrap(), "old preference");
 }
+
+#[cfg(unix)]
+#[test]
+fn restore_rejects_a_symlinked_parent_inside_the_workspace() {
+    let ws = workspace_with(&[]);
+    let outside = tempdir().unwrap();
+    fs::write(outside.path().join("victim.txt"), "outside\n").unwrap();
+    fs::create_dir_all(ws.path().join("link")).unwrap();
+    fs::write(ws.path().join("link/victim.txt"), "inside\n").unwrap();
+    let input = CheckpointInput {
+        target: CheckpointTarget::Workspace(ws.path().join("link/victim.txt")),
+        state: EntryState::Modified,
+        original: Some(b"inside\n".to_vec()),
+    };
+    CheckpointStore::create(ws.path(), &[input]).unwrap();
+    // The directory is swapped for a symlink after the capture, before the undo.
+    std::fs::remove_dir_all(ws.path().join("link")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+    let error = CheckpointStore::undo_latest(ws.path()).unwrap_err();
+
+    assert!(error.to_string().contains("symlinked ancestor"), "{error}");
+    assert_eq!(
+        fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+        "outside\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_rejects_a_symlinked_parent_in_a_global_root() {
+    let ws = workspace_with(&[]);
+    let home = tempdir().unwrap();
+    let skills = home.path().join(".agents/skills");
+    let skill = skills.join("link/SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(&skill, "old skill").unwrap();
+    let input = CheckpointInput {
+        target: CheckpointTarget::Global {
+            path: skill.clone(),
+            allowed_root: skills.clone(),
+        },
+        state: EntryState::Modified,
+        original: Some(b"old skill".to_vec()),
+    };
+    let checkpoint = CheckpointStore::create(ws.path(), &[input]).unwrap();
+    // The entry's parent becomes a symlink to a directory outside the root.
+    let elsewhere = tempdir().unwrap();
+    fs::create_dir_all(elsewhere.path().join("link")).unwrap();
+    fs::write(elsewhere.path().join("link/SKILL.md"), "elsewhere").unwrap();
+    fs::remove_dir_all(skills.join("link")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path().join("link"), skills.join("link")).unwrap();
+
+    let error = CheckpointStore::undo_latest_with_home(ws.path(), Some(home.path())).unwrap_err();
+
+    assert!(error.to_string().contains("symlinked ancestor"), "{error}");
+    assert_eq!(
+        fs::read_to_string(elsewhere.path().join("link/SKILL.md")).unwrap(),
+        "elsewhere"
+    );
+    assert!(checkpoint.exists(), "a rejected checkpoint is kept");
+}
+
+#[test]
+fn restore_accepts_a_regular_nested_directory() {
+    let ws = workspace_with(&[("sub/dir/file.txt", "before")]);
+    CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "sub/dir/file.txt")]).unwrap();
+    fs::write(ws.path().join("sub/dir/file.txt"), "after").unwrap();
+
+    let restored = CheckpointStore::undo_latest(ws.path()).unwrap();
+
+    assert_eq!(restored, vec![ws.path().join("sub/dir/file.txt")]);
+    assert_eq!(
+        fs::read_to_string(ws.path().join("sub/dir/file.txt")).unwrap(),
+        "before"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn undo_reports_the_path_that_failed_and_keeps_the_checkpoint() {
+    use std::os::unix::fs::PermissionsExt;
+    let ws = workspace_with(&[("ok.txt", "old ok"), ("blocked/file.txt", "old blocked")]);
+    let inputs = [
+        modified_input(ws.path(), "ok.txt"),
+        modified_input(ws.path(), "blocked/file.txt"),
+    ];
+    let checkpoint = CheckpointStore::create(ws.path(), &inputs).unwrap();
+    fs::write(ws.path().join("ok.txt"), "new ok").unwrap();
+    fs::write(ws.path().join("blocked/file.txt"), "new blocked").unwrap();
+    let blocked_dir = ws.path().join("blocked");
+    fs::set_permissions(&blocked_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let error = CheckpointStore::undo_latest(ws.path()).unwrap_err();
+
+    let message = error.to_string();
+    assert!(message.contains("blocked/file.txt"), "{message}");
+    assert_eq!(error.restored(), [ws.path().join("ok.txt")]);
+    assert_eq!(
+        fs::read_to_string(ws.path().join("ok.txt")).unwrap(),
+        "old ok"
+    );
+    assert!(checkpoint.exists(), "the checkpoint stays retryable");
+
+    fs::set_permissions(&blocked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+}

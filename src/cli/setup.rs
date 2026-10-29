@@ -23,6 +23,21 @@ fn screen(config_path: &std::path::Path, rows: &[(&str, String)]) {
     let _ = io::stdout().flush();
 }
 
+/// Persist the wizard's answers: the whole config, plus the key only when the
+/// user typed one. `seavx setup` is one of the two surfaces allowed to repair an
+/// unparsable file; the malformed bytes are kept beside it.
+pub fn persist(
+    path: &std::path::Path,
+    config: &crate::agent::engine::AgentConfig,
+    typed_key: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let preserved = crate::cli::config::write_agent_config_repairing(path, config)?;
+    if let Some(key) = typed_key.filter(|key| !key.is_empty()) {
+        crate::cli::config::set_api_key(path, key)?;
+    }
+    Ok(preserved)
+}
+
 pub async fn providers() -> anyhow::Result<()> {
     use std::io::{self, Write};
 
@@ -131,9 +146,14 @@ pub async fn providers() -> anyhow::Result<()> {
         config.reasoning_effort = Some(effort.to_lowercase());
     }
 
-    // One writer: it validates, preserves unknown keys and forces mode `0600`,
-    // which a file holding an API key needs.
-    crate::cli::config::write_agent_config(&config_path, &config).map_err(anyhow::Error::msg)?;
+    let preserved =
+        persist(&config_path, &config, config.api_key.as_deref()).map_err(anyhow::Error::msg)?;
+    if let Some(preserved) = preserved {
+        println!(
+            "note: the previous config could not be parsed and was kept at {}",
+            preserved.display()
+        );
+    }
 
     screen(
         &config_path,

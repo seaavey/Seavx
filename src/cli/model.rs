@@ -4,6 +4,23 @@ use super::prompt;
 use crate::agent::engine::{AgentConfig, EFFORT_LEVELS};
 use std::path::{Path, PathBuf};
 
+/// Write the flags as one targeted update: model and effort change together or
+/// not at all, unknown keys survive, and an unparsable file is repaired while its
+/// bytes are kept. Production and the tests both go through here.
+pub fn apply_flags(
+    path: &std::path::Path,
+    model: String,
+    effort: Option<String>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if let Some(effort) = effort.as_deref()
+        && crate::agent::engine::parse_reasoning_effort(effort).is_none()
+    {
+        anyhow::bail!("unknown reasoning effort '{effort}'");
+    }
+    crate::cli::config::set_model_and_effort_repairing(path, &model, effort.as_deref())
+        .map_err(anyhow::Error::msg)
+}
+
 pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Result<()> {
     let config_path = PathBuf::from(".seavx/config.toml");
     let mut config = AgentConfig::load(Path::new("."));
@@ -15,21 +32,14 @@ pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Resul
 
     // 1. If explicit model name given
     if let Some(chosen_model) = model {
-        config.model = chosen_model;
-        if let Some(eff) = effort {
-            // Both fields are validated before the one write, so a bad effort
-            // cannot leave the model changed.
-            if crate::agent::engine::parse_reasoning_effort(&eff).is_none() {
-                anyhow::bail!("unknown reasoning effort '{eff}'");
-            }
-            config.reasoning_effort = Some(eff);
+        let preserved = apply_flags(&config_path, chosen_model.clone(), effort)?;
+        if let Some(preserved) = preserved {
+            println!(
+                "note: the previous config could not be parsed and was kept at {}",
+                preserved.display()
+            );
         }
-        crate::cli::config::write_agent_config(&config_path, &config)
-            .map_err(anyhow::Error::msg)?;
-        println!(
-            "Updated .seavx/config.toml: model = {}, effort = {:?}",
-            config.model, config.reasoning_effort
-        );
+        println!("Updated .seavx/config.toml: model = {chosen_model}");
         return Ok(());
     }
 

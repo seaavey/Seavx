@@ -45,8 +45,20 @@ fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), Str
 /// Capture the pre-write bytes of `path` so `/undo` can restore them. A target
 /// outside the workspace is accepted only inside an allowed global root.
 fn capture_checkpoint(security: &WorkspaceSecurity, path: &Path) -> Result<(), String> {
-    let original = std::fs::read(path).ok();
-    let state = if original.is_some() {
+    // Existence decides the class, never a successful read: recording an
+    // existing file as `created` would make `/undo` delete it.
+    let exists = std::fs::symlink_metadata(path).is_ok();
+    let original = if exists {
+        Some(std::fs::read(path).map_err(|error| {
+            format!(
+                "refusing to write {}: it exists but cannot be read, so it cannot be checkpointed ({error})",
+                path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let state = if exists {
         EntryState::Modified
     } else {
         EntryState::Created

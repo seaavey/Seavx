@@ -796,7 +796,22 @@ fn apply_command_effect(
             tokio::task::spawn_blocking(move || {
                 let result =
                     crate::checkpoint::CheckpointStore::undo_latest(std::path::Path::new("."))
-                        .map_err(|error| error.to_string());
+                        .map_err(|error| {
+                            // A half-done undo must say what it already changed.
+                            let restored = error.restored();
+                            if restored.is_empty() {
+                                return error.to_string();
+                            }
+                            let paths: Vec<String> = restored
+                                .iter()
+                                .map(|path| path.display().to_string())
+                                .collect();
+                            format!(
+                                "{error}\nRestored {} file(s) before the failure:\n{}",
+                                paths.len(),
+                                paths.join("\n")
+                            )
+                        });
                 let _ = tx.send(Action::UndoDone(result));
             });
         }

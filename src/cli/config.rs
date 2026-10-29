@@ -333,6 +333,17 @@ fn canonical_effort(effort: genai::chat::ReasoningEffort) -> Option<&'static str
     }
 }
 
+/// How an existing file is treated when it does not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLoad {
+    /// Every targeted mutation: an unparsable file is an error.
+    Strict,
+    /// Only the two surfaces that legitimately rewrite a whole file
+    /// (`seavx setup providers`, `seavx model <name>`): the malformed bytes are
+    /// preserved next to the config and the document starts from the seed.
+    RepairUnparsable,
+}
+
 /// Write one key, preserving comments, ordering and unknown keys.
 pub fn set_value(path: &Path, key: ConfigKey, raw: &str) -> Result<String, String> {
     let value = canonical_value(key, raw)?;
@@ -364,32 +375,78 @@ pub fn unset_value(path: &Path, key: ConfigKey) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let mut removed = false;
+    // An absent key is not a write: peeking avoids rewriting bytes, mode or a backup.
+    if load_document(path)?.get(key.name()).is_none() {
+        return Ok(false);
+    }
     update_config(path, |document| {
-        removed = document.remove(key.name()).is_some();
+        document.remove(key.name());
         Ok(())
     })?;
-    Ok(removed)
+    Ok(true)
 }
 
-/// Persist the whole [`AgentConfig`]. Config surfaces whose edit is not one key
-/// (`seavx model`, `seavx setup`, the model picker) go through here.
+/// Persist the whole [`AgentConfig`], never `api_key`: `AgentConfig::load` may
+/// carry a value from the environment, and a model change must not move a secret
+/// onto disk. Only [`set_api_key`] writes that field, for a key the user typed.
 pub fn write_agent_config(path: &Path, config: &AgentConfig) -> Result<(), String> {
     update_config(path, |document| {
-        document["model"] = toml_edit::value(config.model.clone());
-        document["max_turns"] = toml_edit::value(config.max_turns as i64);
-        set_or_remove(document, "base_url", config.base_url.as_deref());
-        set_or_remove(
-            document,
-            "reasoning_effort",
-            config.reasoning_effort.as_deref(),
-        );
-        set_or_remove(document, "system_prompt", config.system_prompt.as_deref());
-        // An absent key in memory never erases the key on disk: `AgentConfig::load`
-        // falls back to the environment, so removing it here would delete a value
-        // the user never changed.
-        if let Some(api_key) = config.api_key.as_deref() {
-            document["api_key"] = toml_edit::value(api_key);
+        write_fields(document, config);
+        Ok(())
+    })
+}
+
+/// [`write_agent_config`] with the repair mode `seavx setup`/`seavx model` need.
+pub fn write_agent_config_repairing(
+    path: &Path,
+    config: &AgentConfig,
+) -> Result<Option<PathBuf>, String> {
+    update_config_with(path, ConfigLoad::RepairUnparsable, |document| {
+        write_fields(document, config);
+        Ok(())
+    })
+}
+
+fn write_fields(document: &mut toml_edit::DocumentMut, config: &AgentConfig) {
+    document["model"] = toml_edit::value(config.model.clone());
+    document["max_turns"] = toml_edit::value(config.max_turns as i64);
+    set_or_remove(document, "base_url", config.base_url.as_deref());
+    set_or_remove(
+        document,
+        "reasoning_effort",
+        config.reasoning_effort.as_deref(),
+    );
+    set_or_remove(document, "system_prompt", config.system_prompt.as_deref());
+}
+
+/// The only writer of `api_key`: a value the user entered in `seavx setup`.
+pub fn set_api_key(path: &Path, key: &str) -> Result<(), String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("api_key must not be empty".to_string());
+    }
+    let key = key.to_string();
+    update_config(path, |document| {
+        document["api_key"] = toml_edit::value(key.clone());
+        Ok(())
+    })
+}
+
+/// [`set_model_and_effort`] with the repair mode `seavx model` needs.
+pub fn set_model_and_effort_repairing(
+    path: &Path,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let model = canonical_value(ConfigKey::Model, model)?;
+    let effort = match effort {
+        Some(raw) => Some(canonical_value(ConfigKey::ReasoningEffort, raw)?),
+        None => None,
+    };
+    update_config_with(path, ConfigLoad::RepairUnparsable, |document| {
+        document["model"] = toml_edit::value(model.clone());
+        if let Some(effort) = &effort {
+            document["reasoning_effort"] = toml_edit::value(effort.clone());
         }
         Ok(())
     })
@@ -422,27 +479,66 @@ fn set_or_remove(document: &mut toml_edit::DocumentMut, key: &str, value: Option
 }
 
 fn load_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
+    load_document_with(path, ConfigLoad::Strict).map(|(document, _)| document)
+}
+
+fn load_document_with(
+    path: &Path,
+    load: ConfigLoad,
+) -> Result<(toml_edit::DocumentMut, Option<PathBuf>), String> {
     // A crashed replace leaves a backup behind; resolve it before reading.
     recover_config(path)?;
 
     if !path.exists() {
-        // `model` and `max_turns` are required by `AgentConfig`, and a file
-        // replaces the built-in defaults wholesale. Seed them so one targeted
-        // set still produces a loadable file.
-        let mut document = toml_edit::DocumentMut::new();
-        document["model"] = toml_edit::value(DEFAULT_MODEL);
-        document["max_turns"] = toml_edit::value(DEFAULT_MAX_TURNS);
-        return Ok(document);
+        return Ok((seed_document(), None));
     }
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    text.parse::<toml_edit::DocumentMut>().map_err(|error| {
-        format!(
-            "failed to parse {}: {}",
-            path.display(),
-            first_line(&error.to_string())
-        )
-    })
+    match text.parse::<toml_edit::DocumentMut>() {
+        Ok(document) => Ok((document, None)),
+        Err(error) => {
+            let message = format!(
+                "failed to parse {}: {}",
+                path.display(),
+                first_line(&error.to_string())
+            );
+            match load {
+                ConfigLoad::Strict => Err(message),
+                ConfigLoad::RepairUnparsable => {
+                    let preserved = preserve_unparsable(path)?;
+                    Ok((seed_document(), Some(preserved)))
+                }
+            }
+        }
+    }
+}
+
+/// `model` and `max_turns` are required by `AgentConfig`, and a file replaces
+/// the built-in defaults wholesale; seeding them keeps the result loadable.
+fn seed_document() -> toml_edit::DocumentMut {
+    let mut document = toml_edit::DocumentMut::new();
+    document["model"] = toml_edit::value(DEFAULT_MODEL);
+    document["max_turns"] = toml_edit::value(DEFAULT_MAX_TURNS);
+    document
+}
+
+/// Keep the bytes of a file that could not be parsed, beside it and owner-only,
+/// so a repair never destroys what the user wrote.
+fn preserve_unparsable(path: &Path) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let preserved = path.with_file_name(format!("{name}.invalid-{}", crate::util::epoch_millis()));
+    crate::atomic_file::write_atomic(
+        &preserved,
+        &bytes,
+        crate::atomic_file::ModePolicy::Force(0o600),
+    )
+    .map_err(|error| format!("failed to preserve {}: {error}", preserved.display()))?;
+    Ok(preserved)
 }
 
 /// The one config writer: load, edit, validate the complete document, then
@@ -454,12 +550,22 @@ pub fn update_config(
     path: &Path,
     edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
 ) -> Result<(), String> {
+    update_config_with(path, ConfigLoad::Strict, edit).map(|_| ())
+}
+
+/// [`update_config`] with an explicit load mode. Returns the preserved copy when
+/// a repair replaced an unparsable file, so the caller can name it once.
+pub fn update_config_with(
+    path: &Path,
+    load: ConfigLoad,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
     static CONFIG_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = CONFIG_WRITE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let mut document = load_document(path)?;
+    let (mut document, preserved) = load_document_with(path, load)?;
     edit(&mut document)?;
 
     let text = document.to_string();
@@ -472,7 +578,8 @@ pub fn update_config(
         )
     })?;
 
-    replace_config(path, text.as_bytes())
+    replace_config(path, text.as_bytes())?;
+    Ok(preserved)
 }
 
 /// Parser errors echo the offending source lines; only the first line is safe

@@ -489,8 +489,9 @@ fn config_recovery_prunes_older_backups() {
     );
 }
 
+/// Pins name uniqueness only: `.bak` and `.new` are two writes, not one atomic pair.
 #[test]
-fn config_backup_names_do_not_collide_within_one_millisecond() {
+fn config_backup_names_are_unique_within_one_millisecond() {
     let temp = tempdir().unwrap();
     let path = config_file(temp.path());
     fs::write(&path, "model = \"old\"\n").unwrap();
@@ -504,4 +505,171 @@ fn config_backup_names_do_not_collide_within_one_millisecond() {
         50,
         "every write keeps its own backup, even in the same millisecond"
     );
+}
+
+// ---- Task 6: phase 0.5 review findings (A1-A4, B2, B4, B5) -----------------
+
+const MALFORMED: &str = "model = \"unterminated\n";
+
+fn agent_config(model: &str) -> AgentConfig {
+    AgentConfig {
+        model: model.to_string(),
+        max_turns: 100,
+        base_url: None,
+        api_key: None,
+        reasoning_effort: Some("high".to_string()),
+        system_prompt: None,
+    }
+}
+
+#[test]
+fn setup_repairs_an_unparsable_config() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, MALFORMED).unwrap();
+
+    let preserved = crate::cli::setup::persist(&path, &agent_config("repaired"), None)
+        .unwrap()
+        .expect("the malformed bytes are kept");
+
+    assert_eq!(fs::read_to_string(&preserved).unwrap(), MALFORMED);
+    let (loaded, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
+    assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
+    assert_eq!(loaded.model, "repaired");
+}
+
+#[test]
+fn model_repairs_an_unparsable_config() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, MALFORMED).unwrap();
+
+    let preserved =
+        crate::cli::model::apply_flags(&path, "flag-model".to_string(), Some("high".to_string()))
+            .unwrap()
+            .expect("the malformed bytes are kept");
+
+    assert_eq!(fs::read_to_string(&preserved).unwrap(), MALFORMED);
+    let (loaded, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
+    assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
+    assert_eq!(loaded.model, "flag-model");
+    assert_eq!(loaded.reasoning_effort.as_deref(), Some("high"));
+}
+
+#[test]
+fn config_set_still_refuses_an_unparsable_config() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, MALFORMED).unwrap();
+
+    let error = set_value(&path, ConfigKey::Model, "x").unwrap_err();
+
+    assert!(error.contains("failed to parse"), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), MALFORMED);
+    assert!(backup_names(path.parent().unwrap()).is_empty());
+}
+
+#[test]
+fn repair_keeps_unknown_keys_when_the_file_parses() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(
+        &path,
+        "# keep me\nmodel = \"old\"\nmax_turns = 10\ncustom = 1\n",
+    )
+    .unwrap();
+
+    let preserved = crate::cli::setup::persist(&path, &agent_config("new"), None).unwrap();
+
+    assert!(
+        preserved.is_none(),
+        "a parseable file is edited, not replaced"
+    );
+    let text = stash_written_config(&path);
+    assert!(text.contains("# keep me"), "{text}");
+    assert!(text.contains("custom = 1"), "{text}");
+    assert!(text.contains("model = \"new\""), "{text}");
+}
+
+#[test]
+fn model_write_never_persists_an_environment_api_key() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    let (config, _) = AgentConfig::load_with_report_env(temp.path(), |name| {
+        (name == "SEAVX_API_KEY").then(|| "sk-test-env".to_string())
+    });
+    assert_eq!(config.api_key.as_deref(), Some("sk-test-env"));
+
+    crate::cli::model::apply_flags(&path, "m".to_string(), None).unwrap();
+
+    let text = stash_written_config(&path);
+    assert!(!text.contains("api_key"), "{text}");
+}
+
+#[test]
+fn write_agent_config_keeps_an_existing_on_disk_key() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(
+        &path,
+        "model = \"old\"\nmax_turns = 10\napi_key = \"sk-test-disk\"\n",
+    )
+    .unwrap();
+
+    write_agent_config(&path, &agent_config("new")).unwrap();
+
+    let text = stash_written_config(&path);
+    assert!(text.contains("api_key = \"sk-test-disk\""), "{text}");
+    assert!(text.contains("model = \"new\""), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_persists_an_explicitly_typed_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+
+    let preserved =
+        crate::cli::setup::persist(&path, &agent_config("m"), Some("sk-test-typed")).unwrap();
+
+    assert!(preserved.is_none());
+    let text = stash_written_config(&path);
+    assert!(text.contains("api_key = \"sk-test-typed\""), "{text}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn unset_of_an_absent_key_does_not_rewrite_the_file() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    let original = "model = \"m\"\nmax_turns = 10\n";
+    fs::write(&path, original).unwrap();
+
+    assert!(!unset_value(&path, ConfigKey::ReasoningEffort).unwrap());
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert!(
+        backup_names(path.parent().unwrap()).is_empty(),
+        "a no-op unset must not leave a backup"
+    );
+}
+
+#[test]
+fn config_recovery_handles_backup_without_new_record() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"old\"\n").unwrap();
+    let backup = plant_backup_at(&path, 1000, b"model = \"old\"\n", b"model = \"new\"\n");
+    // The crash happened before the `.new` record was written.
+    fs::remove_file(PathBuf::from(format!("{}.new", backup.display()))).unwrap();
+    fs::remove_file(&path).unwrap();
+
+    recover_config(&path).unwrap();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "model = \"old\"\n");
+    assert!(!backup.exists());
 }
