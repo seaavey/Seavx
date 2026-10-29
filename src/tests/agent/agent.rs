@@ -392,7 +392,7 @@ mod engine_seam {
         ChatMessage, ChatOptions, ChatRequest, ChatResponse, MessageContent, ToolResponse,
     };
 
-    fn response(content: MessageContent) -> ChatResponse {
+    pub(super) fn response(content: MessageContent) -> ChatResponse {
         let model = genai::ModelIden::new(AdapterKind::OpenAI, "fake-model");
         ChatResponse {
             content,
@@ -415,24 +415,33 @@ mod engine_seam {
         .unwrap()
     }
 
-    /// A scripted provider: one response per request, every request recorded.
+    /// A scripted provider: one response or error per request, every request
+    /// recorded.
     #[derive(Clone, Default)]
-    struct FakeBackend {
+    pub(super) struct FakeBackend {
         inner: std::sync::Arc<FakeInner>,
     }
 
     #[derive(Default)]
     struct FakeInner {
-        script: std::sync::Mutex<std::collections::VecDeque<ChatResponse>>,
+        script: std::sync::Mutex<std::collections::VecDeque<Result<ChatResponse, String>>>,
         requests: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
     }
 
     impl FakeBackend {
-        fn push(&self, response: ChatResponse) {
-            self.inner.script.lock().unwrap().push_back(response);
+        pub(super) fn push(&self, response: ChatResponse) {
+            self.inner.script.lock().unwrap().push_back(Ok(response));
         }
 
-        fn requests(&self) -> Vec<Vec<ChatMessage>> {
+        pub(super) fn push_error(&self, message: &str) {
+            self.inner
+                .script
+                .lock()
+                .unwrap()
+                .push_back(Err(message.to_string()));
+        }
+
+        pub(super) fn requests(&self) -> Vec<Vec<ChatMessage>> {
             self.inner.requests.lock().unwrap().clone()
         }
     }
@@ -450,12 +459,11 @@ mod engine_seam {
                 .lock()
                 .unwrap()
                 .push(request.messages.clone());
-            self.inner
-                .script
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or_else(|| "fake backend ran out of responses".into())
+            match self.inner.script.lock().unwrap().pop_front() {
+                Some(Ok(response)) => Ok(response),
+                Some(Err(message)) => Err(std::io::Error::other(message).into()),
+                None => Err(std::io::Error::other("fake backend ran out of responses").into()),
+            }
         }
     }
 
@@ -809,6 +817,187 @@ mod context_budget {
             request.messages[2].content.first_text(),
             Some("z".repeat(480_000).as_str()),
             "the oversized message is never truncated"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_budget {
+    use super::context_budget::valid_summary;
+    use super::engine_seam::{FakeBackend, response};
+    use crate::agent::engine::{
+        AgentConfig, AgentMode, AgentRuntime, RetryBudget, RetryTrigger, classify_failure,
+    };
+    use crate::agent::security::WorkspaceSecurity;
+    use crate::tui::compact::Summarizer;
+    use genai::chat::{ChatMessage, MessageContent};
+
+    struct CountingSummarizer {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Summarizer for CountingSummarizer {
+        async fn summarize(&self, _prompt: String) -> Result<String, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(valid_summary())
+        }
+    }
+
+    fn runtime(
+        backend: &FakeBackend,
+        summarizer: std::sync::Arc<CountingSummarizer>,
+        workspace: &std::path::Path,
+    ) -> AgentRuntime {
+        let mut config = AgentConfig::load(workspace);
+        config.model = "deepseek-chat".to_string();
+        config.max_turns = 4;
+        config.system_prompt = Some("system prompt".to_string());
+        AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(workspace),
+            Box::new(backend.clone()),
+        )
+        .with_summarizer(summarizer)
+    }
+
+    /// Six turns of ~10 000 tokens: under the 102k budget, over the 40 % one.
+    fn history() -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+        for index in 0..6 {
+            messages.push(ChatMessage::user(format!("question {index}")));
+            messages.push(ChatMessage::assistant("x".repeat(40_000)));
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn a_capacity_error_retries_once_with_aggressive_compaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("400: maximum context length is 128000 tokens");
+        fake.push(response(MessageContent::from_text("recovered")));
+        let summarizer = std::sync::Arc::new(CountingSummarizer {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = runtime(&fake, summarizer.clone(), temp.path());
+
+        let answer = runtime
+            .execute_task(
+                "current task",
+                AgentMode::Build,
+                history(),
+                &crate::agent::permissions::DenyingConfirmer,
+                |_| {},
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answer, "recovered");
+        assert_eq!(fake.requests().len(), 2, "exactly one retry");
+        assert!(
+            summarizer.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the retry compacts against the 40 % budget"
+        );
+        let second = &fake.requests()[1];
+        assert!(
+            second.iter().any(|message| {
+                message
+                    .content
+                    .first_text()
+                    .is_some_and(|text| text.contains("# SESSION CONTEXT (compacted)"))
+            }),
+            "the retried request carries the aggressive summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unidentified_provider_error_is_not_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("400 bad model: no such model");
+        let summarizer = std::sync::Arc::new(CountingSummarizer {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = runtime(&fake, summarizer, temp.path());
+
+        let error = runtime
+            .execute_task(
+                "current task",
+                AgentMode::Build,
+                history(),
+                &crate::agent::permissions::DenyingConfirmer,
+                |_| {},
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("bad model"), "{error}");
+        assert_eq!(fake.requests().len(), 1, "no retry, no second request");
+    }
+
+    #[tokio::test]
+    async fn a_replay_rejection_and_a_capacity_error_share_one_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("400: invalid tool_call_id in messages");
+        fake.push_error("400: maximum context length exceeded");
+        let summarizer = std::sync::Arc::new(CountingSummarizer {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = runtime(&fake, summarizer, temp.path());
+
+        let error = runtime
+            .execute_task(
+                "current task",
+                AgentMode::Build,
+                history(),
+                &crate::agent::permissions::DenyingConfirmer,
+                |_| {},
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("maximum context length"),
+            "the turn fails with the second error: {error}"
+        );
+        assert_eq!(
+            fake.requests().len(),
+            2,
+            "the replay rejection spent the only retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_partial_output_is_retried_zero_times() {
+        // Phase 5's streaming path calls `note_output`; the invariant is here.
+        let mut budget = RetryBudget::default();
+        budget.note_output();
+        assert!(!budget.spend(RetryTrigger::CapacityError));
+        assert!(!budget.spend(RetryTrigger::ReplayRejection));
+
+        let mut budget = RetryBudget::default();
+        assert!(budget.spend(RetryTrigger::ReplayRejection));
+        assert!(
+            !budget.spend(RetryTrigger::CapacityError),
+            "two triggers never stack"
+        );
+
+        assert_eq!(
+            classify_failure(&std::io::Error::other("400 bad model")),
+            None
+        );
+        assert_eq!(
+            classify_failure(&std::io::Error::other("prompt is too long")),
+            Some(RetryTrigger::CapacityError)
+        );
+        assert_eq!(
+            classify_failure(&std::io::Error::other("invalid tool_calls")),
+            Some(RetryTrigger::ReplayRejection)
         );
     }
 }

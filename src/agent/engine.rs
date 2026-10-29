@@ -419,9 +419,110 @@ impl ChatBackend for GenaiBackend {
     }
 }
 
+/// What a provider failure is allowed to buy: at most one retry per user turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryTrigger {
+    /// The provider said the request is too large for the model.
+    CapacityError,
+    /// The provider refused the replayed tool-call structure.
+    ReplayRejection,
+}
+
+/// One budget per user turn, never per tool call.
+#[derive(Debug, Default)]
+pub struct RetryBudget {
+    used: bool,
+    output_seen: bool,
+}
+
+impl RetryBudget {
+    /// Any received output closes the budget: partial output is persisted, never
+    /// resent. Phase 5's streaming path is the caller that sets this.
+    pub fn note_output(&mut self) {
+        self.output_seen = true;
+    }
+
+    /// `true` when this trigger may be retried; a second call is always refused,
+    /// so two triggers can never stack.
+    pub fn spend(&mut self, _trigger: RetryTrigger) -> bool {
+        if self.used || self.output_seen {
+            return false;
+        }
+        self.used = true;
+        true
+    }
+}
+
+/// Phrases that identify a capacity error. Anything else is not retried: an
+/// unidentified failure may be a bad model, a bad key or a bug.
+const CAPACITY_MARKERS: [&str; 6] = [
+    "maximum context length",
+    "context length",
+    "context_length_exceeded",
+    "token limit",
+    "prompt is too long",
+    "prompt too long",
+];
+
+/// Phrases that identify a replay rejection: the provider refused the structure
+/// of the replayed tool calls.
+const REPLAY_MARKERS: [&str; 4] = ["tool_call_id", "tool_calls", "tool result", "tool_use"];
+
+fn message_of(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        text.push(' ');
+        text.push_str(&error.to_string());
+        source = error.source();
+    }
+    text.to_lowercase()
+}
+
+/// The one classifier: only a message that names the condition counts.
+pub fn classify_failure(error: &(dyn std::error::Error + 'static)) -> Option<RetryTrigger> {
+    let text = message_of(error);
+    if CAPACITY_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Some(RetryTrigger::CapacityError);
+    }
+    if REPLAY_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Some(RetryTrigger::ReplayRejection);
+    }
+    None
+}
+
+/// The replay-rejection retry: keep the newest half of the turns, cut at a user
+/// row, so a tool-call pair is never split.
+fn halve_turns(request: &ChatRequest) -> ChatRequest {
+    let messages = &request.messages;
+    if messages.len() < 4 {
+        return request.clone();
+    }
+
+    let body = &messages[1..messages.len() - 1];
+    let mut starts = vec![0];
+    for (index, message) in body.iter().enumerate().skip(1) {
+        if message.role == genai::chat::ChatRole::User {
+            starts.push(index);
+        }
+    }
+    let keep_from = starts[starts.len().div_ceil(2)];
+
+    let mut rebuilt = ChatRequest::default();
+    if let Some(tools) = &request.tools {
+        rebuilt = rebuilt.with_tools(tools.clone());
+    }
+    rebuilt = rebuilt.append_message(messages[0].clone());
+    for message in &body[keep_from..] {
+        rebuilt = rebuilt.append_message(message.clone());
+    }
+    rebuilt.append_message(messages[messages.len() - 1].clone())
+}
+
 pub struct AgentRuntime {
     client: Client,
     backend: Box<dyn ChatBackend>,
+    summarizer: Option<std::sync::Arc<dyn crate::tui::compact::Summarizer>>,
     registry: ToolRegistry,
     security: WorkspaceSecurity,
     config: AgentConfig,
@@ -475,6 +576,7 @@ impl AgentRuntime {
         Self {
             client,
             backend,
+            summarizer: None,
             registry: ToolRegistry::with_default_tools(),
             security,
             config,
@@ -491,6 +593,17 @@ impl AgentRuntime {
         let mut runtime = Self::new(config, security);
         runtime.backend = backend;
         runtime
+    }
+
+    /// Swap the summarizer the compaction step uses, so no test reaches the
+    /// network.
+    #[cfg(test)]
+    pub(crate) fn with_summarizer(
+        mut self,
+        summarizer: std::sync::Arc<dyn crate::tui::compact::Summarizer>,
+    ) -> Self {
+        self.summarizer = Some(summarizer);
+        self
     }
 
     pub fn client(&self) -> &Client {
@@ -527,10 +640,18 @@ impl AgentRuntime {
         mut event_sink: impl FnMut(&str) + Send,
         mut on_message: impl FnMut(&ChatMessage),
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let summarizer = crate::tui::compact::ModelSummarizer::from_config(&self.config);
+        let summarizer: std::sync::Arc<dyn crate::tui::compact::Summarizer> = match &self.summarizer
+        {
+            Some(summarizer) => summarizer.clone(),
+            None => std::sync::Arc::new(crate::tui::compact::ModelSummarizer::from_config(
+                &self.config,
+            )),
+        };
+        let retry_history = history.clone();
         let mut chat_req = self
-            .prepare_request(history, task, mode, &summarizer, &mut event_sink)
+            .prepare_request(history, task, mode, &*summarizer, &mut event_sink)
             .await;
+        let mut retry = RetryBudget::default();
 
         tracing::info!(model = %self.config.model, "Starting Seavx agent task");
 
@@ -552,10 +673,39 @@ impl AgentRuntime {
                 self.security.root(),
             );
 
-            let response = self
+            let response = match self
                 .backend
                 .send(&self.config.model, chat_req.clone(), Some(&chat_options))
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    // One retry per turn, on the first identified trigger only.
+                    let trigger = classify_failure(error.as_ref());
+                    match trigger {
+                        Some(trigger) if retry.spend(trigger) => {
+                            chat_req = match trigger {
+                                RetryTrigger::ReplayRejection => halve_turns(&chat_req),
+                                RetryTrigger::CapacityError => {
+                                    self.aggressive_request(
+                                        &retry_history,
+                                        task,
+                                        mode,
+                                        &*summarizer,
+                                    )
+                                    .await
+                                }
+                            };
+                            // A failure here is the turn's failure: it never
+                            // buys a second retry.
+                            self.backend
+                                .send(&self.config.model, chat_req.clone(), Some(&chat_options))
+                                .await?
+                        }
+                        _ => return Err(error),
+                    }
+                }
+            };
 
             // Track real usage tokens from provider response
             if let Some(total) = response.usage.total_tokens {
@@ -804,6 +954,30 @@ impl AgentRuntime {
             request = request.append_message(message.clone());
         }
         request.append_message(ChatMessage::user(task))
+    }
+
+    /// The capacity-error retry: compact against 40 % of the budget, keep the
+    /// newest turn when even that cannot summarise.
+    async fn aggressive_request(
+        &self,
+        history: &[ChatMessage],
+        task: &str,
+        mode: AgentMode,
+        summarizer: &dyn crate::tui::compact::Summarizer,
+    ) -> ChatRequest {
+        use crate::agent::budget::{compact, request_budget, window_start};
+
+        let limit = model_context_limit(&self.config.model);
+        let aggressive = request_budget(limit.tokens) * 40 / 100;
+        match compact(history, aggressive, summarizer).await {
+            Ok(compaction) => {
+                self.chat_request(Some(&compaction.summary), &compaction.history, task, mode)
+            }
+            Err(_) => {
+                let split = window_start(history, 0);
+                self.chat_request(None, &history[split..], task, mode)
+            }
+        }
     }
 
     /// One place decides a tool call: the matrix, then the human, then the
