@@ -113,6 +113,46 @@ one stays listed and resumable.
 
 ---
 
+## 🧠 Context & Compaction
+
+A request is measured before it is sent, and compacted when it would not fit.
+The measurement is a **serialized-request estimate**: `ceil(chars/4)` over the
+JSON of the whole request (system prompt, history, tool calls, tool results,
+tool schemas, the task). It is a heuristic, not a promise — it can under-count
+CJK or code-dense text by up to ~2x — so overflow is handled rather than
+declared impossible.
+
+| Model family | Window | Source |
+| --- | --- | --- |
+| `claude`, `gemini`, `nemotron` | 1 000 000 | known |
+| `deepseek`, `glm`, `gpt-4o`, `gpt-4.1`, `o3`, `o4` | 128 000 | known |
+| anything else | 64 000 | assumed — the footer and `doctor` say `(assumed)` |
+
+- `request_budget` is 80 % of the window, `keep_recent` 60 % of that budget.
+- Above the budget the older turns are summarised through one chunking rule,
+  `CHUNK_CHARS = 24 000` characters. The summary enters the next request as a
+  single user message with the `# SESSION CONTEXT (compacted)` banner; a turn is
+  never split and a message is never truncated.
+- The summary must be at least 100 characters and carry goals, decisions, files
+  and pending sections. A summary that fails the gate, or a summariser error,
+  drops the older turns and prints `System: compaction failed (<reason>); older
+  turns dropped` — a bad summary is worse than none.
+- After compaction the request is re-measured; a summary that still does not fit
+  shrinks `keep_recent` by 10 % (at most three times), then every kept turn
+  except the newest is dropped, with a warning. A single turn bigger than the
+  budget is sent whole, and the warning names the estimate and the model.
+- One retry per turn, never two: a provider rejection of the replayed tool calls
+  rebuilds the window at half the turns; a provider *capacity* error (a message
+  naming context length, token limit or prompt-too-long) re-compacts against 40 %
+  of the budget. Either is retried once; after that the turn fails with the
+  provider's message. A turn that already produced output is never retried.
+- `max_turns` is a config key and new configs default to 100. An existing file
+  keeps the value it stores. Repeating the same tool call with the same
+  arguments, or the same error twice in a row, ends the loop with `stopped: …`
+  instead of burning the budget.
+
+---
+
 ## ⚙️ Configuration
 
 Configure a provider once per machine (base URL, API key, model, reasoning effort):
@@ -129,7 +169,7 @@ seavx init
 Configuration resides in `.seavx/config.toml`:
 ```toml
 model = "openai/gpt-4o-mini"
-max_turns = 25
+max_turns = 100
 base_url = "https://api.openai.com/v1/"
 api_key = "sk-..."
 reasoning_effort = "highx"
