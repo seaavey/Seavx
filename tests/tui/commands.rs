@@ -49,6 +49,62 @@ fn busy_app_rejects_clear_but_allows_help_and_exit() {
 }
 
 #[test]
+fn every_palette_entry_parses_to_a_handled_command() {
+    use crate::agent::engine::AgentMode;
+    use crate::cli::config::ConfigAction;
+    use crate::cli::memory::MemoryView;
+
+    // One row per palette entry: the command the palette offers must parse to
+    // exactly this variant, so autocomplete can never suggest a dead command.
+    let expected = [
+        (
+            "/model",
+            SlashCommand::Model {
+                target: None,
+                effort: None,
+            },
+        ),
+        ("/compact", SlashCommand::Compact { instructions: None }),
+        (
+            "/config",
+            SlashCommand::Config {
+                action: ConfigAction::Show,
+            },
+        ),
+        (
+            "/plan",
+            SlashCommand::Plan {
+                mode: AgentMode::Plan,
+            },
+        ),
+        ("/clear", SlashCommand::Clear),
+        ("/help", SlashCommand::Help),
+        ("/init", SlashCommand::Init),
+        ("/doctor", SlashCommand::Doctor { offline: false }),
+        (
+            "/memory",
+            SlashCommand::Memory {
+                view: MemoryView::All,
+            },
+        ),
+        ("/exit", SlashCommand::Exit),
+    ];
+
+    let palette: Vec<&str> = SLASH_COMMANDS.iter().map(|(name, _)| *name).collect();
+    let pinned: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
+    assert_eq!(palette, pinned, "palette and parser table drifted");
+
+    for (name, expected_command) in expected {
+        let parsed = parse(name).unwrap_or_else(|| panic!("{name} does not parse"));
+        assert!(
+            !matches!(parsed, SlashCommand::Unknown(_)),
+            "{name} parses to Unknown"
+        );
+        assert_eq!(parsed, expected_command, "{name} changed");
+    }
+}
+
+#[test]
 fn help_lists_every_palette_entry() {
     let help = help_text();
     for (command, _) in crate::tui::app::SLASH_COMMANDS {
