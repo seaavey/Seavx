@@ -1,5 +1,7 @@
 use crate::agent::engine::AgentMode;
 use crate::agent::security::WorkspaceSecurity;
+use crate::atomic_file::{ModePolicy, write_atomic};
+use crate::checkpoint::{CheckpointInput, CheckpointStore, CheckpointTarget, EntryState};
 use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
@@ -33,15 +35,71 @@ fn schema<T: JsonSchema>() -> Value {
     serde_json::to_value(schema_for!(T)).unwrap_or_default()
 }
 
-/// Create parent directories when needed, then write content. Shared core of
-/// `write_file` and `skill_write`; `ctx` labels the target in error messages.
-async fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    tokio::fs::write(path, content)
-        .await
+/// Create parent directories when needed, then write content atomically. Shared
+/// core of `write_file` and `skill_write`; `ctx` labels the target in errors.
+fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), String> {
+    write_atomic(path, content.as_bytes(), ModePolicy::Preserve)
         .map_err(|e| format!("Failed to write {ctx}: {e}"))
+}
+
+/// Capture the pre-write bytes of `path` so `/undo` can restore them. A target
+/// outside the workspace is accepted only inside an allowed global root.
+fn capture_checkpoint(security: &WorkspaceSecurity, path: &Path) -> Result<(), String> {
+    // Existence decides the class, never a successful read: recording an
+    // existing file as `created` would make `/undo` delete it.
+    let exists = std::fs::symlink_metadata(path).is_ok();
+    let original = if exists {
+        Some(std::fs::read(path).map_err(|error| {
+            format!(
+                "refusing to write {}: it exists but cannot be read, so it cannot be checkpointed ({error})",
+                path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let state = if exists {
+        EntryState::Modified
+    } else {
+        EntryState::Created
+    };
+    let target = match path.strip_prefix(security.root()) {
+        Ok(_) => CheckpointTarget::Workspace(path.to_path_buf()),
+        Err(_) => {
+            let allowed_root = global_root_for(path).ok_or_else(|| {
+                format!(
+                    "Refusing to write outside the workspace: {}",
+                    path.display()
+                )
+            })?;
+            CheckpointTarget::Global {
+                path: path.to_path_buf(),
+                allowed_root,
+            }
+        }
+    };
+
+    CheckpointStore::create(
+        security.root(),
+        &[CheckpointInput {
+            target,
+            state,
+            original,
+        }],
+    )
+    .map(|_| ())
+    .map_err(|error| format!("Checkpoint failed: {error}"))
+}
+
+fn global_root_for(path: &Path) -> Option<std::path::PathBuf> {
+    let home = crate::home::dir()?;
+    let files = [home.join(".seavx/MEMORY.md"), home.join(".seavx/USER.md")];
+    if let Some(root) = files.into_iter().find(|root| root == path) {
+        return Some(root);
+    }
+    [home.join(".seavx/skills"), home.join(".agents/skills")]
+        .into_iter()
+        .find(|root| path.starts_with(root))
 }
 
 /// Read a file, replace the first occurrence of `old_string`, and write it back.
@@ -61,8 +119,7 @@ async fn replace_first(
     }
 
     let updated = content.replacen(old_string, new_string, 1);
-    tokio::fs::write(path, updated)
-        .await
+    write_atomic(path, updated.as_bytes(), ModePolicy::Preserve)
         .map_err(|e| format!("Failed to save {ctx} edit: {e}"))
 }
 
@@ -152,7 +209,8 @@ impl AgentTool for WriteFileTool {
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<WriteFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        write_with_parents(&path, parsed.content, "file").await?;
+        capture_checkpoint(security, &path)?;
+        write_with_parents(&path, parsed.content, "file")?;
         Ok(format!("Successfully wrote {}", parsed.path))
     }
 }
@@ -184,6 +242,7 @@ impl AgentTool for EditFileTool {
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<EditFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
+        capture_checkpoint(security, &path)?;
         replace_first(&path, &parsed.old_string, &parsed.new_string, "file").await?;
         Ok(format!("Successfully updated {}", parsed.path))
     }
@@ -547,8 +606,8 @@ impl AgentTool for SaveMemoryTool {
 
         updated.push_str(&format!("- [{confidence}%] {lesson}\n"));
 
-        tokio::fs::write(&target_file, updated)
-            .await
+        capture_checkpoint(security, &target_file)?;
+        write_atomic(&target_file, updated.as_bytes(), ModePolicy::Preserve)
             .map_err(|e| format!("Failed to write memory: {e}"))?;
 
         Ok(format!(
@@ -634,12 +693,14 @@ impl AgentTool for SkillWriteTool {
 
         // Overwrite in place when the skill already exists (could live in a shared skills root).
         if let Ok(path) = find_skill_file(security, &parsed.name) {
-            write_with_parents(&path, parsed.content, "skill").await?;
+            capture_checkpoint(security, &path)?;
+            write_with_parents(&path, parsed.content, "skill")?;
             return Ok(format!("Successfully updated {}", path.display()));
         }
 
-        let path = crate::agent::skills::SkillManager::new(security.root())
-            .save_skill(&parsed.name, &parsed.content)?;
+        let manager = crate::agent::skills::SkillManager::new(security.root());
+        capture_checkpoint(security, &manager.skill_path(&parsed.name)?)?;
+        let path = manager.save_skill(&parsed.name, &parsed.content)?;
         Ok(format!("Successfully created {}", path.display()))
     }
 }
@@ -671,6 +732,7 @@ impl AgentTool for SkillPatchTool {
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<SkillPatchArgs>(args)?;
         let path = find_skill_file(security, &parsed.name)?;
+        capture_checkpoint(security, &path)?;
         replace_first(&path, &parsed.old_string, &parsed.new_string, "skill").await?;
         Ok(format!("Successfully patched {}", parsed.name))
     }
@@ -741,3 +803,7 @@ impl ToolRegistry {
         Ok(tool)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/core/tools.rs"]
+mod tests;

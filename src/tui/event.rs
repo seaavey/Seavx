@@ -20,6 +20,7 @@ pub enum Action {
     CompactDone {
         result: Result<crate::tui::compact::CompactResult, String>,
     },
+    UndoDone(Result<Vec<std::path::PathBuf>, String>),
 }
 
 #[derive(Debug, PartialEq, Eq)]

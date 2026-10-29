@@ -23,12 +23,25 @@ use crate::agent::engine::{AgentMode, EFFORT_LEVELS};
 use crate::tui::event::{Action, AgentState};
 use crate::tui::ui;
 
+const MAX_COMPLETION_RESULTS: usize = 20;
+
 pub fn scan_workspace_entries(query: &str) -> Vec<(bool, String)> {
+    scan_workspace_entries_at(std::path::Path::new("."), query)
+}
+
+/// Root-aware core of [`scan_workspace_entries`]. Tests scan an isolated tree
+/// without changing the process working directory.
+fn scan_workspace_entries_at(root: &std::path::Path, query: &str) -> Vec<(bool, String)> {
     let clean_query = query.trim_start_matches('@').to_lowercase();
     let mut results = Vec::new();
 
-    fn walk_dir(dir: &std::path::Path, results: &mut Vec<(bool, String)>, query: &str) {
-        if results.len() >= 20 {
+    fn walk_dir(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        results: &mut Vec<(bool, String)>,
+        query: &str,
+    ) {
+        if results.len() >= MAX_COMPLETION_RESULTS {
             return;
         }
         let entries = match std::fs::read_dir(dir) {
@@ -36,7 +49,7 @@ pub fn scan_workspace_entries(query: &str) -> Vec<(bool, String)> {
             Err(_) => return,
         };
         for entry in entries.flatten() {
-            if results.len() >= 20 {
+            if results.len() >= MAX_COMPLETION_RESULTS {
                 break;
             }
             let path = entry.path();
@@ -45,21 +58,24 @@ pub fn scan_workspace_entries(query: &str) -> Vec<(bool, String)> {
                 continue;
             }
             let rel = path
-                .strip_prefix(".")
+                .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
-            let is_dir = path.is_dir();
+            // `DirEntry::file_type` does not follow symlinks: a linked directory
+            // is listed as a candidate but never traversed, so it cannot expose
+            // names outside the workspace or walk a cycle.
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
             if query.is_empty() || rel.to_lowercase().contains(query) {
                 results.push((is_dir, rel));
             }
             if is_dir {
-                walk_dir(&path, results, query);
+                walk_dir(&path, root, results, query);
             }
         }
     }
 
-    walk_dir(std::path::Path::new("."), &mut results, &clean_query);
+    walk_dir(root, root, &mut results, &clean_query);
     results.sort_by(|a, b| a.1.cmp(&b.1));
     results
 }
@@ -80,6 +96,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/init", "Initialize workspace configuration"),
     ("/doctor", "Check environment and health"),
     ("/memory", "Inspect persistent memory"),
+    ("/undo", "Restore files from the latest checkpoint"),
     ("/exit", "Quit Seavx agent TUI"),
 ];
 
@@ -382,20 +399,10 @@ impl<'a> App<'a> {
         };
 
         let config_path = crate::cli::config::workspace_config_path(std::path::Path::new("."));
+        // One write: the model and the effort change together or not at all.
         let mut errors = Vec::new();
-        if let Err(error) = crate::cli::config::set_value(
-            &config_path,
-            crate::cli::config::ConfigKey::Model,
-            &resolved_model,
-        ) {
-            errors.push(error);
-        }
-        if let Some(effort) = effort
-            && let Err(error) = crate::cli::config::set_value(
-                &config_path,
-                crate::cli::config::ConfigKey::ReasoningEffort,
-                effort,
-            )
+        if let Err(error) =
+            crate::cli::config::set_model_and_effort(&config_path, &resolved_model, effort)
         {
             errors.push(error);
         }
@@ -781,6 +788,31 @@ fn apply_command_effect(
             tokio::spawn(async move {
                 let report = crate::cli::doctor::run(options).await;
                 let _ = tx.send(Action::DoctorDone(report));
+            });
+        }
+        CommandEffect::RunUndo => {
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let result =
+                    crate::checkpoint::CheckpointStore::undo_latest(std::path::Path::new("."))
+                        .map_err(|error| {
+                            // A half-done undo must say what it already changed.
+                            let restored = error.restored();
+                            if restored.is_empty() {
+                                return error.to_string();
+                            }
+                            let paths: Vec<String> = restored
+                                .iter()
+                                .map(|path| path.display().to_string())
+                                .collect();
+                            format!(
+                                "{error}\nRestored {} file(s) before the failure:\n{}",
+                                paths.len(),
+                                paths.join("\n")
+                            )
+                        });
+                let _ = tx.send(Action::UndoDone(result));
             });
         }
         CommandEffect::RunCompact { instructions } => {
@@ -1181,11 +1213,15 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     app.config.model = model.clone();
                                     app.config.reasoning_effort = Some(chosen_effort.clone());
 
-                                    // Persist to .seavx/config.toml
-                                    let _ = app.config.save(std::path::Path::new("."));
+                                    // Persist through the one config writer.
+                                    let saved = app.config.save(std::path::Path::new("."));
 
+                                    let saved_line = match &saved {
+                                        Ok(()) => "Saved to .seavx/config.toml".to_string(),
+                                        Err(error) => format!("Failed to save config: {error}"),
+                                    };
                                     app.set_text(format!(
-                                        "✓ Switched model to: {}\n✓ Reasoning effort: {}\nSaved to .seavx/config.toml",
+                                        "Switched model to: {}\nReasoning effort: {}\n{saved_line}",
                                         app.config.model,
                                         app.config.reasoning_effort.as_deref().unwrap_or("none")
                                     ));
@@ -1413,6 +1449,20 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                 Action::DoctorDone(report) => {
                     app.status = AgentState::Idle;
                     app.push_notice(crate::cli::doctor::render(&report));
+                }
+                Action::UndoDone(result) => {
+                    app.status = AgentState::Idle;
+                    match result {
+                        Ok(paths) if paths.is_empty() => app.push_notice("Nothing to undo."),
+                        Ok(paths) => {
+                            let mut text = format!("Restored {} file(s):", paths.len());
+                            for path in paths {
+                                text.push_str(&format!("\n{}", path.display()));
+                            }
+                            app.push_notice(text);
+                        }
+                        Err(error) => app.push_notice(format!("Undo failed: {error}")),
+                    }
                 }
                 Action::CompactDone { result } => {
                     app.status = AgentState::Idle;

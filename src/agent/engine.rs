@@ -213,6 +213,16 @@ impl AgentConfig {
         let workspace_path = workspace_root.join(".seavx/config.toml");
         let global_path = home.map(|home| home.join(".seavx/config.toml"));
 
+        // A replace interrupted by a crash is resolved before the file is read.
+        for path in [Some(&workspace_path), global_path.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = crate::cli::config::recover_config(path) {
+                tracing::warn!(%error, "config recovery");
+            }
+        }
+
         let workspace_exists = workspace_path.exists();
         let global_exists = global_path.as_ref().is_some_and(|path| path.exists());
         let active_path = if workspace_exists {
@@ -278,20 +288,15 @@ impl AgentConfig {
         )
     }
 
-    /// Persist as pretty TOML under the workspace's `.seavx/config.toml`,
-    /// creating the directory when missing. TUI call-sites ignore errors.
+    /// Persist under the workspace's `.seavx/config.toml`. Call-sites that
+    /// cannot report an error ignore it.
     pub fn save(&self, workspace_root: &Path) -> std::io::Result<()> {
         self.write_to(&workspace_root.join(".seavx/config.toml"))
     }
 
-    /// Write the config as pretty TOML, creating parent directories if needed.
+    /// Write through the one validated config writer in `config.rs`.
     pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let toml_str =
-            toml::to_string_pretty(self).map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(path, toml_str)
+        crate::cli::config::write_agent_config(path, self).map_err(std::io::Error::other)
     }
 }
 
