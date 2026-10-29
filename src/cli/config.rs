@@ -36,6 +36,7 @@ pub enum ConfigKey {
     BaseUrl,
     ApiKey,
     ReasoningEffort,
+    Stream,
     MaxTurns,
     SystemPrompt,
     ToolPermissions,
@@ -49,6 +50,7 @@ impl ConfigKey {
             "base_url" => Some(Self::BaseUrl),
             "api_key" => Some(Self::ApiKey),
             "effort" | "reasoning_effort" => Some(Self::ReasoningEffort),
+            "stream" => Some(Self::Stream),
             "max_turns" => Some(Self::MaxTurns),
             "system_prompt" => Some(Self::SystemPrompt),
             "tool_permissions" | "permissions" => Some(Self::ToolPermissions),
@@ -63,6 +65,7 @@ impl ConfigKey {
             Self::BaseUrl => "base_url",
             Self::ApiKey => "api_key",
             Self::ReasoningEffort => "reasoning_effort",
+            Self::Stream => "stream",
             Self::MaxTurns => "max_turns",
             Self::SystemPrompt => "system_prompt",
             Self::ToolPermissions => "tool_permissions",
@@ -178,6 +181,7 @@ pub fn render_report(config: &AgentConfig, report: &ConfigReport) -> String {
     let rows = [
         ("model", config.model.clone(), ConfigKey::Model),
         ("reasoning_effort", effort, ConfigKey::ReasoningEffort),
+        ("stream", config.stream.to_string(), ConfigKey::Stream),
         ("base_url", base_url, ConfigKey::BaseUrl),
         ("api_key", api_key, ConfigKey::ApiKey),
         (
@@ -251,6 +255,7 @@ pub fn render_value(config: &AgentConfig, report: &ConfigReport, key: ConfigKey)
             .reasoning_effort
             .clone()
             .unwrap_or_else(|| "default".to_string()),
+        ConfigKey::Stream => config.stream.to_string(),
         ConfigKey::MaxTurns => config.max_turns.to_string(),
         ConfigKey::SystemPrompt => config
             .system_prompt
@@ -350,6 +355,11 @@ fn canonical_value(key: ConfigKey, raw: &str) -> Result<String, String> {
                 .map(str::to_string)
                 .ok_or_else(|| format!("invalid reasoning_effort: {raw}"))
         }
+        ConfigKey::Stream => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "on" | "1" => Ok("true".to_string()),
+            "false" | "off" | "0" => Ok("false".to_string()),
+            _ => Err(format!("stream must be true or false, got: {raw}")),
+        },
         ConfigKey::MaxTurns => {
             let turns: u64 = raw
                 .trim()
@@ -394,7 +404,10 @@ pub enum ConfigLoad {
 pub fn set_value(path: &Path, key: ConfigKey, raw: &str) -> Result<String, String> {
     let value = canonical_value(key, raw)?;
     update_config(path, |document| {
-        if key == ConfigKey::MaxTurns {
+        if key == ConfigKey::Stream {
+            // A boolean is written as a TOML boolean, not a string.
+            document[key.name()] = toml_edit::value(value == "true");
+        } else if key == ConfigKey::MaxTurns {
             let turns: i64 = value
                 .parse()
                 .map_err(|_| "max_turns must be an integer".to_string())?;

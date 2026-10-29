@@ -1,4 +1,4 @@
-use crate::agent::backend::{ChatBackend, GenaiBackend};
+use crate::agent::backend::{ChatBackend, GenaiBackend, StreamDelta};
 use crate::agent::permissions::{
     self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
 };
@@ -59,11 +59,12 @@ pub const DEFAULT_MAX_TURNS: usize = 100;
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
 
 /// Config keys that can appear in a config file, in display order.
-pub const CONFIG_KEYS: [&str; 8] = [
+pub const CONFIG_KEYS: [&str; 9] = [
     "model",
     "base_url",
     "api_key",
     "reasoning_effort",
+    "stream",
     "max_turns",
     "system_prompt",
     "tool_permissions",
@@ -122,10 +123,17 @@ pub struct AgentConfig {
     /// Action kinds lifted from `ask` to `allow`; never `global-write`.
     #[serde(default)]
     pub permitted_actions: Vec<String>,
+    /// Stream the answer instead of waiting for the whole response.
+    #[serde(default = "default_stream")]
+    pub stream: bool,
 }
 
 fn default_tool_permissions() -> String {
     "ask".to_string()
+}
+
+fn default_stream() -> bool {
+    true
 }
 
 impl Default for AgentConfig {
@@ -153,6 +161,7 @@ impl AgentConfig {
             system_prompt: None,
             tool_permissions: default_tool_permissions(),
             permitted_actions: Vec::new(),
+            stream: default_stream(),
         }
     }
 }
@@ -400,6 +409,8 @@ pub enum RetryTrigger {
     CapacityError,
     /// The provider refused the replayed tool-call structure.
     ReplayRejection,
+    /// The stream produced no chunk at all: the endpoint may not stream.
+    StreamUnavailable,
 }
 
 /// One budget per user turn, never per tool call.
@@ -610,7 +621,7 @@ impl AgentRuntime {
         history: Vec<ChatMessage>,
         confirm: &dyn Confirmer,
         mut event_sink: impl FnMut(&str) + Send,
-        mut on_message: impl FnMut(&ChatMessage),
+        mut on_message: impl FnMut(&ChatMessage, crate::session::MessageStatus),
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let summarizer: std::sync::Arc<dyn crate::tui::compact::Summarizer> = match &self.summarizer
         {
@@ -649,37 +660,77 @@ impl AgentRuntime {
                 self.security.root(),
             );
 
-            let response = match self
-                .backend
-                .send(&self.config.model, chat_req.clone(), Some(&chat_options))
-                .await
-            {
+            // First attempt: a stream when the config allows it, one plain
+            // request otherwise. Both share the turn's single retry.
+            let mut got_delta = false;
+            let mut received = String::new();
+            let first = if self.config.stream {
+                let mut on_delta = |delta: StreamDelta| {
+                    got_delta = true;
+                    retry.note_output();
+                    match delta {
+                        StreamDelta::Token(token) => {
+                            received.push_str(&token);
+                            event_sink(&format!("TOKEN:{token}"));
+                        }
+                        StreamDelta::Thinking(thoughts) => {
+                            event_sink(&format!("THINKING:{thoughts}"));
+                        }
+                    }
+                };
+                self.backend
+                    .stream(
+                        &self.config.model,
+                        chat_req.clone(),
+                        Some(&chat_options),
+                        &mut on_delta,
+                    )
+                    .await
+            } else {
+                self.backend
+                    .send(&self.config.model, chat_req.clone(), Some(&chat_options))
+                    .await
+            };
+
+            let response = match first {
                 Ok(response) => response,
+                Err(error) if got_delta => {
+                    // Output already left the sink: persisted, never resent.
+                    if !received.trim().is_empty() {
+                        on_message(
+                            &ChatMessage::assistant(&received),
+                            crate::session::MessageStatus::Partial,
+                        );
+                    }
+                    return Err(error);
+                }
                 Err(error) => {
                     // One retry per turn, on the first identified trigger only.
                     let trigger = classify_failure(error.as_ref());
-                    match trigger {
-                        Some(trigger) if retry.spend(trigger) => {
-                            chat_req = match trigger {
-                                RetryTrigger::ReplayRejection => halve_turns(&chat_req),
-                                RetryTrigger::CapacityError => {
-                                    self.aggressive_request(
-                                        &retry_history,
-                                        task,
-                                        mode,
-                                        &*summarizer,
-                                    )
-                                    .await
-                                }
-                            };
-                            // A failure here is the turn's failure: it never
-                            // buys a second retry.
-                            self.backend
-                                .send(&self.config.model, chat_req.clone(), Some(&chat_options))
-                                .await?
-                        }
-                        _ => return Err(error),
+                    let spent = match trigger {
+                        Some(trigger) => retry.spend(trigger),
+                        // A stream that produced nothing may still answer
+                        // unstreamed; that attempt is the same single retry.
+                        None => self.config.stream && retry.spend(RetryTrigger::StreamUnavailable),
+                    };
+                    if !spent {
+                        return Err(error);
                     }
+                    if let Some(trigger) = trigger {
+                        chat_req = match trigger {
+                            RetryTrigger::ReplayRejection => halve_turns(&chat_req),
+                            RetryTrigger::CapacityError => {
+                                self.aggressive_request(&retry_history, task, mode, &*summarizer)
+                                    .await
+                            }
+                            RetryTrigger::StreamUnavailable => chat_req.clone(),
+                        };
+                    }
+                    // A failure here is the turn's failure: it never buys a
+                    // second retry.
+                    self.backend
+                        .send(&self.config.model, chat_req.clone(), Some(&chat_options))
+                        .await?
                 }
             };
 
@@ -703,7 +754,10 @@ impl AgentRuntime {
 
                 // The filler is not model output: only real text is reported.
                 if !final_text.trim().is_empty() {
-                    on_message(&ChatMessage::assistant(&final_text));
+                    on_message(
+                        &ChatMessage::assistant(&final_text),
+                        crate::session::MessageStatus::Complete,
+                    );
                 }
 
                 let return_text = if !final_text.trim().is_empty() {
@@ -729,7 +783,7 @@ impl AgentRuntime {
 
             let assistant_msg = response.clone().into_assistant_message_for_tool_use();
             if let Some(msg) = assistant_msg {
-                on_message(&msg);
+                on_message(&msg, crate::session::MessageStatus::Complete);
                 chat_req = chat_req.append_message(msg);
             }
 
@@ -819,7 +873,7 @@ impl AgentRuntime {
 
                 let tool_message =
                     ChatMessage::from(ToolResponse::new(call.call_id.clone(), result_str));
-                on_message(&tool_message);
+                on_message(&tool_message, crate::session::MessageStatus::Complete);
                 chat_req = chat_req.append_message(tool_message);
             }
         }
@@ -838,7 +892,10 @@ impl AgentRuntime {
 
         let final_text = response.into_first_text().unwrap_or_default();
         if !final_text.trim().is_empty() {
-            on_message(&ChatMessage::assistant(&final_text));
+            on_message(
+                &ChatMessage::assistant(&final_text),
+                crate::session::MessageStatus::Complete,
+            );
             Ok(final_text)
         } else {
             Ok(
@@ -1228,3 +1285,7 @@ mod mode_policy_tests {
         assert!(prompt.contains(PLAN_POLICY));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/core/streaming.rs"]
+mod streaming_tests;

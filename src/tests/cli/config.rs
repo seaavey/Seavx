@@ -181,6 +181,7 @@ fn config_writer_preserves_comments_and_unknown_keys() {
         permitted_actions: Vec::new(),
         reasoning_effort: None,
         system_prompt: None,
+        stream: true,
     };
     write_agent_config(&path, &config).unwrap();
     let text = stash_written_config(&path);
@@ -523,6 +524,7 @@ fn agent_config(model: &str) -> AgentConfig {
         system_prompt: None,
         tool_permissions: "ask".to_string(),
         permitted_actions: Vec::new(),
+        stream: true,
     }
 }
 

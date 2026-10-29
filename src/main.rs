@@ -161,12 +161,14 @@ async fn main() -> anyhow::Result<()> {
                     &agent::permissions::DenyingConfirmer,
                     |evt| {
                         // Reasoning blocks are a TUI concern; headless runs skip them.
-                        if !evt.starts_with("THINKING:") {
+                        if let Some(token) = evt.strip_prefix("TOKEN:") {
+                            print!("{token}");
+                        } else if !evt.starts_with("THINKING:") {
                             println!("{evt}");
                         }
                     },
                     // `seavx exec` stays session-free: no row is ever written.
-                    |_| {},
+                    |_, _| {},
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;

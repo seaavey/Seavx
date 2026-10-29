@@ -500,7 +500,7 @@ mod engine_seam {
                 history,
                 &DenyingConfirmer,
                 |_| {},
-                |message| reported.push(message.clone()),
+                |message, _| reported.push(message.clone()),
             )
             .await
             .unwrap();
@@ -550,7 +550,7 @@ mod engine_seam {
                 history,
                 &DenyingConfirmer,
                 |_| {},
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -849,11 +849,13 @@ mod retry_budget {
         backend: &FakeBackend,
         summarizer: std::sync::Arc<CountingSummarizer>,
         workspace: &std::path::Path,
+        stream: bool,
     ) -> AgentRuntime {
         let mut config = AgentConfig::load(workspace);
         config.model = "deepseek-chat".to_string();
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
+        config.stream = stream;
         AgentRuntime::with_backend(
             config,
             WorkspaceSecurity::new(workspace),
@@ -881,7 +883,7 @@ mod retry_budget {
         let summarizer = std::sync::Arc::new(CountingSummarizer {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let runtime = runtime(&fake, summarizer.clone(), temp.path());
+        let runtime = runtime(&fake, summarizer.clone(), temp.path(), true);
 
         let answer = runtime
             .execute_task(
@@ -890,7 +892,7 @@ mod retry_budget {
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
                 |_| {},
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -921,7 +923,9 @@ mod retry_budget {
         let summarizer = std::sync::Arc::new(CountingSummarizer {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let runtime = runtime(&fake, summarizer, temp.path());
+        // The non-streaming path: the streaming fallback is its own row of the
+        // retry table and is covered by `tests/core/streaming.rs`.
+        let runtime = runtime(&fake, summarizer, temp.path(), false);
 
         let error = runtime
             .execute_task(
@@ -930,7 +934,7 @@ mod retry_budget {
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
                 |_| {},
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap_err();
@@ -948,7 +952,7 @@ mod retry_budget {
         let summarizer = std::sync::Arc::new(CountingSummarizer {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let runtime = runtime(&fake, summarizer, temp.path());
+        let runtime = runtime(&fake, summarizer, temp.path(), true);
 
         let error = runtime
             .execute_task(
@@ -957,7 +961,7 @@ mod retry_budget {
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
                 |_| {},
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap_err();
@@ -1048,7 +1052,7 @@ mod repeated_actions {
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
                 |_| {},
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -1096,7 +1100,7 @@ mod backend_seam {
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
                 |_| {},
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap();

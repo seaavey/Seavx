@@ -1136,6 +1136,10 @@ pub async fn run_agent_worker(
         let tx_clone = tx.clone();
         let row_store = store.clone();
         let row_tx = tx.clone();
+        // Set by the first streamed token: the answer is already on screen, so
+        // the turn must not append it a second time.
+        let streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let streamed_evt = streamed.clone();
         let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
         let result = runtime
             .execute_task(
@@ -1154,6 +1158,14 @@ pub async fn run_agent_worker(
                                 prompt_tokens: prompt,
                             });
                         }
+                    } else if let Some(token) = evt.strip_prefix("TOKEN:") {
+                        let first = !streamed_evt.swap(true, std::sync::atomic::Ordering::Relaxed);
+                        let frame = if first {
+                            format!("\n\n{token}")
+                        } else {
+                            token.to_string()
+                        };
+                        let _ = tx_clone.send(Action::AgentToken(frame));
                     } else if evt.starts_with("Tool: ") {
                         let tool_label = evt.strip_prefix("Tool: ").unwrap_or(evt);
                         let _ = tx_clone.send(Action::AgentToolStart(tool_label.to_string()));
@@ -1164,14 +1176,12 @@ pub async fn run_agent_worker(
                     }
                 },
                 // The single persistence channel: every appended message, once.
-                move |message| {
+                move |message, status| {
                     let (Some(handle), Some(id)) = (&row_store, session_id) else {
                         return;
                     };
                     let guard = lock_store(handle);
-                    if let Err(error) =
-                        guard.record_message(id, message, crate::session::MessageStatus::Complete)
-                    {
+                    if let Err(error) = guard.record_message(id, message, status) {
                         let _ = row_tx.send(Action::SessionFailed(format!(
                             "Session history disabled: {error}"
                         )));
@@ -1182,9 +1192,13 @@ pub async fn run_agent_worker(
 
         match result {
             Ok(answer) => {
-                let clean_answer = answer.trim();
-                if !clean_answer.is_empty() {
-                    let _ = tx.send(Action::AgentToken(format!("\n\n{clean_answer}\n")));
+                if streamed.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send(Action::AgentToken("\n".to_string()));
+                } else {
+                    let clean_answer = answer.trim();
+                    if !clean_answer.is_empty() {
+                        let _ = tx.send(Action::AgentToken(format!("\n\n{clean_answer}\n")));
+                    }
                 }
             }
             Err(e) => {
