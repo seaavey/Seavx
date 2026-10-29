@@ -1001,3 +1001,66 @@ mod retry_budget {
         );
     }
 }
+
+#[cfg(test)]
+mod repeated_actions {
+    use super::engine_seam::{FakeBackend, response};
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
+    use crate::agent::security::WorkspaceSecurity;
+    use genai::chat::{ChatMessage, MessageContent};
+
+    fn tool_call(call_id: &str, name: &str, path: &str) -> genai::chat::ToolCall {
+        serde_json::from_value(serde_json::json!({
+            "call_id": call_id,
+            "fn_name": name,
+            "fn_arguments": { "path": path },
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_repeated_call_stops_the_loop_with_a_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        for call_id in ["call_one", "call_two", "call_three"] {
+            fake.push(response(MessageContent::from_tool_calls(vec![tool_call(
+                call_id,
+                "list_directory",
+                ".",
+            )])));
+        }
+
+        let mut config = AgentConfig::load(temp.path());
+        config.model = "fake-model".to_string();
+        config.max_turns = 10;
+        config.system_prompt = Some("system prompt".to_string());
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let result = runtime
+            .execute_task(
+                "look around",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                |_| {},
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.starts_with("stopped: list_directory("),
+            "the reason names the tool and its arguments: {result}"
+        );
+        assert!(result.contains("repeated twice"), "{result}");
+        assert_eq!(
+            fake.requests().len(),
+            2,
+            "the loop stops instead of asking a third time"
+        );
+    }
+}

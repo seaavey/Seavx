@@ -28,7 +28,7 @@ const DEFAULT_MODEL: &str = "openai/gpt-4o-mini";
 pub const PERMISSION_MODES: [&str; 3] = ["deny", "ask", "allow"];
 /// Action kinds `permitted_actions` may lift from `ask` to `allow`.
 pub const LIFTABLE_ACTIONS: [&str; 2] = ["execute", "network"];
-const DEFAULT_MAX_TURNS: i64 = 1000;
+const DEFAULT_MAX_TURNS: i64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKey {

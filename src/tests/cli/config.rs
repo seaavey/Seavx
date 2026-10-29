@@ -53,7 +53,7 @@ fn set_on_missing_file_writes_a_loadable_config() {
     let (config, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
     assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
     assert_eq!(config.model, "new-model");
-    assert_eq!(config.max_turns, 1000);
+    assert_eq!(config.max_turns, 100, "new files default to 100 turns");
 }
 
 #[test]
@@ -745,4 +745,40 @@ fn permissions_keys_survive_an_unrelated_write() {
     assert!(text.contains("tool_permissions = \"allow\""), "{text}");
     assert!(text.contains("permitted_actions = [\"execute\"]"), "{text}");
     assert!(text.contains("# keep"), "{text}");
+}
+
+#[test]
+fn a_new_config_writes_one_hundred_turns() {
+    let temp = tempdir().unwrap();
+    let (path, created) = init_workspace(temp.path()).unwrap();
+    assert!(created);
+
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("max_turns = 100"),
+        "a new config defaults to 100 turns: {text}"
+    );
+    let config = AgentConfig::load(temp.path());
+    assert_eq!(config.max_turns, 100);
+}
+
+#[test]
+fn an_existing_value_of_one_thousand_is_kept() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join(".seavx/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        "model = \"old\"\nmax_turns = 1000\ntool_permissions = \"ask\"\npermitted_actions = []\n",
+    )
+    .unwrap();
+
+    set_value(&path, ConfigKey::Model, "new-model").unwrap();
+
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("max_turns = 1000"),
+        "the user's value is never rewritten: {text}"
+    );
+    assert_eq!(AgentConfig::load(temp.path()).max_turns, 1000);
 }

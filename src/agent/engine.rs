@@ -53,6 +53,9 @@ pub(crate) fn with_mode_policy(mut prompt: String, mode: AgentMode) -> String {
 /// TUI modal, the CLI prompts and `parse_reasoning_effort`.
 pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx", "max"];
 
+/// Turn budget a new config starts with. An existing file keeps its own value.
+pub const DEFAULT_MAX_TURNS: usize = 100;
+
 /// Endpoint used when the config does not set `base_url`.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
 
@@ -144,7 +147,7 @@ impl AgentConfig {
         let reasoning_effort = env("SEAVX_REASONING_EFFORT");
         Self {
             model,
-            max_turns: 1000,
+            max_turns: DEFAULT_MAX_TURNS,
             base_url,
             api_key,
             reasoning_effort,
@@ -660,6 +663,10 @@ impl AgentRuntime {
         // Tool steps of this run, fed to the post-task skill evaluator: the model
         // cannot judge repeatability from the task text alone.
         let mut steps: Vec<String> = Vec::new();
+        // Repeated-action detection: the same call or the same error twice ends
+        // the loop instead of burning the turn budget.
+        let mut last_action: Option<String> = None;
+        let mut last_failure: Option<String> = None;
 
         for turn in 0..self.config.max_turns {
             tracing::debug!(turn = turn, "Executing chat request");
@@ -761,6 +768,13 @@ impl AgentRuntime {
 
             for call in owned_calls {
                 let tool_name = &call.fn_name;
+                let signature = format!("{tool_name}({})", call.fn_arguments);
+                if last_action.as_deref() == Some(signature.as_str()) {
+                    tracing::warn!(action = %security::redact(&signature), "repeated action stopped the loop");
+                    return Ok(format!("stopped: {signature} repeated twice"));
+                }
+                last_action = Some(signature);
+
                 let args_summary = match &call.fn_arguments {
                     serde_json::Value::Object(map) => {
                         let parts: Vec<String> = map
@@ -812,6 +826,17 @@ impl AgentRuntime {
 
                 let result_str = security::redact(&result_str);
                 Self::log_tool_result(tool_name, is_err, &result_str);
+
+                if is_err {
+                    if last_failure.as_deref() == Some(result_str.as_str()) {
+                        return Ok(format!(
+                            "stopped: the same error repeated twice: {result_str}"
+                        ));
+                    }
+                    last_failure = Some(result_str.clone());
+                } else {
+                    last_failure = None;
+                }
 
                 // Emit preview snippet of tool output (first 3 lines or 150 chars)
                 let preview = result_str.lines().take(3).collect::<Vec<_>>().join("\n");
