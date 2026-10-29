@@ -144,3 +144,69 @@ fn exit_code_is_one_only_when_a_check_fails() {
     report.checks[0].status = CheckStatus::Fail;
     assert_eq!(exit_code(&report), 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_planted_symlink_at_the_probe_name_is_not_followed() {
+    let temp = tempdir().unwrap();
+    let target = temp.path().join("target.txt");
+    std::fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, temp.path().join(".probe")).unwrap();
+
+    let error = create_probe(temp.path(), ".probe").unwrap_err();
+    assert!(matches!(error, ProbeError::InUse));
+    assert!(
+        temp.path().join(".probe").is_symlink(),
+        "the planted link survives"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+}
+
+#[test]
+fn a_pre_existing_file_at_the_probe_name_is_left_untouched() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join(".probe");
+    std::fs::write(&path, "keep me").unwrap();
+
+    let error = create_probe(temp.path(), ".probe").unwrap_err();
+    assert!(matches!(error, ProbeError::InUse));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+}
+
+#[test]
+fn a_failing_cleanup_is_reported() {
+    let temp = tempdir().unwrap();
+    let probe = create_probe(temp.path(), ".probe").unwrap();
+
+    // A file replaced under the same name is not the one this check created:
+    // removing it would destroy somebody else's data.
+    let replacement = temp.path().join("replacement");
+    std::fs::write(&replacement, "theirs").unwrap();
+    std::fs::rename(&replacement, temp.path().join(".probe")).unwrap();
+
+    let error = remove_probe(probe).unwrap_err();
+    assert!(error.contains("no longer the file"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".probe")).unwrap(),
+        "theirs",
+        "the replacement is left alone"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_probe_is_owner_only_and_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let probe = create_probe(temp.path(), ".probe").unwrap();
+    let mode = std::fs::metadata(temp.path().join(".probe"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the probe is owner-only");
+
+    remove_probe(probe).unwrap();
+    assert!(!temp.path().join(".probe").exists());
+}

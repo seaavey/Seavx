@@ -209,18 +209,106 @@ fn workspace_check(workspace_root: &Path) -> CheckResult {
         );
     }
 
-    let probe = directory.join(format!(".doctor-{}", std::process::id()));
-    if let Err(error) = std::fs::write(&probe, b"ok") {
-        let _ = std::fs::remove_file(&probe);
-        return fail("workspace", format!("not writable: {error}"));
+    let probe = match create_probe(&directory, &probe_name()) {
+        Ok(probe) => probe,
+        Err(ProbeError::InUse) => return warn("workspace", "probe name in use; not overwritten"),
+        Err(ProbeError::Failed(detail)) => {
+            return fail("workspace", format!("not writable: {detail}"));
+        }
+    };
+    if let Err(error) = remove_probe(probe) {
+        return fail("workspace", error);
     }
-    let _ = std::fs::remove_file(&probe);
 
     if existed {
         ok("workspace", "writable")
     } else {
         warn("workspace", "created `.seavx` during check")
     }
+}
+
+/// A name no other run can hold: this process, this instant.
+pub(crate) fn probe_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!(".{}-{nanos}", std::process::id())
+}
+
+/// A probe file this run created, identified by the filesystem's own handle.
+#[derive(Debug)]
+pub(crate) struct Probe {
+    path: PathBuf,
+    id: FileId,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileId(u64, u64);
+
+fn file_id(metadata: &std::fs::Metadata) -> FileId {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        FileId(metadata.dev(), metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        FileId(metadata.len(), 0)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ProbeError {
+    /// Something is already at that name: never followed, never overwritten.
+    InUse,
+    Failed(String),
+}
+
+/// Create the probe exclusively and owner-only. `create_new` is what makes a
+/// planted symlink or file a `WARN` instead of a write through it.
+pub(crate) fn create_probe(directory: &Path, name: &str) -> Result<Probe, ProbeError> {
+    let path = directory.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ProbeError::InUse);
+        }
+        Err(error) => return Err(ProbeError::Failed(error.to_string())),
+    };
+    let id = file
+        .metadata()
+        .map(|metadata| file_id(&metadata))
+        .map_err(|error| ProbeError::Failed(error.to_string()))?;
+    use std::io::Write;
+    file.write_all(b"ok")
+        .map_err(|error| ProbeError::Failed(error.to_string()))?;
+    drop(file);
+
+    Ok(Probe { path, id })
+}
+
+/// Remove exactly the file this run created: a same-named replacement is left
+/// alone, and a failed cleanup is reported instead of hidden.
+pub(crate) fn remove_probe(probe: Probe) -> Result<(), String> {
+    let current = std::fs::metadata(&probe.path)
+        .map(|metadata| file_id(&metadata))
+        .map_err(|error| format!("probe cleanup failed: {error}"))?;
+    if current != probe.id {
+        return Err(format!(
+            "probe cleanup refused: {} is no longer the file this check created",
+            display_path(&probe.path)
+        ));
+    }
+    std::fs::remove_file(&probe.path).map_err(|error| format!("probe cleanup failed: {error}"))
 }
 
 fn memory_check(options: &DoctorOptions) -> CheckResult {
