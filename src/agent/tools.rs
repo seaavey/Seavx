@@ -345,46 +345,110 @@ impl AgentTool for RunCommandTool {
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<RunCommandArgs>(args)?;
+        let class = crate::agent::shell::classify(&parsed.command, security);
 
-        let blocked = ["rm -rf /", ":(){ :|:& };:"];
-        for b in &blocked {
-            if parsed.command.contains(b) {
-                return Err("Command refused by security policy".to_string());
-            }
+        // The engine already refused this through the matrix; the belt exists so a
+        // caller that skips the engine still cannot run it.
+        if class.kind == ActionKind::Destructive {
+            return Err("Command refused by security policy".to_string());
         }
 
-        // Windows has no `sh`; `cmd /C` runs the same command through the system shell.
-        #[cfg(windows)]
-        let mut shell = {
-            let mut cmd = tokio::process::Command::new("cmd");
-            cmd.arg("/C");
-            cmd
+        let output = run_shell(&parsed.command, security, COMMAND_TIMEOUT).await?;
+        let stdout = cap_stream(&String::from_utf8_lossy(&output.stdout));
+        let stderr = cap_stream(&String::from_utf8_lossy(&output.stderr));
+
+        // A recursive read names a directory, so its lines are filtered: the
+        // policy cannot see the files it walked.
+        let recursive = class.segments.iter().any(|segment| {
+            crate::agent::shell::RECURSIVE_READERS.contains(&segment.program.as_str())
+        });
+        let (stdout, withheld) = if recursive {
+            crate::agent::shell::filter_output(&stdout, security)
+        } else {
+            (stdout, 0)
         };
-        #[cfg(not(windows))]
-        let mut shell = {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c");
-            cmd
-        };
+        let _ = withheld;
 
-        let cmd = shell
-            .arg(&parsed.command)
-            .current_dir(security.root())
-            .output();
-
-        let output = tokio::time::timeout(std::time::Duration::from_secs(30), cmd)
-            .await
-            .map_err(|_| "Command execution timed out (30s limit)".to_string())?
-            .map_err(|e| format!("Process execution failed: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
         let status = output.status.code().unwrap_or(-1);
-
-        Ok(format!(
-            "exit: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        ))
+        let text = format!("exit: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        Ok(crate::agent::security::redact(&text))
     }
+}
+
+/// Wall-clock ceiling for one command; the child is killed when it expires.
+pub(crate) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-stream ceiling, split evenly between the head and the tail.
+const STREAM_CAP: usize = 32 * 1024;
+const STREAM_HALF: usize = 16 * 1024;
+
+/// Run one command with a cleared environment: a tool call cannot read the
+/// agent's own `SEAVX_*` variables, and the child dies with the future.
+pub(crate) async fn run_shell(
+    command: &str,
+    security: &WorkspaceSecurity,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    // Windows has no `sh`; `cmd /C` runs the same command through the system shell.
+    #[cfg(windows)]
+    let mut shell = {
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C");
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut shell = {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c");
+        cmd
+    };
+
+    shell
+        .arg(command)
+        .current_dir(security.root())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env_clear()
+        .kill_on_drop(true);
+    for name in ["PATH", "LANG", "TERM"] {
+        if let Ok(value) = std::env::var(name) {
+            shell.env(name, value);
+        }
+    }
+    // Most tooling breaks without `HOME`; the agent's own variables never pass.
+    if let Some(home) = crate::home::dir() {
+        shell.env("HOME", home);
+    }
+
+    let child = shell
+        .spawn()
+        .map_err(|e| format!("Process execution failed: {e}"))?;
+    match tokio::time::timeout(limit, child.wait_with_output()).await {
+        Err(_) => Err(format!(
+            "Command execution timed out ({}s limit)",
+            limit.as_secs()
+        )),
+        Ok(Err(error)) => Err(format!("Process execution failed: {error}")),
+        Ok(Ok(output)) => Ok(output),
+    }
+}
+
+/// Keep a bounded head and tail so a chatty command cannot flood the context.
+fn cap_stream(text: &str) -> String {
+    if text.len() <= STREAM_CAP {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(STREAM_HALF).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(STREAM_HALF)
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let omitted = text.len().saturating_sub(head.len() + tail.len());
+    format!("{head}\n[{omitted} bytes omitted]\n{tail}")
 }
 
 // 6. search_files

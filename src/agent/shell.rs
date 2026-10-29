@@ -486,3 +486,33 @@ fn resolve(home: Option<&Path>, token: &str, security: &WorkspaceSecurity) -> Op
         Some(security.root().join(path))
     }
 }
+
+/// Drop lines whose leading `path:` prefix the policy refuses, and lines that
+/// cannot be read as a path prefix at all. Measured per line, so the shell may
+/// still read those bytes — their content never reaches the conversation.
+pub fn filter_output(text: &str, security: &WorkspaceSecurity) -> (String, usize) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut withheld = 0usize;
+    for line in text.lines() {
+        let prefix = line.split(':').next().unwrap_or_default().trim();
+        let allowed = !prefix.is_empty() && {
+            let path = if Path::new(prefix).is_absolute() {
+                PathBuf::from(prefix)
+            } else {
+                security.root().join(prefix)
+            };
+            check_file(&path).is_ok()
+        };
+        if allowed {
+            kept.push(line);
+        } else {
+            withheld += 1;
+        }
+    }
+
+    let mut out = kept.join("\n");
+    if withheld > 0 {
+        out.push_str(&format!("\n[{withheld} lines withheld by policy]"));
+    }
+    (out, withheld)
+}

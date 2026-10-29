@@ -265,3 +265,87 @@ async fn tool_output_and_logs_never_contain_a_fake_key() {
         "request.log kept the key: {request}"
     );
 }
+
+#[tokio::test]
+async fn command_output_is_capped_and_environment_is_cleared() {
+    let (_temp, _root, security) = prepare().await;
+    let registry = ToolRegistry::with_default_tools();
+    let run = |command: &'static str| {
+        let security = security.clone();
+        let tool = ToolRegistry::with_default_tools();
+        async move {
+            tool.get("run_command")
+                .unwrap()
+                .execute(json!({ "command": command }), &security)
+                .await
+        }
+    };
+    let _ = &registry;
+
+    let big = run("yes x | head -c 200000").await.unwrap();
+    assert!(
+        big.contains("bytes omitted"),
+        "a 200 KB stream must be capped: {}",
+        &big[big.len().saturating_sub(120)..]
+    );
+
+    // SAFETY: this test owns the variable for its lifetime; nothing else in the
+    // suite reads it.
+    unsafe { std::env::set_var("SEAVX_API_KEY", "sk-live-test") };
+    let echoed = run("printf '%s' \"$SEAVX_API_KEY\"").await.unwrap();
+    unsafe { std::env::remove_var("SEAVX_API_KEY") };
+    assert!(
+        !echoed.contains("sk-live-test"),
+        "the agent's environment reached the child: {echoed}"
+    );
+    assert!(echoed.contains("stdout:"), "{echoed}");
+}
+
+#[tokio::test]
+async fn recursive_search_output_withholds_protected_lines() {
+    let (_temp, root, security) = prepare().await;
+    for rel in ["deploy.pem", ".env", ".git/config"] {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "PRIVATE_KEY here\n").unwrap();
+    }
+    std::fs::write(root.join("notes.md"), "PRIVATE_KEY here\n").unwrap();
+
+    let output = ToolRegistry::with_default_tools()
+        .get("run_command")
+        .unwrap()
+        .execute(json!({ "command": "grep -rn PRIVATE_KEY ." }), &security)
+        .await
+        .unwrap();
+
+    assert!(
+        output.contains("notes.md"),
+        "an ordinary hit must stay: {output}"
+    );
+    for leaked in ["deploy.pem", ".env", ".git"] {
+        assert!(!output.contains(leaked), "{leaked} leaked: {output}");
+    }
+    assert!(
+        output.contains("lines withheld by policy"),
+        "unexpected output: {output}"
+    );
+}
+
+#[tokio::test]
+async fn a_command_outliving_its_timeout_leaves_no_child() {
+    let (_temp, root, security) = prepare().await;
+    let pid_file = root.join("child.pid");
+    let command = format!("echo $$ > {}; exec sleep 60", pid_file.display());
+
+    let result = super::run_shell(&command, &security, std::time::Duration::from_millis(300)).await;
+    assert!(result.is_err(), "the timeout must be reported");
+
+    let pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
+    let pid = pid.trim();
+    assert!(!pid.is_empty(), "the child never started");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "child {pid} survived the timeout"
+    );
+}
