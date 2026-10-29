@@ -349,3 +349,82 @@ async fn a_command_outliving_its_timeout_leaves_no_child() {
         "child {pid} survived the timeout"
     );
 }
+
+#[tokio::test]
+async fn ambiguous_snippet_is_refused_with_count_and_samples() {
+    let (_temp, root, security) = prepare().await;
+    std::fs::write(root.join("notes.txt"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+    let before = std::fs::read(root.join("notes.txt")).unwrap();
+
+    let error = ToolRegistry::with_default_tools()
+        .get("edit_file")
+        .unwrap()
+        .execute(
+            json!({ "path": "notes.txt", "old_string": "fn", "new_string": "pub fn" }),
+            &security,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("old_string occurs 3 times"), "{error}");
+    assert!(error.contains("line 1: fn a() {}"), "{error}");
+    assert!(
+        error.matches("line ").count() <= 3,
+        "at most three samples: {error}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("notes.txt")).unwrap(),
+        before,
+        "a refused edit must not touch the file"
+    );
+}
+
+#[tokio::test]
+async fn replace_all_changes_every_occurrence() {
+    let (_temp, root, security) = prepare().await;
+    std::fs::write(root.join("notes.txt"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+
+    let result = ToolRegistry::with_default_tools()
+        .get("edit_file")
+        .unwrap()
+        .execute(
+            json!({ "path": "notes.txt", "old_string": "fn", "new_string": "pub fn", "replace_all": true }),
+            &security,
+        )
+        .await
+        .unwrap();
+
+    let text = std::fs::read_to_string(root.join("notes.txt")).unwrap();
+    assert_eq!(text, "pub fn a() {}\npub fn b() {}\npub fn c() {}\n");
+    assert!(result.contains('3'), "the count must be reported: {result}");
+}
+
+#[tokio::test]
+async fn an_empty_old_string_and_a_noop_edit_are_handled() {
+    let (_temp, root, security) = prepare().await;
+    std::fs::write(root.join("notes.txt"), "one line\n").unwrap();
+    let tool = ToolRegistry::with_default_tools();
+    let edit_file = tool.get("edit_file").unwrap();
+
+    let error = edit_file
+        .execute(
+            json!({ "path": "notes.txt", "old_string": "", "new_string": "x" }),
+            &security,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("must not be empty"), "{error}");
+
+    let result = edit_file
+        .execute(
+            json!({ "path": "notes.txt", "old_string": "one line", "new_string": "one line" }),
+            &security,
+        )
+        .await
+        .unwrap();
+    assert!(result.to_lowercase().contains("no change"), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "one line\n"
+    );
+}

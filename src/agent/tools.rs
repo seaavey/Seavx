@@ -107,26 +107,53 @@ fn capture_checkpoint(security: &WorkspaceSecurity, path: &Path) -> Result<(), S
     .map_err(|error| format!("Checkpoint failed: {error}"))
 }
 
-/// Read a file, replace the first occurrence of `old_string`, and write it back.
-/// Shared core of `edit_file` and `skill_patch`; `ctx` labels the target in errors.
-async fn replace_first(
+/// Replace `old_string` and write the file back, returning how many occurrences
+/// changed. A snippet that occurs more than once is refused unless `replace_all`
+/// is set: silently editing the first match edits the wrong place.
+async fn replace_unique(
     path: &Path,
     old_string: &str,
     new_string: &str,
+    replace_all: bool,
     ctx: &str,
-) -> Result<(), String> {
+) -> Result<usize, String> {
+    if old_string.is_empty() {
+        return Err("old_string must not be empty".to_string());
+    }
+
     let content = crate::agent::security::read_verified(path)
         .await
         .map_err(|e| format!("Failed to read {ctx} for editing: {e}"))?;
 
-    if !content.contains(old_string) {
+    let occurrences = content.matches(old_string).count();
+    if occurrences == 0 {
         return Err(format!("Target old_string not found in {ctx}"));
     }
+    if occurrences > 1 && !replace_all {
+        let samples: Vec<String> = content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(old_string))
+            .take(3)
+            .map(|(index, line)| format!("line {}: {}", index + 1, line.trim()))
+            .collect();
+        return Err(format!(
+            "old_string occurs {occurrences} times in {ctx}; add context or pass replace_all\n{}",
+            samples.join("\n")
+        ));
+    }
 
-    let updated = content.replacen(old_string, new_string, 1);
+    // An identical replacement is a noted no-op, not a rewrite of the same bytes.
+    if old_string == new_string {
+        return Ok(0);
+    }
+
+    let count = if replace_all { occurrences } else { 1 };
+    let updated = content.replacen(old_string, new_string, count);
     crate::agent::security::check_write_target(path)?;
     write_atomic(path, updated.as_bytes(), ModePolicy::Preserve)
-        .map_err(|e| format!("Failed to save {ctx} edit: {e}"))
+        .map_err(|e| format!("Failed to save {ctx} edit: {e}"))?;
+    Ok(count)
 }
 
 // 1. read_file
@@ -229,6 +256,9 @@ struct EditFileArgs {
     path: String,
     old_string: String,
     new_string: String,
+    /// Replace every occurrence instead of refusing an ambiguous snippet.
+    #[serde(default)]
+    replace_all: bool,
 }
 
 pub struct EditFileTool;
@@ -251,8 +281,22 @@ impl AgentTool for EditFileTool {
         let parsed = parse_args::<EditFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
         capture_checkpoint(security, &path)?;
-        replace_first(&path, &parsed.old_string, &parsed.new_string, "file").await?;
-        Ok(format!("Successfully updated {}", parsed.path))
+        let count = replace_unique(
+            &path,
+            &parsed.old_string,
+            &parsed.new_string,
+            parsed.replace_all,
+            "file",
+        )
+        .await?;
+        Ok(if count == 0 {
+            format!("No change to {}: old_string equals new_string", parsed.path)
+        } else {
+            format!(
+                "Successfully updated {} ({count} replacement(s))",
+                parsed.path
+            )
+        })
     }
 }
 
@@ -877,8 +921,25 @@ impl AgentTool for SkillPatchTool {
         let parsed = parse_args::<SkillPatchArgs>(args)?;
         let path = find_skill_file(security, &parsed.name)?;
         capture_checkpoint(security, &path)?;
-        replace_first(&path, &parsed.old_string, &parsed.new_string, "skill").await?;
-        Ok(format!("Successfully patched {}", parsed.name))
+        let count = replace_unique(
+            &path,
+            &parsed.old_string,
+            &parsed.new_string,
+            false,
+            "skill",
+        )
+        .await?;
+        Ok(if count == 0 {
+            format!(
+                "No change to skill {}: old_string equals new_string",
+                parsed.name
+            )
+        } else {
+            format!(
+                "Successfully patched {} ({count} replacement(s))",
+                parsed.name
+            )
+        })
     }
 }
 
