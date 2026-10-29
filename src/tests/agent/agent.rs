@@ -384,7 +384,8 @@ mod test_cases {
 
 #[cfg(test)]
 mod engine_seam {
-    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime, ChatBackend};
+    use crate::agent::backend::ChatBackend;
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
     use crate::agent::permissions::DenyingConfirmer;
     use crate::agent::security::WorkspaceSecurity;
     use genai::adapter::AdapterKind;
@@ -1062,5 +1063,45 @@ mod repeated_actions {
             2,
             "the loop stops instead of asking a third time"
         );
+    }
+}
+
+#[cfg(test)]
+mod backend_seam {
+    use super::engine_seam::{FakeBackend, response};
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
+    use crate::agent::security::WorkspaceSecurity;
+    use genai::chat::{ChatMessage, MessageContent};
+
+    #[tokio::test]
+    async fn the_engine_reaches_the_provider_through_the_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_text("through the seam")));
+
+        let mut config = AgentConfig::load(temp.path());
+        config.model = "fake-model".to_string();
+        config.max_turns = 2;
+        config.system_prompt = Some("system prompt".to_string());
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let answer = runtime
+            .execute_task(
+                "do it",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                |_| {},
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answer, "through the seam");
+        assert_eq!(fake.requests().len(), 1, "exactly one backend call");
     }
 }

@@ -1,3 +1,4 @@
+use crate::agent::backend::{ChatBackend, GenaiBackend};
 use crate::agent::permissions::{
     self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
 };
@@ -6,9 +7,7 @@ use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
 use genai::Client;
 use genai::adapter::AdapterKind;
-use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, ChatResponse, ReasoningEffort, ToolResponse,
-};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort, ToolResponse};
 use genai::resolver::{AuthData, Endpoint};
 
 use serde::{Deserialize, Serialize};
@@ -394,34 +393,6 @@ fn apply_env_overrides(
     }
 }
 
-/// One request, one response. The only place the engine talks to a provider, so
-/// a test can script turns without a network.
-#[async_trait::async_trait]
-pub trait ChatBackend: Send + Sync {
-    async fn send(
-        &self,
-        model: &str,
-        request: ChatRequest,
-        options: Option<&ChatOptions>,
-    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>>;
-}
-
-struct GenaiBackend {
-    client: Client,
-}
-
-#[async_trait::async_trait]
-impl ChatBackend for GenaiBackend {
-    async fn send(
-        &self,
-        model: &str,
-        request: ChatRequest,
-        options: Option<&ChatOptions>,
-    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.client.exec_chat(model, request, options).await?)
-    }
-}
-
 /// What a provider failure is allowed to buy: at most one retry per user turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryTrigger {
@@ -573,9 +544,7 @@ impl AgentRuntime {
         let client = builder
             .build()
             .unwrap_or_else(|_| Client::new().expect("Failed to initialize genai Client"));
-        let backend = Box::new(GenaiBackend {
-            client: client.clone(),
-        });
+        let backend = Box::new(GenaiBackend::new(client.clone()));
         Self {
             client,
             backend,
