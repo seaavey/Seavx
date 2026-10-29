@@ -5,6 +5,7 @@ use crate::agent::cancel::{CancelToken, Cleanup, TurnStatus, cleanup_notice};
 use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
 use crate::agent::permissions::DenyingConfirmer;
 use crate::agent::security::WorkspaceSecurity;
+#[cfg(unix)]
 use crate::agent::tools::run_shell;
 use crate::session::MessageStatus;
 use genai::adapter::AdapterKind;
