@@ -232,6 +232,7 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/config unset [--global] <key>` | Remove one key. |
 | `/plan [on\|off]` | Enter or leave Plan Mode. |
 | `/clear` | Clear the transcript and any compacted context. |
+| `/new` | Alias for `/clear`. |
 | `/help` | Show help and the command palette. |
 | `/init` | Create `.seavx/config.toml` with defaults. |
 | `/doctor [--offline]` | Check config, key, endpoint, cache, workspace, memory, and skills. |
