@@ -1041,6 +1041,35 @@ fn apply_command_effect(
                 let _ = tx.send(Action::DoctorDone(report));
             });
         }
+        CommandEffect::RunSessions { index } => {
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || match index {
+                None => {
+                    let result = crate::session::SessionStore::open()
+                        .map_err(|error| error.to_string())
+                        .and_then(|store| {
+                            crate::cli::sessions::numbered_list_text(
+                                &store,
+                                &crate::session::workspace_key(),
+                            )
+                        });
+                    let _ = tx.send(Action::SessionsListed(result));
+                }
+                Some(number) => {
+                    let result = crate::session::SessionStore::open()
+                        .map_err(|error| error.to_string())
+                        .and_then(|store| {
+                            crate::cli::sessions::resume_by_number(
+                                &store,
+                                &crate::session::workspace_key(),
+                                number,
+                            )
+                        });
+                    let _ = tx.send(Action::SessionResume(result));
+                }
+            });
+        }
         CommandEffect::RunUndo => {
             app.status = AgentState::Checking;
             let tx = tx.clone();
@@ -1846,6 +1875,20 @@ pub async fn start_tui(
                 Action::DoctorDone(report) => {
                     app.status = AgentState::Idle;
                     app.push_notice(crate::cli::doctor::render(&report));
+                }
+                Action::SessionsListed(result) => {
+                    app.status = AgentState::Idle;
+                    match result {
+                        Ok(text) => app.push_notice(text),
+                        Err(error) => app.push_notice(format!("Sessions unavailable: {error}")),
+                    }
+                }
+                Action::SessionResume(result) => {
+                    app.status = AgentState::Idle;
+                    match result {
+                        Ok(session) => app.load_session(session),
+                        Err(error) => app.push_notice(error),
+                    }
                 }
                 Action::UndoDone(result) => {
                     app.status = AgentState::Idle;

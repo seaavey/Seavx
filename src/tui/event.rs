@@ -32,6 +32,10 @@ pub enum Action {
         result: Result<crate::tui::compact::CompactResult, String>,
     },
     UndoDone(Result<Vec<std::path::PathBuf>, String>),
+    /// `/sessions`: the numbered list, or the reason it could not be read.
+    SessionsListed(Result<String, String>),
+    /// `/sessions <n>`: the session to open, or the refusal with its reason.
+    SessionResume(Result<crate::session::LoadedSession, String>),
     /// A tool call needs an answer. The worker blocks on `reply`; dropping it
     /// (quit, panic) resolves as a denial.
     PermissionAsk {

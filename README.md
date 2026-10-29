@@ -238,6 +238,7 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/doctor [--offline]` | Check config, key, endpoint, cache, workspace, memory, and skills. |
 | `/memory [show\|project\|user\|skills\|path]` | Inspect persistent memory and installed skills. |
 | `/undo` | Restore files from the newest checkpoint and remove it; repeat to walk back. |
+| `/sessions [number]` | List this workspace's sessions and resume one by its listed number. |
 | `/exit` | Quit the TUI. |
 
 Permission keys, written by `/config set` and by the permission prompt itself:

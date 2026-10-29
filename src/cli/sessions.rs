@@ -115,6 +115,60 @@ pub fn list_text(store: &SessionStore, workspace: &str) -> Result<String, String
     Ok(out)
 }
 
+/// The TUI's `/sessions` list: numbered in the order `resume <n>` reads.
+pub fn numbered_list_text(store: &SessionStore, workspace: &str) -> Result<String, String> {
+    let summaries = store.list(workspace).map_err(|error| error.to_string())?;
+    if summaries.is_empty() {
+        return Ok(format!(
+            "No sessions yet for {workspace}. Start one by sending a prompt."
+        ));
+    }
+
+    let now = crate::util::epoch_secs() as i64;
+    let mut out = String::from("Sessions (newest first):");
+    for (index, summary) in summaries.iter().enumerate() {
+        out.push_str(&format!(
+            "\n  {}  id {}  {}  {} msgs  {}\n     {}",
+            index + 1,
+            summary.id,
+            relative_age(summary.updated_at, now),
+            summary.messages,
+            summary.state.as_str(),
+            if summary.title.is_empty() {
+                "(untitled)"
+            } else {
+                summary.title.as_str()
+            }
+        ));
+    }
+    out.push_str("\nResume one with /sessions <number>.");
+    Ok(out)
+}
+
+/// Load the session at `number` in the listed order, refusing a read-only one
+/// with its reason instead of opening it.
+pub fn resume_by_number(
+    store: &SessionStore,
+    workspace: &str,
+    number: u32,
+) -> Result<LoadedSession, String> {
+    let summaries = store.list(workspace).map_err(|error| error.to_string())?;
+    let summary = summaries
+        .get(number.saturating_sub(1) as usize)
+        .filter(|_| number > 0)
+        .ok_or_else(|| {
+            format!("No session {number}. Run `/sessions` to list this workspace's sessions.")
+        })?;
+    let session = store.load(summary.id).map_err(|error| error.to_string())?;
+    if let Some(reason) = &session.read_only {
+        return Err(format!(
+            "Session {} is read-only: {reason}. Use /clear to start a new one.",
+            session.id
+        ));
+    }
+    Ok(session)
+}
+
 /// Full transcript with the header the spec asks for: id, title, model,
 /// payload format and usage.
 pub fn show_text(store: &SessionStore, id: i64) -> Result<String, String> {

@@ -25,6 +25,7 @@ pub enum CommandId {
     Doctor,
     Memory,
     Undo,
+    Sessions,
     Exit,
 }
 
@@ -106,6 +107,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         id: CommandId::Undo,
     },
     CommandSpec {
+        name: "/sessions",
+        usage: "/sessions [number]",
+        summary: "List this workspace's sessions and resume one",
+        id: CommandId::Sessions,
+    },
+    CommandSpec {
         name: "/exit",
         usage: "/exit",
         summary: "Quit Seavx agent TUI",
@@ -149,6 +156,10 @@ pub enum SlashCommand {
     },
     /// Restore files from the newest checkpoint.
     Undo,
+    /// List this workspace's sessions, or resume one by its listed number.
+    Sessions {
+        index: Option<u32>,
+    },
     Unknown(String),
 }
 
@@ -160,6 +171,7 @@ pub enum CommandEffect {
     RunDoctor { offline: bool },
     RunCompact { instructions: Option<String> },
     RunUndo,
+    RunSessions { index: Option<u32> },
 }
 
 /// Parse one line of input. Returns `None` when the line is not a slash
@@ -216,6 +228,16 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         CommandId::Doctor => match args.as_slice() {
             [] => SlashCommand::Doctor { offline: false },
             ["--offline"] => SlashCommand::Doctor { offline: true },
+            _ => SlashCommand::Unknown(trimmed.to_string()),
+        },
+        CommandId::Sessions => match args.as_slice() {
+            [] => SlashCommand::Sessions { index: None },
+            [number] => match number.parse::<u32>() {
+                Ok(number) if number > 0 => SlashCommand::Sessions {
+                    index: Some(number),
+                },
+                _ => SlashCommand::Unknown(trimmed.to_string()),
+            },
             _ => SlashCommand::Unknown(trimmed.to_string()),
         },
         CommandId::Config => parse_config(&args, trimmed),
@@ -354,6 +376,7 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },
         SlashCommand::Undo => CommandEffect::RunUndo,
+        SlashCommand::Sessions { index } => CommandEffect::RunSessions { index },
         SlashCommand::Init => {
             match config::init_workspace(std::path::Path::new(".")) {
                 Ok((path, true)) => {

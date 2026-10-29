@@ -89,6 +89,7 @@ fn every_registry_entry_parses_to_a_handled_command() {
             },
         ),
         ("/undo", SlashCommand::Undo),
+        ("/sessions", SlashCommand::Sessions { index: None }),
         ("/exit", SlashCommand::Exit),
     ];
 
@@ -121,8 +122,19 @@ fn every_handled_command_appears_in_the_registry() {
     // Every variant the parser can produce from a name must be reachable from
     // the table; a variant with no row is a command nobody can type.
     let handled: Vec<&str> = vec![
-        "/model", "/compact", "/config", "/plan", "/clear", "/new", "/help", "/init", "/doctor",
-        "/memory", "/undo", "/exit",
+        "/model",
+        "/compact",
+        "/config",
+        "/plan",
+        "/clear",
+        "/new",
+        "/help",
+        "/init",
+        "/doctor",
+        "/memory",
+        "/undo",
+        "/sessions",
+        "/exit",
     ];
     for name in handled {
         let parsed = parse(name).expect("a registered name parses");
@@ -133,7 +145,7 @@ fn every_handled_command_appears_in_the_registry() {
     }
 
     // And the reverse: a name the table does not carry is unknown, not silent.
-    for absent in ["/sessions", "/nope", "/clear now"] {
+    for absent in ["/nope", "/clear now"] {
         assert!(
             !COMMANDS.iter().any(|spec| spec.name == absent),
             "{absent} should not be registered yet"
@@ -185,8 +197,19 @@ fn the_palette_is_the_table() {
     assert_eq!(
         order,
         vec![
-            "/model", "/compact", "/config", "/plan", "/clear", "/new", "/help", "/init",
-            "/doctor", "/memory", "/undo", "/exit"
+            "/model",
+            "/compact",
+            "/config",
+            "/plan",
+            "/clear",
+            "/new",
+            "/help",
+            "/init",
+            "/doctor",
+            "/memory",
+            "/undo",
+            "/sessions",
+            "/exit"
         ]
     );
 }
@@ -443,4 +466,73 @@ fn undo_is_refused_while_busy() {
         )),
         "the refusal is explained"
     );
+}
+
+fn fixture_store() -> (tempfile::TempDir, crate::session::SessionStore, String) {
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let workspace = "test-workspace".to_string();
+    for prompt in ["first prompt", "second prompt"] {
+        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt).unwrap();
+    }
+    (temp, store, workspace)
+}
+
+#[test]
+fn sessions_lists_the_workspace_and_resumes_by_number() {
+    assert_eq!(
+        parse("/sessions"),
+        Some(SlashCommand::Sessions { index: None })
+    );
+    assert_eq!(
+        parse("/sessions 2"),
+        Some(SlashCommand::Sessions { index: Some(2) })
+    );
+    assert!(matches!(
+        parse("/sessions 0"),
+        Some(SlashCommand::Unknown(_))
+    ));
+    assert!(matches!(
+        parse("/sessions nope"),
+        Some(SlashCommand::Unknown(_))
+    ));
+
+    let (_temp, store, workspace) = fixture_store();
+    let listing = crate::cli::sessions::numbered_list_text(&store, &workspace).expect("a listing");
+    assert!(listing.contains("/sessions <number>"), "{listing}");
+    assert!(listing.contains("first prompt"), "{listing}");
+    assert!(listing.contains("second prompt"), "{listing}");
+    // Newest first: number 1 is the session created last.
+    let lines: Vec<&str> = listing.lines().collect();
+    // Numbered row, then its title on the following line.
+    assert!(lines[1].trim_start().starts_with("1  id"), "{listing}");
+    assert!(lines[2].trim().contains("second prompt"), "{listing}");
+    assert!(lines[3].trim_start().starts_with("2  id"), "{listing}");
+    assert!(lines[4].trim().contains("first prompt"), "{listing}");
+
+    let first = crate::cli::sessions::resume_by_number(&store, &workspace, 1).expect("resumes");
+    assert_eq!(first.title.as_deref(), Some("second prompt"));
+    let second = crate::cli::sessions::resume_by_number(&store, &workspace, 2).expect("resumes");
+    assert_eq!(second.title.as_deref(), Some("first prompt"));
+
+    let missing = crate::cli::sessions::resume_by_number(&store, &workspace, 9).unwrap_err();
+    assert!(missing.contains("/sessions"), "{missing}");
+}
+
+#[test]
+fn resuming_a_read_only_session_is_refused_with_the_reason() {
+    let (_temp, store, workspace) = fixture_store();
+    store
+        .connection()
+        .execute("UPDATE sessions SET payload_format = 'genai-0.6'", [])
+        .unwrap();
+
+    let error = crate::cli::sessions::resume_by_number(&store, &workspace, 1).unwrap_err();
+    assert!(error.contains("read-only"), "{error}");
+    assert!(
+        error.contains("payload format"),
+        "the reason travels with the refusal: {error}"
+    );
+    // Nothing was opened: the message names the session, the transcript stays out.
+    assert!(!error.contains("User:"), "{error}");
 }
