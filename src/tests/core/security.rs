@@ -208,7 +208,11 @@ async fn search_skips_protected_files_and_counts_them() {
     let output = crate::agent::tools::ToolRegistry::with_default_tools()
         .get("search_files")
         .unwrap()
-        .execute(serde_json::json!({ "pattern": "PRIVATE_KEY" }), &security)
+        .execute(
+            serde_json::json!({ "pattern": "PRIVATE_KEY" }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await
         .unwrap();
 
@@ -235,7 +239,11 @@ async fn search_over_only_protected_files_returns_no_lines() {
     let output = crate::agent::tools::ToolRegistry::with_default_tools()
         .get("search_files")
         .unwrap()
-        .execute(serde_json::json!({ "pattern": "PRIVATE_KEY" }), &security)
+        .execute(
+            serde_json::json!({ "pattern": "PRIVATE_KEY" }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await
         .unwrap();
 

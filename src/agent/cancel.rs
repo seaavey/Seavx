@@ -3,28 +3,53 @@
 //! The token is the only thing the TUI sets; the engine polls it between turns,
 //! around every provider future and inside a tool call.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How often a waiting turn re-checks the token. A poll interval keeps the
 /// token a plain `Clone` handle with no task to outlive the turn.
 const POLL: Duration = Duration::from_millis(20);
 
+/// How long a killed group gets between `SIGTERM` and `SIGKILL`.
+pub const TERM_GRACE: Duration = Duration::from_millis(200);
+/// How long the OS gets to confirm the child is gone before the cleanup is
+/// reported as unconfirmed.
+pub const REAP_WINDOW: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken {
+    cancelled: Arc<AtomicBool>,
+    /// The last killed process tree, recorded by the tool that sent the signal
+    /// so the turn can report what the OS said.
+    killed: Arc<Mutex<Option<(u32, Cleanup)>>>,
+}
 
 impl CancelToken {
     pub fn new() -> Self {
         Self::default()
     }
 
+    pub fn note_cleanup(&self, pid: u32, cleanup: Cleanup) {
+        *self
+            .killed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((pid, cleanup));
+    }
+
+    pub fn last_cleanup(&self) -> Option<(u32, Cleanup)> {
+        *self
+            .killed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.cancelled.load(Ordering::SeqCst)
     }
 
     /// Resolves once the token is set, immediately if it already is.
@@ -56,6 +81,67 @@ impl TurnStatus {
 pub enum Cleanup {
     Confirmed,
     Unconfirmed,
+}
+
+/// Kill the child's whole process group, then reap it. The return value is what
+/// the OS confirmed: a kill that was sent but not reaped is never called clean.
+pub async fn kill_tree(child: &mut tokio::process::Child, pid: u32) -> Cleanup {
+    kill_tree_within(child, pid, REAP_WINDOW).await
+}
+
+/// [`kill_tree`] with the reap window as a parameter, so a test can force the
+/// timeout branch without waiting two seconds.
+pub async fn kill_tree_within(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    window: Duration,
+) -> Cleanup {
+    #[cfg(unix)]
+    {
+        // The child was spawned with `process_group(0)`, so the negative pid is
+        // the group: the shell and everything it started.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        tokio::time::sleep(TERM_GRACE).await;
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+
+    reap_or_report(
+        async {
+            let _ = child.wait().await;
+        },
+        window,
+    )
+    .await
+}
+
+/// The reap decision on its own: the kernel confirms every `SIGKILL`, so the
+/// timeout branch is only reachable through this seam.
+pub async fn reap_or_report<F: std::future::Future<Output = ()>>(
+    reap: F,
+    window: Duration,
+) -> Cleanup {
+    match tokio::time::timeout(window, reap).await {
+        Ok(()) => Cleanup::Confirmed,
+        Err(_) => Cleanup::Unconfirmed,
+    }
+}
+
+/// The one line a user sees when the OS did not confirm the kill.
+pub fn cleanup_notice(pid: u32) -> String {
+    format!("cancellation could not be confirmed; pid {pid} may still be running")
 }
 
 /// The turn state machine: forward edges only, a terminal status is final.

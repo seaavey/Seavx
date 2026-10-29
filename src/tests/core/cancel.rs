@@ -1,10 +1,11 @@
 //! Cancelling a turn: while waiting, mid-stream and between turns.
 
 use crate::agent::backend::{BackendError, ChatBackend, StreamDelta};
-use crate::agent::cancel::{CancelToken, TurnStatus};
+use crate::agent::cancel::{CancelToken, Cleanup, TurnStatus, cleanup_notice};
 use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
 use crate::agent::permissions::DenyingConfirmer;
 use crate::agent::security::WorkspaceSecurity;
+use crate::agent::tools::run_shell;
 use crate::session::MessageStatus;
 use genai::adapter::AdapterKind;
 use genai::chat::{ChatOptions, ChatRequest, ChatResponse, MessageContent};
@@ -66,6 +67,19 @@ impl ChatBackend for SlowBackend {
         tokio::time::sleep(Duration::from_secs(30)).await;
         Ok(response("one two three"))
     }
+}
+
+/// Polls until `probe` says the pid is gone, failing after two seconds.
+#[cfg(unix)]
+async fn wait_until_gone(pid: i32) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
 }
 
 fn runtime_with(backend: &SlowBackend, workspace: &std::path::Path, stream: bool) -> AgentRuntime {
@@ -219,5 +233,77 @@ async fn cancelling_between_turns_is_immediate() {
     assert!(
         backend.calls().is_empty(),
         "a turn cancelled before it starts calls no provider"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_a_command_kills_the_whole_tree_confirmed() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cancel = CancelToken::new();
+    let path = workspace.path().to_path_buf();
+    let clone = cancel.clone();
+
+    // A shell that starts a grandchild and waits for it: killing only the shell
+    // would leave `sleep 30` behind.
+    let handle = tokio::spawn(async move {
+        let security = WorkspaceSecurity::new(path);
+        run_shell(
+            "sleep 30 & echo $! > pid; wait",
+            &security,
+            Duration::from_secs(30),
+            &clone,
+        )
+        .await
+    });
+
+    let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(workspace.path().join("pid"))
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the command must write its grandchild pid");
+
+    cancel.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the kill must finish inside the window")
+        .unwrap()
+        .expect("a cancelled command still returns a result");
+
+    assert_eq!(outcome.cleanup, Some(Cleanup::Confirmed));
+    assert_eq!(outcome.status, -1, "a killed command has no exit code");
+    assert!(
+        wait_until_gone(pid).await,
+        "the grandchild {pid} survived the group kill"
+    );
+}
+
+#[tokio::test]
+async fn an_unconfirmed_reap_is_reported_not_claimed_clean() {
+    // The kernel confirms every kill it delivers, so the timeout branch is
+    // forced through the same decision function the tool uses.
+    let cleanup = crate::agent::cancel::reap_or_report(
+        std::future::pending::<()>(),
+        Duration::from_millis(50),
+    )
+    .await;
+    assert_eq!(cleanup, Cleanup::Unconfirmed);
+
+    let pid = 4242;
+    let notice = cleanup_notice(pid);
+    assert!(
+        notice.contains(&pid.to_string()),
+        "the notice names the pid: {notice}"
+    );
+    assert!(
+        !notice.to_lowercase().contains("clean"),
+        "an unconfirmed cleanup is never called clean: {notice}"
     );
 }

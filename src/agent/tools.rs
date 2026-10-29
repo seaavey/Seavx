@@ -1,3 +1,4 @@
+use crate::agent::cancel::{CancelToken, Cleanup, REAP_WINDOW, cleanup_notice, kill_tree};
 use crate::agent::engine::AgentMode;
 use crate::agent::permissions::ActionKind;
 use crate::agent::security::WorkspaceSecurity;
@@ -35,7 +36,12 @@ pub trait AgentTool: Send + Sync {
         None
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String>;
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        cancel: &CancelToken,
+    ) -> Result<String, String>;
 }
 
 // ---- Shared cores ----------------------------------------------------------
@@ -188,7 +194,12 @@ impl AgentTool for ReadFileTool {
         schema::<ReadFileArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<ReadFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
         let content = crate::agent::security::read_verified(&path).await?;
@@ -241,7 +252,12 @@ impl AgentTool for WriteFileTool {
         schema::<WriteFileArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<WriteFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
         capture_checkpoint(security, &path)?;
@@ -277,7 +293,12 @@ impl AgentTool for EditFileTool {
         schema::<EditFileArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<EditFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
         capture_checkpoint(security, &path)?;
@@ -330,7 +351,12 @@ impl AgentTool for ListDirectoryTool {
         schema::<ListDirArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<ListDirArgs>(args)?;
         let req_path = match parsed.path {
             Some(ref p) if p != "None" && !p.trim().is_empty() => p.as_str(),
@@ -387,7 +413,12 @@ impl AgentTool for RunCommandTool {
         schema::<RunCommandArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<RunCommandArgs>(args)?;
         let class = crate::agent::shell::classify(&parsed.command, security);
 
@@ -397,9 +428,9 @@ impl AgentTool for RunCommandTool {
             return Err("Command refused by security policy".to_string());
         }
 
-        let output = run_shell(&parsed.command, security, COMMAND_TIMEOUT).await?;
-        let stdout = cap_stream(&String::from_utf8_lossy(&output.stdout));
-        let stderr = cap_stream(&String::from_utf8_lossy(&output.stderr));
+        let outcome = run_shell(&parsed.command, security, COMMAND_TIMEOUT, cancel).await?;
+        let stdout = cap_stream(&outcome.stdout);
+        let stderr = cap_stream(&outcome.stderr);
 
         // A recursive read names a directory, so its lines are filtered: the
         // policy cannot see the files it walked.
@@ -413,8 +444,19 @@ impl AgentTool for RunCommandTool {
         };
         let _ = withheld;
 
-        let status = output.status.code().unwrap_or(-1);
-        let text = format!("exit: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        let mut text = format!(
+            "exit: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            outcome.status
+        );
+        if let Some(cleanup) = outcome.cleanup {
+            // The result stays `complete`: the call answered, the answer says
+            // how far the kill got.
+            text.push_str("\noutcome: cancelled");
+            if cleanup == Cleanup::Unconfirmed {
+                text.push('\n');
+                text.push_str(&cleanup_notice(outcome.pid));
+            }
+        }
         Ok(crate::agent::security::redact(&text))
     }
 }
@@ -425,13 +467,24 @@ pub(crate) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::fro
 const STREAM_CAP: usize = 32 * 1024;
 const STREAM_HALF: usize = 16 * 1024;
 
+/// One command's result, including how a killed tree ended.
+pub(crate) struct ShellOutcome {
+    pub status: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub pid: u32,
+    /// `Some` only when a cancel killed the tree.
+    pub cleanup: Option<Cleanup>,
+}
+
 /// Run one command with a cleared environment: a tool call cannot read the
 /// agent's own `SEAVX_*` variables, and the child dies with the future.
 pub(crate) async fn run_shell(
     command: &str,
     security: &WorkspaceSecurity,
     limit: std::time::Duration,
-) -> Result<std::process::Output, String> {
+    cancel: &CancelToken,
+) -> Result<ShellOutcome, String> {
     // Windows has no `sh`; `cmd /C` runs the same command through the system shell.
     #[cfg(windows)]
     let mut shell = {
@@ -454,6 +507,12 @@ pub(crate) async fn run_shell(
         .stderr(std::process::Stdio::piped())
         .env_clear()
         .kill_on_drop(true);
+    // The whole tree must be addressable by one signal: its own process group
+    // on Unix, so `sh -c 'sleep 30 & wait'` takes the grandchild with it.
+    #[cfg(unix)]
+    shell.process_group(0);
+    #[cfg(windows)]
+    shell.creation_flags(0x0000_0200);
     for name in ["PATH", "LANG", "TERM"] {
         if let Ok(value) = std::env::var(name) {
             shell.env(name, value);
@@ -464,17 +523,85 @@ pub(crate) async fn run_shell(
         shell.env("HOME", home);
     }
 
-    let child = shell
+    let mut child = shell
         .spawn()
         .map_err(|e| format!("Process execution failed: {e}"))?;
-    match tokio::time::timeout(limit, child.wait_with_output()).await {
-        Err(_) => Err(format!(
-            "Command execution timed out ({}s limit)",
-            limit.as_secs()
-        )),
-        Ok(Err(error)) => Err(format!("Process execution failed: {error}")),
-        Ok(Ok(output)) => Ok(output),
+    let pid = child.id().unwrap_or_default();
+
+    // The pipes are drained while the child runs: a chatty command must not
+    // block on a full pipe before we ever look at the cancel token.
+    let mut out_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Process stdout was not captured".to_string())?;
+    let mut err_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Process stderr was not captured".to_string())?;
+    let read_out = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut out_pipe, &mut buffer).await;
+        buffer
+    });
+    let read_err = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut err_pipe, &mut buffer).await;
+        buffer
+    });
+
+    enum End {
+        Exited(std::process::ExitStatus),
+        Cancelled,
+        TimedOut,
     }
+
+    let end = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => End::Cancelled,
+        _ = tokio::time::sleep(limit) => End::TimedOut,
+        status = child.wait() => match status {
+            Ok(status) => End::Exited(status),
+            Err(error) => return Err(format!("Process execution failed: {error}")),
+        },
+    };
+
+    // A killed tree closes its pipes; an escaped grandchild might not, and that
+    // must not hold the turn open.
+    let read_both = async { (read_out.await, read_err.await) };
+    let (stdout, stderr) = match &end {
+        End::Exited(_) => {
+            let (out, err) = read_both.await;
+            (out.unwrap_or_default(), err.unwrap_or_default())
+        }
+        _ => match tokio::time::timeout(REAP_WINDOW, read_both).await {
+            Ok((out, err)) => (out.unwrap_or_default(), err.unwrap_or_default()),
+            Err(_) => (Vec::new(), Vec::new()),
+        },
+    };
+
+    let (status, cleanup) = match end {
+        End::Exited(status) => (status.code().unwrap_or(-1), None),
+        End::Cancelled => {
+            let cleanup = kill_tree(&mut child, pid).await;
+            cancel.note_cleanup(pid, cleanup);
+            (-1, Some(cleanup))
+        }
+        End::TimedOut => {
+            kill_tree(&mut child, pid).await;
+            return Err(format!(
+                "Command execution timed out ({}s limit)",
+                limit.as_secs()
+            ));
+        }
+    };
+
+    Ok(ShellOutcome {
+        status,
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
+        pid,
+        cleanup,
+    })
 }
 
 /// Keep a bounded head and tail so a chatty command cannot flood the context.
@@ -527,7 +654,12 @@ impl AgentTool for SearchFilesTool {
         schema::<SearchFilesArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SearchFilesArgs>(args)?;
         let target_mode = parsed.target.unwrap_or_else(|| "content".to_string());
         let search_path = parsed.path.unwrap_or_else(|| ".".to_string());
@@ -705,7 +837,12 @@ impl AgentTool for SaveMemoryTool {
         schema::<SaveMemoryArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SaveMemoryArgs>(args)?;
 
         let lesson = parsed.lesson.trim();
@@ -825,7 +962,12 @@ impl AgentTool for SkillViewTool {
         schema::<SkillViewArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SkillViewArgs>(args)?;
         let path = find_skill_file(security, &parsed.name)?;
         tokio::fs::read_to_string(path)
@@ -858,7 +1000,12 @@ impl AgentTool for ApplyPatchTool {
         schema::<ApplyPatchArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<ApplyPatchArgs>(args)?;
         let files = crate::agent::patch::parse(&parsed.patch)
             .map_err(|error| format!("Patch refused: {error}"))?;
@@ -934,7 +1081,12 @@ impl AgentTool for SkillWriteTool {
         schema::<SkillWriteArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SkillWriteArgs>(args)?;
         if parsed.content.trim().is_empty() {
             return Err("Skill content cannot be empty".to_string());
@@ -986,7 +1138,12 @@ impl AgentTool for SkillPatchTool {
         schema::<SkillPatchArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SkillPatchArgs>(args)?;
         let path = find_skill_file(security, &parsed.name)?;
         capture_checkpoint(security, &path)?;

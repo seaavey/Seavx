@@ -46,6 +46,7 @@ mod test_cases {
             .execute(
                 json!({ "path": "Cargo.toml", "offset": 1, "limit": 5 }),
                 &sec,
+                &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(res.is_ok());
@@ -54,7 +55,11 @@ mod test_cases {
         let search_res = registry
             .get("search_files")
             .unwrap()
-            .execute(json!({ "pattern": "name = \"seavx\"" }), &sec)
+            .execute(
+                json!({ "pattern": "name = \"seavx\"" }),
+                &sec,
+                &crate::agent::cancel::CancelToken::new(),
+            )
             .await;
         assert!(search_res.is_ok());
         assert!(search_res.unwrap().contains("Cargo.toml"));
@@ -75,7 +80,11 @@ mod test_cases {
         let mem_res = registry
             .get("save_memory")
             .unwrap()
-            .execute(json!({ "lesson": "secret_api_key_123" }), &mem_sec)
+            .execute(
+                json!({ "lesson": "secret_api_key_123" }),
+                &mem_sec,
+                &crate::agent::cancel::CancelToken::new(),
+            )
             .await;
         assert!(mem_res.is_err());
 
@@ -86,6 +95,7 @@ mod test_cases {
             .execute(
                 json!({ "lesson": "Low confidence guess", "confidence": 50 }),
                 &mem_sec,
+                &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(low_conf_res.is_err());
@@ -101,6 +111,7 @@ mod test_cases {
             .execute(
                 json!({ "lesson": "High confidence verified rule", "confidence": 95 }),
                 &mem_sec,
+                &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(high_conf_res.is_ok());
@@ -250,7 +261,7 @@ mod test_cases {
                     "name": name,
                     "content": "---\nname: seavx-skill-tools-roundtrip\ndescription: \"Roundtrip test skill.\"\n---\n\nStep A\n"
                 }),
-                &sec,
+                &sec, &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(created.unwrap().contains("Successfully created"));
@@ -261,6 +272,7 @@ mod test_cases {
             .execute(
                 json!({ "name": name, "old_string": "Step A", "new_string": "Step B" }),
                 &sec,
+                &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(patched.unwrap().contains("Successfully patched"));
@@ -268,7 +280,11 @@ mod test_cases {
         let viewed = registry
             .get("skill_view")
             .unwrap()
-            .execute(json!({ "name": name }), &sec)
+            .execute(
+                json!({ "name": name }),
+                &sec,
+                &crate::agent::cancel::CancelToken::new(),
+            )
             .await
             .unwrap();
         assert!(viewed.contains("Step B"));
@@ -276,7 +292,11 @@ mod test_cases {
         let missing = registry
             .get("skill_view")
             .unwrap()
-            .execute(json!({ "name": "no-such-skill-xyz" }), &sec)
+            .execute(
+                json!({ "name": "no-such-skill-xyz" }),
+                &sec,
+                &crate::agent::cancel::CancelToken::new(),
+            )
             .await;
         assert!(missing.is_err());
 

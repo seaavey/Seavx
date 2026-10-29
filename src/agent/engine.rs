@@ -963,7 +963,7 @@ impl AgentRuntime {
                             .map(|path| path.display().to_string())
                             .unwrap_or_else(|| args_summary.clone());
                         match self.gate(confirm, kind, tool_name, &detail).await {
-                            Ok(()) => match tool.execute(args, &self.security).await {
+                            Ok(()) => match tool.execute(args, &self.security, cancel).await {
                                 Ok(res) => (res, false),
                                 Err(err) => (format!("Error executing {tool_name}: {err}"), true),
                             },
@@ -974,6 +974,11 @@ impl AgentRuntime {
                 };
 
                 let result_str = security::redact(&result_str);
+                // A cancelled command reports what the OS said; the turn carries it.
+                if let Some((_, cleanup)) = cancel.last_cleanup() {
+                    turn_state.set_cleanup(cleanup);
+                }
+
                 Self::log_tool_result(tool_name, is_err, &result_str);
 
                 if is_err {
