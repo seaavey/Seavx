@@ -210,3 +210,137 @@ fn the_probe_is_owner_only_and_removed() {
     remove_probe(probe).unwrap();
     assert!(!temp.path().join(".probe").exists());
 }
+
+fn check<'a>(report: &'a DoctorReport, id: &str) -> &'a CheckResult {
+    report
+        .checks
+        .iter()
+        .find(|check| check.id == id)
+        .unwrap_or_else(|| panic!("no {id} check in {}", render(report)))
+}
+
+#[tokio::test]
+async fn doctor_reports_storage_permissions_and_streaming_without_secrets() {
+    let temp = tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".seavx")).unwrap();
+    std::fs::write(
+        workspace.join(".seavx/config.toml"),
+        "model = \"openai/gpt-4o-mini\"\nmax_turns = 10\ntool_permissions = \"ask\"\npermitted_actions = [\"workspace-write\"]\napi_key = \"sk-never-print-me\"\nbase_url = \"https://user:pass@host/v1?token=secret\"\n",
+    )
+    .unwrap();
+
+    // A session database next to the config, as debug mode keeps it.
+    let store =
+        crate::session::SessionStore::open_at(&workspace.join(".seavx/sessions.db")).unwrap();
+    crate::session::prepare_turn(&store, "ws", "m", None, "hello").unwrap();
+    drop(store);
+
+    let probe = FakeProbe {
+        calls: AtomicUsize::new(0),
+        result: ProbeResult::Ok { models: 1 },
+    };
+    let report = run_with_probe(options(&workspace), &probe).await;
+
+    let session = check(&report, "session");
+    assert_eq!(session.status, CheckStatus::Ok, "{}", session.detail);
+    assert!(session.detail.contains("schema v"), "{}", session.detail);
+    assert!(
+        session.detail.contains("genai-chat-v1"),
+        "{}",
+        session.detail
+    );
+    assert!(session.detail.contains("writable"), "{}", session.detail);
+
+    let permissions = check(&report, "permissions");
+    assert_eq!(permissions.status, CheckStatus::Ok);
+    assert!(permissions.detail.contains("ask"), "{}", permissions.detail);
+    assert!(
+        permissions.detail.contains("workspace-write"),
+        "{}",
+        permissions.detail
+    );
+
+    let stream = check(&report, "stream");
+    assert_eq!(stream.status, CheckStatus::Ok);
+    assert!(stream.detail.contains("enabled"), "{}", stream.detail);
+
+    let text = render(&report);
+    assert!(!text.contains("sk-never-print-me"), "{text}");
+    assert!(!text.contains("user:pass@"), "{text}");
+    assert!(!text.contains("?token="), "{text}");
+    assert!(!text.contains("token=secret"), "{text}");
+}
+
+#[tokio::test]
+async fn a_config_parse_error_is_a_fail() {
+    let temp = tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".seavx")).unwrap();
+    std::fs::write(
+        workspace.join(".seavx/config.toml"),
+        "model = \"unterminated\n",
+    )
+    .unwrap();
+
+    let probe = FakeProbe {
+        calls: AtomicUsize::new(0),
+        result: ProbeResult::Ok { models: 1 },
+    };
+    let report = run_with_probe(options(&workspace), &probe).await;
+    let config = check(&report, "config");
+    assert_eq!(config.status, CheckStatus::Fail);
+    assert!(config.detail.contains("parse error"), "{}", config.detail);
+    assert!(
+        !config.detail.contains('\n'),
+        "one line, no echoed source: {}",
+        config.detail
+    );
+}
+
+#[tokio::test]
+async fn a_pending_recovery_conflict_is_named() {
+    let temp = tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let directory = workspace.join(".seavx");
+    std::fs::create_dir_all(&directory).unwrap();
+
+    // A `.bak` with its `.new` record, and a third state in the target: the
+    // loader keeps the backup and reports the conflict.
+    let previous = b"model = \"previous\"\n";
+    let intended = b"model = \"intended\"\n";
+    std::fs::write(directory.join("config.toml"), "model = \"third\"\n").unwrap();
+    let backup = directory.join(format!("config.toml.bak-100-0-{}", previous.len()));
+    std::fs::write(&backup, previous).unwrap();
+    std::fs::write(
+        format!("{}.new", backup.display()),
+        format!(
+            "{}\t{}\n",
+            intended.len(),
+            crate::checkpoint::fnv1a64(intended)
+        ),
+    )
+    .unwrap();
+
+    let probe = FakeProbe {
+        calls: AtomicUsize::new(0),
+        result: ProbeResult::Ok { models: 1 },
+    };
+    let report = run_with_probe(options(&workspace), &probe).await;
+    let recovery = check(&report, "config-recovery");
+    assert_eq!(recovery.status, CheckStatus::Warn, "{}", recovery.detail);
+    assert!(
+        recovery.detail.contains("config recovery conflict") || recovery.detail.contains("backup"),
+        "{}",
+        recovery.detail
+    );
+}
+
+#[test]
+fn setup_prints_the_redacted_url() {
+    let printed = crate::cli::config::redact_url("https://user:pass@host/v1?token=secret");
+    assert!(printed.contains("https://host/"), "{printed}");
+    assert!(printed.contains("(userinfo/query redacted)"), "{printed}");
+    assert!(!printed.contains("user:pass"), "{printed}");
+    assert!(!printed.contains("secret"), "{printed}");
+}

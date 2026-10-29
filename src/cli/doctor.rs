@@ -73,11 +73,15 @@ pub async fn run_with_probe(options: DoctorOptions, probe: &dyn EndpointProbe) -
     let checks = vec![
         binary_check(),
         config_check(&config_report),
+        config_recovery_check(&config_report),
         secret_check(&config),
         context_check(&config),
+        permissions_check(&config),
+        stream_check(&config, options.offline),
         endpoint_check(&options, &config, &base_url, probe).await,
         cache_check(&options.workspace_root, &base_url),
         workspace_check(&options.workspace_root),
+        session_check(&options),
         memory_check(&options),
         skills_check(&options.workspace_root),
     ];
@@ -309,6 +313,126 @@ pub(crate) fn remove_probe(probe: Probe) -> Result<(), String> {
         ));
     }
     std::fs::remove_file(&probe.path).map_err(|error| format!("probe cleanup failed: {error}"))
+}
+
+/// A `.bak` the loader could not resolve: name it instead of leaving it in a
+/// `tracing::warn!`. Load already succeeded with whatever file is readable.
+fn config_recovery_check(report: &ConfigReport) -> CheckResult {
+    let path = report
+        .active_path
+        .as_deref()
+        .unwrap_or(&report.workspace_path);
+    match crate::cli::config::recover_config(path) {
+        Ok(()) => ok("config-recovery", "no pending backup conflict"),
+        Err(conflict) => warn("config-recovery", conflict),
+    }
+}
+
+/// The permission mode and the categories lifted out of it; never a secret.
+fn permissions_check(config: &AgentConfig) -> CheckResult {
+    let persisted = if config.permitted_actions.is_empty() {
+        "none".to_string()
+    } else {
+        config.permitted_actions.join(" ")
+    };
+    match config.tool_permissions.as_str() {
+        "deny" | "ask" | "allow" => ok(
+            "permissions",
+            format!("{} (persisted: {persisted})", config.tool_permissions),
+        ),
+        other => fail("permissions", format!("invalid tool_permissions: {other}")),
+    }
+}
+
+/// A capability probe would spend a provider request; this reports the setting
+/// and what a failure falls back to, unless `--offline` hides the endpoint.
+fn stream_check(config: &AgentConfig, offline: bool) -> CheckResult {
+    let suffix = if offline { " (not probed)" } else { "" };
+    if config.stream {
+        ok(
+            "stream",
+            format!("enabled{suffix}; a failed stream falls back to one plain request"),
+        )
+    } else {
+        ok(
+            "stream",
+            format!("disabled{suffix}; every turn sends one plain request"),
+        )
+    }
+}
+
+/// Where this run's session database lives, derived from the report's paths so a
+/// test never opens the checkout's own file.
+fn session_path(options: &DoctorOptions) -> Option<PathBuf> {
+    if crate::util::is_debug() {
+        return Some(options.workspace_root.join(".seavx").join("sessions.db"));
+    }
+    options
+        .home
+        .as_ref()
+        .map(|home| home.join(".seavx").join("sessions.db"))
+}
+
+/// Path, schema version, payload format and writability, read without writing.
+fn session_check(options: &DoctorOptions) -> CheckResult {
+    let Some(path) = session_path(options) else {
+        return warn("session", "home directory is not set");
+    };
+    let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let writable = std::fs::create_dir_all(&directory).is_ok()
+        && create_probe(&directory, &probe_name())
+            .ok()
+            .is_some_and(|probe| remove_probe(probe).is_ok());
+
+    if !path.exists() {
+        return ok(
+            "session",
+            format!(
+                "{} (empty; created with the first prompt)",
+                display_path(&path)
+            ),
+        );
+    }
+
+    let header =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())
+            .and_then(|connection| {
+                let version: i64 = connection
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                let format: String = connection
+                    .query_row(
+                        "SELECT payload_format FROM sessions ORDER BY id DESC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_else(|_| "unknown".to_string());
+                Ok((version, format))
+            });
+
+    match header {
+        Ok((version, format)) => {
+            let detail = format!(
+                "{} · schema v{version} · {format} · {}",
+                display_path(&path),
+                if writable { "writable" } else { "not writable" }
+            );
+            result(
+                "session",
+                if writable {
+                    CheckStatus::Ok
+                } else {
+                    CheckStatus::Warn
+                },
+                detail,
+            )
+        }
+        Err(error) => warn(
+            "session",
+            format!("{} is unreadable: {error}", display_path(&path)),
+        ),
+    }
 }
 
 fn memory_check(options: &DoctorOptions) -> CheckResult {

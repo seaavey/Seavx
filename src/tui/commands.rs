@@ -409,6 +409,10 @@ fn execute_config(app: &mut App, action: ConfigAction) {
     match action {
         ConfigAction::Show => {
             let (config, report) = AgentConfig::load_with_report(workspace);
+            if let Err(conflict) = config::recover_config(&config::workspace_config_path(workspace))
+            {
+                app.push_notice(conflict);
+            }
             app.push_notice(config::render_report(&config, &report));
         }
         ConfigAction::Path => {
