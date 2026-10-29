@@ -5,6 +5,18 @@ mod test_cases {
     use crate::agent::tools::ToolRegistry;
     use serde_json::json;
 
+    /// Size and mtime of every path that exists, so a test can prove nothing outside its
+    /// temporary workspace changed.
+    fn snapshot_all(paths: &[std::path::PathBuf]) -> Vec<Option<(u64, std::time::SystemTime)>> {
+        paths
+            .iter()
+            .map(|path| {
+                let meta = std::fs::metadata(path).ok()?;
+                Some((meta.len(), meta.modified().ok()?))
+            })
+            .collect()
+    }
+
     #[test]
     fn test_workspace_security_path_traversal() {
         let sec = WorkspaceSecurity::new(".");
@@ -47,10 +59,23 @@ mod test_cases {
         assert!(search_res.is_ok());
         assert!(search_res.unwrap().contains("Cargo.toml"));
 
+        // Memory writes go to a temporary workspace, never into the checkout.
+        let temp = tempfile::tempdir().unwrap();
+        let mem_sec = WorkspaceSecurity::new(temp.path().canonicalize().unwrap());
+        let memory_paths = [
+            mem_sec.root().join(".seavx/MEMORY.md"),
+            mem_sec.root().join("MEMORY.md"),
+        ];
+        let checkout_paths = [
+            std::path::PathBuf::from(".seavx/MEMORY.md"),
+            "MEMORY.md".into(),
+        ];
+        let checkout_before = snapshot_all(&checkout_paths);
+
         let mem_res = registry
             .get("save_memory")
             .unwrap()
-            .execute(json!({ "lesson": "secret_api_key_123" }), &sec)
+            .execute(json!({ "lesson": "secret_api_key_123" }), &mem_sec)
             .await;
         assert!(mem_res.is_err());
 
@@ -60,10 +85,14 @@ mod test_cases {
             .unwrap()
             .execute(
                 json!({ "lesson": "Low confidence guess", "confidence": 50 }),
-                &sec,
+                &mem_sec,
             )
             .await;
         assert!(low_conf_res.is_err());
+        assert!(
+            memory_paths.iter().all(|path| !path.exists()),
+            "rejected lessons must not create a memory file"
+        );
 
         // Test singularity acceptance (>= 70%)
         let high_conf_res = registry
@@ -71,11 +100,22 @@ mod test_cases {
             .unwrap()
             .execute(
                 json!({ "lesson": "High confidence verified rule", "confidence": 95 }),
-                &sec,
+                &mem_sec,
             )
             .await;
         assert!(high_conf_res.is_ok());
-        let _ = std::fs::remove_file("MEMORY.md");
+
+        let memory_file = memory_paths
+            .iter()
+            .find(|path| path.exists())
+            .unwrap_or_else(|| panic!("no memory file under {}", mem_sec.root().display()));
+        let written = std::fs::read_to_string(memory_file).unwrap();
+        assert!(written.contains("High confidence verified rule"));
+        assert_eq!(
+            checkout_before,
+            snapshot_all(&checkout_paths),
+            "the checkout's memory files must not change"
+        );
     }
 
     #[test]
@@ -172,23 +212,26 @@ mod test_cases {
 
     #[test]
     fn test_skill_manager_workflow() {
-        let mgr = crate::agent::skills::SkillManager::new(std::path::Path::new("."));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mgr = crate::agent::skills::SkillManager::new(&root);
         let test_content = "---\nname: test-skill\ndescription: A test skill\n---\n# Test Content";
-        let save_res = mgr.save_skill("test-skill", test_content);
-        assert!(save_res.is_ok());
+        let saved = mgr.save_skill("test-skill", test_content).unwrap();
+        assert!(
+            saved.starts_with(&root),
+            "skills must be written under {}",
+            root.display()
+        );
 
         let skills = mgr.list_skills();
         assert!(skills.iter().any(|s| s.name == "test-skill"));
 
         // Category subdirectories (shared ~/.agents/skills layout) are scanned too.
-        let nested = std::path::Path::new(".seavx/skills/category/nested-skill");
-        let _ = std::fs::create_dir_all(nested);
-        let _ = std::fs::write(nested.join("SKILL.md"), test_content);
+        let nested = root.join(".seavx/skills/category/nested-skill");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("SKILL.md"), test_content).unwrap();
         let skills = mgr.list_skills();
         assert!(skills.iter().any(|s| s.name == "nested-skill"));
-
-        let _ = std::fs::remove_dir_all(".seavx/skills/test-skill");
-        let _ = std::fs::remove_dir_all(".seavx/skills/category");
     }
 
     #[tokio::test]
