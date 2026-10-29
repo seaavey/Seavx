@@ -53,7 +53,7 @@ fn checkpoint_manifest_round_trips_all_entry_fields() {
     let checkpoint =
         CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
 
-    let entries = CheckpointStore::validate(checkpoint.path(), ws.path()).unwrap();
+    let entries = CheckpointStore::validate(&checkpoint, ws.path()).unwrap();
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].target, ws.path().join("notes.txt"));
@@ -61,7 +61,7 @@ fn checkpoint_manifest_round_trips_all_entry_fields() {
     let backup = entries[0].backup.as_ref().unwrap();
     assert_eq!(fs::read(backup).unwrap(), b"before");
 
-    let manifest = manifest_of(checkpoint.path());
+    let manifest = manifest_of(&checkpoint);
     let fields: Vec<&str> = manifest.trim_end().split('\t').collect();
     assert_eq!(fields.len(), 7, "{manifest}");
     assert_eq!(fields[0], "notes.txt");
@@ -81,7 +81,7 @@ fn checkpoint_records_a_created_target_without_a_backup() {
     };
     let checkpoint = CheckpointStore::create(ws.path(), &[created]).unwrap();
 
-    let entries = CheckpointStore::validate(checkpoint.path(), ws.path()).unwrap();
+    let entries = CheckpointStore::validate(&checkpoint, ws.path()).unwrap();
 
     assert_eq!(entries[0].state, EntryState::Created);
     assert!(entries[0].backup.is_none());
@@ -98,9 +98,9 @@ fn checkpoint_rejects_outside_and_parent_paths() {
     }] {
         let checkpoint =
             CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
-        tamper_field(checkpoint.path(), 0, &tampered);
+        tamper_field(&checkpoint, 0, &tampered);
 
-        let error = CheckpointStore::validate(checkpoint.path(), ws.path()).unwrap_err();
+        let error = CheckpointStore::validate(&checkpoint, ws.path()).unwrap_err();
 
         assert!(
             error.to_string().starts_with("checkpoint rejected"),
@@ -110,7 +110,7 @@ fn checkpoint_rejects_outside_and_parent_paths() {
             fs::read_to_string(ws.path().join("notes.txt")).unwrap(),
             "before"
         );
-        fs::remove_dir_all(checkpoint.path()).unwrap();
+        fs::remove_dir_all(&checkpoint).unwrap();
     }
 }
 
@@ -120,13 +120,13 @@ fn checkpoint_rejects_backup_symlinks() {
     let ws = workspace_with(&[("notes.txt", "before")]);
     let checkpoint =
         CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
-    let backup = backup_path(checkpoint.path());
+    let backup = backup_path(&checkpoint);
     let copy = ws.path().join("copy.txt");
     fs::write(&copy, "before").unwrap();
     fs::remove_file(&backup).unwrap();
     std::os::unix::fs::symlink(&copy, &backup).unwrap();
 
-    let error = CheckpointStore::validate(checkpoint.path(), ws.path()).unwrap_err();
+    let error = CheckpointStore::validate(&checkpoint, ws.path()).unwrap_err();
 
     assert!(
         error.to_string().starts_with("checkpoint rejected"),
@@ -139,7 +139,7 @@ fn checkpoint_rejects_wrong_backup_identity() {
     let ws = workspace_with(&[("notes.txt", "before")]);
     let checkpoint =
         CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
-    let backup = backup_path(checkpoint.path());
+    let backup = backup_path(&checkpoint);
     // Same bytes, different inode: the replacement is created before the original
     // is removed, so the filesystem cannot hand back the same inode.
     let replacement = ws.path().join("replacement.bin");
@@ -147,7 +147,7 @@ fn checkpoint_rejects_wrong_backup_identity() {
     fs::remove_file(&backup).unwrap();
     fs::rename(&replacement, &backup).unwrap();
 
-    let error = CheckpointStore::validate(checkpoint.path(), ws.path()).unwrap_err();
+    let error = CheckpointStore::validate(&checkpoint, ws.path()).unwrap_err();
 
     assert!(error.to_string().contains("identity"), "{error}");
 }
@@ -158,12 +158,12 @@ fn checkpoint_rejects_same_inode_backup_edit() {
     let ws = workspace_with(&[("notes.txt", "before")]);
     let checkpoint =
         CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
-    let backup = backup_path(checkpoint.path());
+    let backup = backup_path(&checkpoint);
     let mut file = fs::OpenOptions::new().append(true).open(&backup).unwrap();
     file.write_all(b" tampered").unwrap();
     drop(file);
 
-    let error = CheckpointStore::validate(checkpoint.path(), ws.path()).unwrap_err();
+    let error = CheckpointStore::validate(&checkpoint, ws.path()).unwrap_err();
 
     assert!(
         error.to_string().contains("checksum") || error.to_string().contains("length"),
@@ -176,10 +176,10 @@ fn checkpoint_rejects_truncated_backup() {
     let ws = workspace_with(&[("notes.txt", "before")]);
     let checkpoint =
         CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
-    let backup = backup_path(checkpoint.path());
+    let backup = backup_path(&checkpoint);
     fs::write(&backup, "bef").unwrap();
 
-    let error = CheckpointStore::validate(checkpoint.path(), ws.path()).unwrap_err();
+    let error = CheckpointStore::validate(&checkpoint, ws.path()).unwrap_err();
 
     assert!(
         error.to_string().starts_with("checkpoint rejected"),
@@ -192,9 +192,9 @@ fn checkpoint_rejects_a_malformed_manifest() {
     let ws = workspace_with(&[("notes.txt", "before")]);
     let checkpoint =
         CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
-    rewrite_manifest(checkpoint.path(), "notes.txt\tbackup-0\n");
+    rewrite_manifest(&checkpoint, "notes.txt\tbackup-0\n");
 
-    let error = CheckpointStore::validate(checkpoint.path(), ws.path()).unwrap_err();
+    let error = CheckpointStore::validate(&checkpoint, ws.path()).unwrap_err();
 
     assert!(
         error.to_string().starts_with("checkpoint rejected"),
@@ -221,8 +221,7 @@ fn checkpoint_accepts_a_global_target_inside_the_allowlist() {
     let checkpoint = CheckpointStore::create(ws.path(), &[input]).unwrap();
 
     let entries =
-        CheckpointStore::validate_with_home(checkpoint.path(), ws.path(), Some(home.path()))
-            .unwrap();
+        CheckpointStore::validate_with_home(&checkpoint, ws.path(), Some(home.path())).unwrap();
 
     assert_eq!(entries[0].target, user_memory);
     assert_eq!(entries[0].state, EntryState::Modified);
@@ -247,11 +246,120 @@ fn checkpoint_rejects_a_global_target_outside_the_allowlist() {
     let checkpoint = CheckpointStore::create(ws.path(), &[input]).unwrap();
 
     let error =
-        CheckpointStore::validate_with_home(checkpoint.path(), ws.path(), Some(home.path()))
-            .unwrap_err();
+        CheckpointStore::validate_with_home(&checkpoint, ws.path(), Some(home.path())).unwrap_err();
 
     assert!(
         error.to_string().starts_with("checkpoint rejected"),
         "{error}"
     );
+}
+
+#[test]
+fn undo_restores_latest_checkpoint() {
+    let ws = workspace_with(&[("notes.txt", "before")]);
+    let input = modified_input(ws.path(), "notes.txt");
+    CheckpointStore::create(ws.path(), &[input]).unwrap();
+    fs::write(ws.path().join("notes.txt"), "after").unwrap();
+
+    let restored = CheckpointStore::undo_latest(ws.path()).unwrap();
+
+    assert_eq!(restored, vec![ws.path().join("notes.txt")]);
+    assert_eq!(
+        fs::read_to_string(ws.path().join("notes.txt")).unwrap(),
+        "before"
+    );
+    assert!(
+        fs::read_dir(ws.path().join(".seavx/checkpoints"))
+            .unwrap()
+            .flatten()
+            .next()
+            .is_none(),
+        "the undone checkpoint is removed"
+    );
+}
+
+#[test]
+fn undo_walks_back_one_checkpoint_at_a_time() {
+    let ws = workspace_with(&[("notes.txt", "first")]);
+    CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
+    fs::write(ws.path().join("notes.txt"), "second").unwrap();
+    CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
+    fs::write(ws.path().join("notes.txt"), "third").unwrap();
+
+    CheckpointStore::undo_latest(ws.path()).unwrap();
+    assert_eq!(
+        fs::read_to_string(ws.path().join("notes.txt")).unwrap(),
+        "second"
+    );
+    CheckpointStore::undo_latest(ws.path()).unwrap();
+    assert_eq!(
+        fs::read_to_string(ws.path().join("notes.txt")).unwrap(),
+        "first"
+    );
+    assert!(CheckpointStore::undo_latest(ws.path()).unwrap().is_empty());
+}
+
+#[test]
+fn undo_removes_created_files() {
+    let ws = workspace_with(&[]);
+    let created = CheckpointInput {
+        target: CheckpointTarget::Workspace(ws.path().join("new.txt")),
+        state: EntryState::Created,
+        original: None,
+    };
+    CheckpointStore::create(ws.path(), &[created]).unwrap();
+    fs::write(ws.path().join("new.txt"), "written by the agent").unwrap();
+
+    let restored = CheckpointStore::undo_latest(ws.path()).unwrap();
+
+    assert_eq!(restored, vec![ws.path().join("new.txt")]);
+    assert!(!ws.path().join("new.txt").exists());
+}
+
+#[test]
+fn undo_rejects_incomplete_checkpoint_without_changes() {
+    let ws = workspace_with(&[("notes.txt", "before")]);
+    let checkpoint =
+        CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
+    rewrite_manifest(
+        &checkpoint,
+        "notes.txt\t../escape.txt\tmodified\t0:0\t0\t0\tworkspace\n",
+    );
+    fs::write(ws.path().join("notes.txt"), "after").unwrap();
+
+    let error = CheckpointStore::undo_latest(ws.path()).unwrap_err();
+
+    assert!(
+        error.to_string().contains("checkpoint incomplete"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read_to_string(ws.path().join("notes.txt")).unwrap(),
+        "after"
+    );
+    assert!(checkpoint.exists(), "a rejected checkpoint is kept");
+}
+
+#[test]
+fn undo_restores_allowed_global_target_under_temp_home() {
+    let ws = workspace_with(&[]);
+    let home = tempdir().unwrap();
+    let user_memory = home.path().join(".seavx/USER.md");
+    fs::create_dir_all(user_memory.parent().unwrap()).unwrap();
+    fs::write(&user_memory, "old preference").unwrap();
+    let input = CheckpointInput {
+        target: CheckpointTarget::Global {
+            path: user_memory.clone(),
+            allowed_root: user_memory.clone(),
+        },
+        state: EntryState::Modified,
+        original: Some(fs::read(&user_memory).unwrap()),
+    };
+    CheckpointStore::create(ws.path(), &[input]).unwrap();
+    fs::write(&user_memory, "new preference").unwrap();
+
+    let restored = CheckpointStore::undo_latest_with_home(ws.path(), Some(home.path())).unwrap();
+
+    assert_eq!(restored, vec![user_memory.clone()]);
+    assert_eq!(fs::read_to_string(&user_memory).unwrap(), "old preference");
 }

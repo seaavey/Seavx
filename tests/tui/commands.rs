@@ -87,6 +87,7 @@ fn every_palette_entry_parses_to_a_handled_command() {
                 view: MemoryView::All,
             },
         ),
+        ("/undo", SlashCommand::Undo),
         ("/exit", SlashCommand::Exit),
     ];
 
@@ -265,4 +266,35 @@ fn parses_plan_forms() {
         Some(SlashCommand::Unknown("/plan nope".into()))
     );
     assert_eq!(parse("plan"), None);
+}
+
+#[test]
+fn undo_is_registered_and_dispatchable() {
+    let palette: Vec<&str> = SLASH_COMMANDS.iter().map(|(name, _)| *name).collect();
+    assert!(palette.contains(&"/undo"), "{palette:?}");
+    assert_eq!(parse("/undo"), Some(SlashCommand::Undo));
+
+    let mut app = crate::tui::app::test_app();
+    assert_eq!(
+        execute(&mut app, SlashCommand::Undo),
+        CommandEffect::RunUndo
+    );
+}
+
+#[test]
+fn undo_is_refused_while_busy() {
+    let mut app = crate::tui::app::test_app();
+    app.status = AgentState::Streaming;
+
+    let effect = execute(&mut app, SlashCommand::Undo);
+
+    assert_eq!(effect, CommandEffect::Handled);
+    assert!(
+        app.segments.iter().any(|segment| matches!(
+            segment,
+            crate::tui::app::Segment::Text(text)
+                if text.contains("Agent is busy, try again when it is idle.")
+        )),
+        "the refusal is explained"
+    );
 }

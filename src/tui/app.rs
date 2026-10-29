@@ -96,6 +96,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/init", "Initialize workspace configuration"),
     ("/doctor", "Check environment and health"),
     ("/memory", "Inspect persistent memory"),
+    ("/undo", "Restore files from the latest checkpoint"),
     ("/exit", "Quit Seavx agent TUI"),
 ];
 
@@ -799,6 +800,16 @@ fn apply_command_effect(
                 let _ = tx.send(Action::DoctorDone(report));
             });
         }
+        CommandEffect::RunUndo => {
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let result =
+                    crate::checkpoint::CheckpointStore::undo_latest(std::path::Path::new("."))
+                        .map_err(|error| error.to_string());
+                let _ = tx.send(Action::UndoDone(result));
+            });
+        }
         CommandEffect::RunCompact { instructions } => {
             let transcript = crate::tui::compact::transcript_from_segments(&app.segments);
             if crate::tui::compact::is_too_short(&transcript) {
@@ -1429,6 +1440,20 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                 Action::DoctorDone(report) => {
                     app.status = AgentState::Idle;
                     app.push_notice(crate::cli::doctor::render(&report));
+                }
+                Action::UndoDone(result) => {
+                    app.status = AgentState::Idle;
+                    match result {
+                        Ok(paths) if paths.is_empty() => app.push_notice("Nothing to undo."),
+                        Ok(paths) => {
+                            let mut text = format!("Restored {} file(s):", paths.len());
+                            for path in paths {
+                                text.push_str(&format!("\n{}", path.display()));
+                            }
+                            app.push_notice(text);
+                        }
+                        Err(error) => app.push_notice(format!("Undo failed: {error}")),
+                    }
                 }
                 Action::CompactDone { result } => {
                     app.status = AgentState::Idle;

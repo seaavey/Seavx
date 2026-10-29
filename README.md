@@ -120,6 +120,7 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/init` | Create `.seavx/config.toml` with defaults. |
 | `/doctor [--offline]` | Check config, key, endpoint, cache, workspace, memory, and skills. |
 | `/memory [show\|project\|user\|skills\|path]` | Inspect persistent memory and installed skills. |
+| `/undo` | Restore files from the newest checkpoint and remove it; repeat to walk back. |
 | `/exit` | Quit the TUI. |
 
 `/config` never writes `api_key`; use `seavx setup providers` to change keys. Config writes preserve comments and unknown keys and are atomic.

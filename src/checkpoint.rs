@@ -1,7 +1,3 @@
-// The restore half of this module is consumed by `/undo`, which lands in the
-// next commit; drop this attribute when it does.
-#![allow(dead_code)]
-
 //! Checkpoint store: one directory of complete backups per tool call.
 //!
 //! The manifest is untrusted data on restore. Everything is validated before a
@@ -67,27 +63,33 @@ pub(crate) struct RestoreEntry {
 }
 
 #[derive(Debug)]
-pub(crate) struct CheckpointId(PathBuf);
+pub(crate) struct CheckpointError {
+    prefix: &'static str,
+    detail: String,
+}
 
-impl CheckpointId {
-    pub fn path(&self) -> &Path {
-        &self.0
+impl CheckpointError {
+    fn incomplete(error: &Self) -> Self {
+        Self {
+            prefix: "checkpoint incomplete",
+            detail: error.detail.clone(),
+        }
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct CheckpointError(String);
-
 impl std::fmt::Display for CheckpointError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "checkpoint rejected: {}", self.0)
+        write!(f, "{}: {}", self.prefix, self.detail)
     }
 }
 
 impl std::error::Error for CheckpointError {}
 
 fn reject(message: impl std::fmt::Display) -> CheckpointError {
-    CheckpointError(message.to_string())
+    CheckpointError {
+        prefix: "checkpoint rejected",
+        detail: message.to_string(),
+    }
 }
 
 pub(crate) struct CheckpointStore;
@@ -97,10 +99,10 @@ impl CheckpointStore {
     pub(crate) fn create(
         workspace: &Path,
         entries: &[CheckpointInput],
-    ) -> Result<CheckpointId, CheckpointError> {
+    ) -> Result<PathBuf, CheckpointError> {
         let directory = allocate_directory(&workspace.join(".seavx/checkpoints"))?;
         match write_checkpoint(&directory, workspace, entries) {
-            Ok(()) => Ok(CheckpointId(directory)),
+            Ok(()) => Ok(directory),
             Err(error) => {
                 // A half-written checkpoint must never be offered to undo.
                 let _ = std::fs::remove_dir_all(&directory);
@@ -114,6 +116,32 @@ impl CheckpointStore {
         workspace: &Path,
     ) -> Result<Vec<RestoreEntry>, CheckpointError> {
         Self::validate_with_home(checkpoint, workspace, crate::home::dir().as_deref())
+    }
+
+    /// Restore the newest checkpoint and remove it. Nothing is restored unless
+    /// the whole manifest validates, and the directory is only removed after
+    /// every entry was written back.
+    pub(crate) fn undo_latest(workspace: &Path) -> Result<Vec<PathBuf>, CheckpointError> {
+        let Some(checkpoint) = latest_checkpoint(workspace) else {
+            return Ok(Vec::new());
+        };
+        let entries = Self::validate(&checkpoint, workspace)
+            .map_err(|error| CheckpointError::incomplete(&error))?;
+        restore(&checkpoint, entries)
+    }
+
+    /// Test seam: `undo_latest` with the home directory injected.
+    #[cfg(test)]
+    pub(crate) fn undo_latest_with_home(
+        workspace: &Path,
+        home: Option<&Path>,
+    ) -> Result<Vec<PathBuf>, CheckpointError> {
+        let Some(checkpoint) = latest_checkpoint(workspace) else {
+            return Ok(Vec::new());
+        };
+        let entries = Self::validate_with_home(&checkpoint, workspace, home)
+            .map_err(|error| CheckpointError::incomplete(&error))?;
+        restore(&checkpoint, entries)
     }
 
     /// Validate the whole manifest against `home`'s allowlist; no target is touched.
@@ -145,6 +173,51 @@ impl CheckpointStore {
 
         Ok(entries)
     }
+}
+
+fn restore(checkpoint: &Path, entries: Vec<RestoreEntry>) -> Result<Vec<PathBuf>, CheckpointError> {
+    let mut restored = Vec::new();
+    for entry in entries {
+        match entry.state {
+            EntryState::Created => {
+                if entry.target.exists() {
+                    std::fs::remove_file(&entry.target)
+                        .map_err(|error| reject(format!("{}: {error}", entry.target.display())))?;
+                }
+            }
+            EntryState::Modified => {
+                let backup = entry.backup.as_ref().ok_or_else(|| {
+                    reject(format!(
+                        "{}: modified entry without a backup",
+                        entry.target.display()
+                    ))
+                })?;
+                let bytes = std::fs::read(backup)
+                    .map_err(|error| reject(format!("{}: {error}", backup.display())))?;
+                write_atomic(&entry.target, &bytes, ModePolicy::Preserve)
+                    .map_err(|error| reject(format!("{}: {error}", entry.target.display())))?;
+            }
+            EntryState::Skipped => continue,
+        }
+        restored.push(entry.target);
+    }
+
+    // Only a complete restore removes the checkpoint, so a failure stays retryable.
+    std::fs::remove_dir_all(checkpoint)
+        .map_err(|error| reject(format!("{}: {error}", checkpoint.display())))?;
+    Ok(restored)
+}
+
+fn latest_checkpoint(workspace: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(workspace.join(".seavx/checkpoints")).ok()?;
+    let mut directories: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    // Names start with epoch milliseconds, so lexical order is capture order.
+    directories.sort();
+    directories.pop()
 }
 
 fn allocate_directory(root: &Path) -> Result<PathBuf, CheckpointError> {
