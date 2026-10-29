@@ -1035,3 +1035,37 @@ fn redaction_covers_tool_text_but_not_prompts_or_checkpoints() {
         "the checkpoint backup holds the original bytes"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn creators_tighten_existing_loose_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let seavx = dir.path().join(".seavx");
+    std::fs::create_dir_all(&seavx).unwrap();
+    std::fs::set_permissions(&seavx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for name in ["debug.log", "svx_history"] {
+        let path = seavx.join(name);
+        std::fs::write(&path, b"x\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // The three creators run the way a start does.
+    crate::util::prepare_log_file(&seavx).unwrap();
+    crate::history::ChatHistory::load(&seavx).append("a prompt");
+    SessionStore::open_at(&seavx.join("sessions.db")).unwrap();
+
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&seavx), 0o700, "the directory is tightened");
+    for name in ["debug.log", "svx_history", "sessions.db"] {
+        assert_eq!(mode(&seavx.join(name)), 0o600, "{name} is owner-only");
+    }
+
+    // A path that cannot be created reports one error instead of continuing.
+    let blocker = dir.path().join("plain-file");
+    std::fs::write(&blocker, b"").unwrap();
+    let error = crate::util::ensure_private_dir(&blocker.join("nested"), 0o700).unwrap_err();
+    assert!(!error.to_string().is_empty(), "{error}");
+}

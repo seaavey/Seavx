@@ -91,9 +91,7 @@ enum SetupSection {
 }
 
 fn init_tracing(debug_flag: bool) -> anyhow::Result<Option<PathBuf>> {
-    let log_dir = PathBuf::from(".seavx");
-    std::fs::create_dir_all(&log_dir)?;
-    let log_file_path = log_dir.join("debug.log");
+    let log_file_path = util::prepare_log_file(std::path::Path::new(".seavx"))?;
 
     let file = OpenOptions::new()
         .create(true)

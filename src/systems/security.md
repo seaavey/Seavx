@@ -5,4 +5,5 @@
 - Writes inside the workspace are checkpointed and reversible. Writes outside it require human approval in every mode and cannot be lifted by configuration.
 - Shell command execution must observe 30-second bounded timeout limits. Every segment of a command is classified, not just the first, and any construct that cannot be proven read-only asks.
 - Destructive commands (`rm -rf`, `mkfs`, `dd of=/dev/…`, `shutdown`, `reboot`) are refused outright; the user runs those themselves.
-- Tool output, errors and logs are redacted before they reach the conversation; never copy a credential into a file, a log or an answer.
+- The session database holds prompts and assistant text verbatim; it lives `0600` in a `0700` directory, tool output is redacted before it is stored, and a session whose payload does not match this build's format opens read-only and refuses new turns.
+- - Tool output, errors and logs are redacted before they reach the conversation; never copy a credential into a file, a log or an answer.

@@ -486,7 +486,7 @@ impl SessionStore {
     /// build that does not understand the file never touches it.
     pub fn open_at(path: &Path) -> Result<Self, SessionError> {
         if let Some(directory) = path.parent() {
-            create_owner_only(directory, 0o700)
+            crate::util::ensure_private_dir(directory, 0o700)
                 .map_err(|error| SessionError::Unavailable(error.to_string()))?;
         }
 
@@ -501,7 +501,7 @@ impl SessionStore {
             });
         }
 
-        create_owner_only(path, 0o600)
+        crate::util::ensure_private_file(path, 0o600)
             .map_err(|error| SessionError::Unavailable(error.to_string()))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=2000;",
@@ -951,27 +951,6 @@ fn response_call_id(payload: &str) -> Option<String> {
         .tool_responses()
         .first()
         .map(|response| response.call_id.clone())
-}
-
-fn create_owner_only(path: &Path, mode: u32) -> std::io::Result<()> {
-    if path.is_dir() {
-        std::fs::create_dir_all(path)?;
-    } else if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Tighten, never refuse: a legacy 0755 directory is repaired.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
