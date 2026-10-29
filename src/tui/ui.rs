@@ -225,15 +225,10 @@ pub fn render(app: &App, frame: &mut Frame) {
     let config = &app.config;
     let effort_label = config.reasoning_effort.as_deref().unwrap_or("none");
 
-    // Dynamic model context window limit detection
-    let max_context_limit: i32 = if config.model.contains("claude")
-        || config.model.contains("nemotron")
-        || config.model.contains("gemini")
-    {
-        1_000_000 // 1M context
-    } else {
-        128_000 // default 128k context (deepseek, glm, gpt-4o, etc)
-    };
+    // One table, shared with the budget and `doctor`.
+    let limit = crate::agent::engine::model_context_limit(&config.model);
+    let max_context_limit = limit.tokens;
+    let assumed = if limit.assumed { " (assumed)" } else { "" };
 
     let total = app.total_tokens.max(app.prompt_tokens);
 
@@ -268,7 +263,10 @@ pub fn render(app: &App, frame: &mut Frame) {
                     .add_modifier(Modifier::BOLD),
             ),
             separator.clone(),
-            Span::styled(token_display, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{token_display}{assumed}"),
+                Style::default().fg(Color::Cyan),
+            ),
             separator,
             Span::styled(format!("effort {effort_label}"), dim),
         ])),

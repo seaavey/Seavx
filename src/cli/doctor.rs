@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::agent::engine::{
-    AgentConfig, ConfigOrigin, ConfigReport, DEFAULT_BASE_URL, normalize_base_url,
+    AgentConfig, ConfigOrigin, ConfigReport, DEFAULT_BASE_URL, model_context_limit,
+    normalize_base_url,
 };
 use crate::agent::models::{ModelCache, ModelManager};
 use crate::agent::skills::SkillManager;
@@ -73,6 +74,7 @@ pub async fn run_with_probe(options: DoctorOptions, probe: &dyn EndpointProbe) -
         binary_check(),
         config_check(&config_report),
         secret_check(&config),
+        context_check(&config),
         endpoint_check(&options, &config, &base_url, probe).await,
         cache_check(&options.workspace_root, &base_url),
         workspace_check(&options.workspace_root),
@@ -122,6 +124,17 @@ fn config_check(report: &ConfigReport) -> CheckResult {
         ),
         None => ok("config", "no file; using defaults"),
     }
+}
+
+/// The limit the budget uses, and whether it is this build's conservative guess.
+fn context_check(config: &AgentConfig) -> CheckResult {
+    let limit = model_context_limit(&config.model);
+    let source = if limit.assumed {
+        "assumed".to_string()
+    } else {
+        config.model.clone()
+    };
+    ok("context", format!("{} tokens ({source})", limit.tokens))
 }
 
 fn secret_check(config: &AgentConfig) -> CheckResult {

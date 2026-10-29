@@ -155,6 +155,51 @@ impl AgentConfig {
     }
 }
 
+/// The context window a model is assumed to have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextLimit {
+    pub tokens: i32,
+    /// `true` when the id was not recognised and the conservative default was
+    /// used, so the footer and `doctor` can say so.
+    pub assumed: bool,
+}
+
+/// Model families known to have a 1M window.
+const MILLION_TOKEN_FAMILIES: [&str; 3] = ["claude", "gemini", "nemotron"];
+/// Model families known to have a 128k window.
+const HUNDRED_TWENTY_EIGHT_K_FAMILIES: [&str; 6] =
+    ["deepseek", "glm", "gpt-4o", "gpt-4.1", "o3", "o4"];
+/// Anything unrecognised gets this instead of the largest guess.
+pub const ASSUMED_CONTEXT_LIMIT: i32 = 64_000;
+
+/// One table, shared by the footer, the context budget and `doctor`. An
+/// unrecognised id is never assumed to be 128k.
+pub fn model_context_limit(model: &str) -> ContextLimit {
+    let id = model.to_lowercase();
+    if MILLION_TOKEN_FAMILIES
+        .iter()
+        .any(|family| id.contains(family))
+    {
+        return ContextLimit {
+            tokens: 1_000_000,
+            assumed: false,
+        };
+    }
+    if HUNDRED_TWENTY_EIGHT_K_FAMILIES
+        .iter()
+        .any(|family| id.contains(family))
+    {
+        return ContextLimit {
+            tokens: 128_000,
+            assumed: false,
+        };
+    }
+    ContextLimit {
+        tokens: ASSUMED_CONTEXT_LIMIT,
+        assumed: true,
+    }
+}
+
 pub fn parse_reasoning_effort(effort: &str) -> Option<ReasoningEffort> {
     match effort.to_lowercase().trim() {
         "none" | "zero" | "0" => Some(ReasoningEffort::Zero),

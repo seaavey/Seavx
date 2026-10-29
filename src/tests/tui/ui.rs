@@ -216,3 +216,34 @@ fn empty_session_shows_splash_until_transcript_starts() {
             .any(|r| r.contains(SPLASH[2]))
     );
 }
+
+#[test]
+fn the_footer_marks_an_unrecognised_model_as_assumed() {
+    // Wide enough that the hints do not clip the limit.
+    let mut app = test_app();
+    app.config.model = "vendor/mystery-1".to_string();
+    let mut terminal = Terminal::new(TestBackend::new(170, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("/64k"), "the conservative default: {text}");
+    assert!(text.contains("(assumed)"), "{text}");
+
+    app.config.model = "deepseek-chat".to_string();
+    let mut terminal = Terminal::new(TestBackend::new(170, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("/128k"), "{text}");
+    assert!(!text.contains("(assumed)"), "{text}");
+}

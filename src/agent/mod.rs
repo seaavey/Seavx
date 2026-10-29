@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod budget;
 pub mod engine;
 pub mod models;
 pub mod patch;
