@@ -3,7 +3,6 @@
 //! Shared by `seavx`, the TUI `/config` command and the model picker so every
 //! path validates and persists values the same way.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::agent::engine::{
@@ -106,12 +105,22 @@ pub fn mask_key(value: &str) -> String {
     format!("set (...{tail})")
 }
 
-/// Strip query strings and userinfo from a URL before printing it.
+/// Strip userinfo, query and fragment from a URL before printing it. The marker
+/// says something was removed, so a reader never mistakes the shorter URL for
+/// the value that was stored.
 pub fn redact_url(raw: &str) -> String {
     if let Ok(mut url) = reqwest::Url::parse(raw) {
+        let redacted =
+            !url.username().is_empty() || url.password().is_some() || url.query().is_some();
         let _ = url.set_password(None);
+        let _ = url.set_username("");
         url.set_query(None);
-        return url.to_string();
+
+        let mut text = url.to_string();
+        if redacted {
+            text.push_str(" (userinfo/query redacted)");
+        }
+        return text;
     }
 
     let without_fragment = raw.split('#').next().unwrap_or(raw);
@@ -119,7 +128,7 @@ pub fn redact_url(raw: &str) -> String {
         .split('?')
         .next()
         .unwrap_or(without_fragment);
-    match (without_query.find("://"), without_query.rfind('@')) {
+    let stripped = match (without_query.find("://"), without_query.rfind('@')) {
         (Some(scheme), Some(at)) if at > scheme + 3 => {
             format!(
                 "{}://{}",
@@ -128,6 +137,11 @@ pub fn redact_url(raw: &str) -> String {
             )
         }
         _ => without_query.to_string(),
+    };
+    if stripped != raw {
+        format!("{stripped} (userinfo/query redacted)")
+    } else {
+        stripped
     }
 }
 
@@ -279,7 +293,8 @@ fn canonical_value(key: ConfigKey, raw: &str) -> Result<String, String> {
             let (normalized, _) = normalize_base_url(raw);
             match reqwest::Url::parse(&normalized) {
                 Ok(url) if url.host().is_some() => Ok(normalized),
-                _ => Err(format!("invalid base_url: {raw}")),
+                // Never repeat the input: it may carry userinfo or a token.
+                _ => Err("invalid base_url: expected a URL with a host".to_string()),
             }
         }
         ConfigKey::ReasoningEffort => {
@@ -321,18 +336,22 @@ fn canonical_effort(effort: genai::chat::ReasoningEffort) -> Option<&'static str
 /// Write one key, preserving comments, ordering and unknown keys.
 pub fn set_value(path: &Path, key: ConfigKey, raw: &str) -> Result<String, String> {
     let value = canonical_value(key, raw)?;
-    let mut document = load_document(path)?;
+    update_config(path, |document| {
+        if key == ConfigKey::MaxTurns {
+            let turns: i64 = value
+                .parse()
+                .map_err(|_| "max_turns must be an integer".to_string())?;
+            document[key.name()] = toml_edit::value(turns);
+        } else {
+            document[key.name()] = toml_edit::value(value.clone());
+        }
+        Ok(())
+    })?;
 
-    if key == ConfigKey::MaxTurns {
-        let turns: i64 = value
-            .parse()
-            .map_err(|_| "max_turns must be an integer".to_string())?;
-        document[key.name()] = toml_edit::value(turns);
-    } else {
-        document[key.name()] = toml_edit::value(value.clone());
+    // A URL is echoed only with its userinfo and query removed.
+    if key == ConfigKey::BaseUrl {
+        return Ok(redact_url(&value));
     }
-
-    write_atomic(path, &document.to_string())?;
     Ok(value)
 }
 
@@ -345,16 +364,67 @@ pub fn unset_value(path: &Path, key: ConfigKey) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let mut document = load_document(path)?;
-    if document.remove(key.name()).is_none() {
-        return Ok(false);
-    }
+    let mut removed = false;
+    update_config(path, |document| {
+        removed = document.remove(key.name()).is_some();
+        Ok(())
+    })?;
+    Ok(removed)
+}
 
-    write_atomic(path, &document.to_string())?;
-    Ok(true)
+/// Persist the whole [`AgentConfig`]. Config surfaces whose edit is not one key
+/// (`seavx model`, `seavx setup`, the model picker) go through here.
+pub fn write_agent_config(path: &Path, config: &AgentConfig) -> Result<(), String> {
+    update_config(path, |document| {
+        document["model"] = toml_edit::value(config.model.clone());
+        document["max_turns"] = toml_edit::value(config.max_turns as i64);
+        set_or_remove(document, "base_url", config.base_url.as_deref());
+        set_or_remove(
+            document,
+            "reasoning_effort",
+            config.reasoning_effort.as_deref(),
+        );
+        set_or_remove(document, "system_prompt", config.system_prompt.as_deref());
+        // An absent key in memory never erases the key on disk: `AgentConfig::load`
+        // falls back to the environment, so removing it here would delete a value
+        // the user never changed.
+        if let Some(api_key) = config.api_key.as_deref() {
+            document["api_key"] = toml_edit::value(api_key);
+        }
+        Ok(())
+    })
+}
+
+/// Set the model and, optionally, the reasoning effort as one write.
+pub fn set_model_and_effort(path: &Path, model: &str, effort: Option<&str>) -> Result<(), String> {
+    let model = canonical_value(ConfigKey::Model, model)?;
+    let effort = match effort {
+        Some(raw) => Some(canonical_value(ConfigKey::ReasoningEffort, raw)?),
+        None => None,
+    };
+
+    update_config(path, |document| {
+        document["model"] = toml_edit::value(model.clone());
+        if let Some(effort) = &effort {
+            document["reasoning_effort"] = toml_edit::value(effort.clone());
+        }
+        Ok(())
+    })
+}
+
+fn set_or_remove(document: &mut toml_edit::DocumentMut, key: &str, value: Option<&str>) {
+    match value {
+        Some(value) => document[key] = toml_edit::value(value),
+        None => {
+            document.remove(key);
+        }
+    }
 }
 
 fn load_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
+    // A crashed replace leaves a backup behind; resolve it before reading.
+    recover_config(path)?;
+
     if !path.exists() {
         // `model` and `max_turns` are required by `AgentConfig`, and a file
         // replaces the built-in defaults wholesale. Seed them so one targeted
@@ -375,71 +445,340 @@ fn load_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
     })
 }
 
+/// The one config writer: load, edit, validate the complete document, then
+/// replace the file once. In-process callers are serialised so two of them
+/// cannot interleave a read and a write. A second *process* can still land in
+/// the window between the final re-check and the rename; that case ends in the
+/// `config recovery conflict` branch instead of losing data.
+pub fn update_config(
+    path: &Path,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
+) -> Result<(), String> {
+    static CONFIG_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = CONFIG_WRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut document = load_document(path)?;
+    edit(&mut document)?;
+
+    let text = document.to_string();
+    // Validate the whole resulting document before the file is touched.
+    text.parse::<toml::Value>().map_err(|error| {
+        format!(
+            "failed to validate {}: {}",
+            path.display(),
+            first_line(&error.to_string())
+        )
+    })?;
+
+    replace_config(path, text.as_bytes())
+}
+
 /// Parser errors echo the offending source lines; only the first line is safe
 /// to show because the source may be an `api_key`.
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or_default().trim().to_string()
 }
 
-/// Replace the file atomically; the temporary file is owner-only on Unix.
-fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+const BAK_MARKER: &str = ".bak-";
+
+/// Crash points a test can force. Production passes `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// Creating the `.bak` copy fails.
+    BackupCreate,
+    /// Another writer replaces the target between capture and the re-check.
+    ChangeTargetDuringWrite,
+    /// Removing the target for the replacement fails.
+    TargetRemove,
+    /// A second writer recreates the target between the removal and the rename.
+    ThirdStateAfterRemove,
+    /// The rename into place fails.
+    Rename,
+    /// Removing the `.bak` after a verified write fails.
+    BackupCleanup,
+}
+
+struct Backup {
+    path: PathBuf,
+    record: PathBuf,
+}
+
+impl Backup {
+    fn remove(&self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.record);
+    }
+}
+
+/// Capture the target, keep a private `.bak` copy, replace the target, then
+/// verify the result. Never leaves the process without a usable config.
+fn replace_config(path: &Path, contents: &[u8]) -> Result<(), String> {
+    replace_config_with(path, contents, None)
+}
+
+fn replace_config_with(path: &Path, contents: &[u8], fault: Option<Fault>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     }
 
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "config.toml".to_string());
-    let temporary = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
+    // (1) Capture before anything is written.
+    let captured = std::fs::read(path).ok();
 
-    // A crashed previous run may have left the same pid-named file behind.
-    let _ = std::fs::remove_file(&temporary);
-
-    let result = (|| -> Result<(), String> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| format!("failed to create {}: {error}", temporary.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| format!("failed to secure {}: {error}", temporary.display()))?;
-        }
-
-        file.write_all(contents.as_bytes())
-            .map_err(|error| format!("failed to write {}: {error}", temporary.display()))?;
-        file.sync_all()
-            .map_err(|error| format!("failed to flush {}: {error}", temporary.display()))?;
-        Ok(())
-    })();
-
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&temporary);
+    // (2) Stage the new bytes.
+    let temp = crate::atomic_file::unique_temp_path(path);
+    if let Err(error) = stage(&temp, contents) {
+        let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
 
-    match std::fs::rename(&temporary, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // Windows cannot rename over an existing file; replace it once.
-            #[cfg(windows)]
-            {
-                if path.exists() {
-                    let _ = std::fs::remove_file(path);
-                    if std::fs::rename(&temporary, path).is_ok() {
-                        return Ok(());
-                    }
+    // (3) Keep a private copy of what is being replaced.
+    let backup = match captured.as_deref() {
+        Some(previous) => {
+            if fault == Some(Fault::BackupCreate) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(format!("failed to create a backup of {}", path.display()));
+            }
+            match write_backup(path, previous, contents) {
+                Ok(backup) => Some(backup),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(error);
                 }
             }
-            let _ = std::fs::remove_file(&temporary);
-            Err(format!("failed to replace {}: {error}", path.display()))
         }
+        None => None,
+    };
+
+    let abort = |message: String| -> Result<(), String> {
+        let _ = std::fs::remove_file(&temp);
+        if let Some(backup) = &backup {
+            backup.remove();
+        }
+        Err(message)
+    };
+
+    // (4) Abort when the target moved under us since the capture.
+    if fault == Some(Fault::ChangeTargetDuringWrite)
+        && let Err(error) = std::fs::write(path, b"concurrent = true\n")
+    {
+        return abort(format!("failed to write {}: {error}", path.display()));
     }
+    if std::fs::read(path).ok() != captured {
+        return abort("config changed during write".to_string());
+    }
+    // Re-check immediately before the removal: the last moment the captured
+    // bytes can still be the ones on disk.
+    if std::fs::read(path).ok() != captured {
+        return abort("config changed during write".to_string());
+    }
+
+    // (5) Remove the target.
+    if fault == Some(Fault::TargetRemove) {
+        return abort(format!("failed to remove {}", path.display()));
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return abort(format!("failed to remove {}: {error}", path.display())),
+    }
+
+    if fault == Some(Fault::ThirdStateAfterRemove)
+        && let Err(error) = std::fs::write(path, b"third = 3\n")
+    {
+        return abort(format!("failed to write {}: {error}", path.display()));
+    }
+    if path.exists() {
+        // Someone else wrote a third state. Leave it alone and keep the backup
+        // for the user to decide instead of overwriting their file.
+        let _ = std::fs::remove_file(&temp);
+        let kept = backup
+            .as_ref()
+            .map(|backup| backup.path.display().to_string())
+            .unwrap_or_else(|| "none".to_string());
+        return Err(format!(
+            "config recovery conflict: {}; backup kept at {kept}",
+            path.display()
+        ));
+    }
+
+    // (6) Rename into place.
+    let replaced = fault != Some(Fault::Rename) && std::fs::rename(&temp, path).is_ok();
+    if !replaced {
+        restore_previous(path, captured.as_deref());
+        return abort(format!("failed to replace {}", path.display()));
+    }
+
+    // (7) Verify the new bytes, then drop the backup.
+    if std::fs::read(path).ok().as_deref() != Some(contents) {
+        restore_previous(path, captured.as_deref());
+        return abort(format!("failed to verify {}", path.display()));
+    }
+    if fault != Some(Fault::BackupCleanup)
+        && let Some(backup) = &backup
+    {
+        backup.remove();
+    }
+    Ok(())
+}
+
+fn stage(temp: &Path, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = create_exclusive(temp)?;
+    file.write_all(contents)
+        .map_err(|error| format!("failed to write {}: {error}", temp.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("failed to flush {}: {error}", temp.display()))
+}
+
+fn create_exclusive(path: &Path) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map_err(|error| format!("failed to create {}: {error}", path.display()))
+}
+
+/// The backup carries the bytes being replaced; the `.new` record names the
+/// bytes the interrupted write intended, so recovery can tell the new state from
+/// a third one.
+fn write_backup(path: &Path, previous: &[u8], next: &[u8]) -> Result<Backup, String> {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let nanos = crate::util::epoch_millis();
+    let backup_path = path.with_file_name(format!("{name}{BAK_MARKER}{nanos}-{}", previous.len()));
+
+    let mut file = create_exclusive(&backup_path)?;
+    file.write_all(previous)
+        .map_err(|error| format!("failed to write {}: {error}", backup_path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("failed to flush {}: {error}", backup_path.display()))?;
+    drop(file);
+
+    let record = PathBuf::from(format!("{}.new", backup_path.display()));
+    let contents = format!("{}\t{}\n", next.len(), crate::checkpoint::fnv1a64(next));
+    if let Err(error) = std::fs::write(&record, contents) {
+        let _ = std::fs::remove_file(&backup_path);
+        return Err(format!("failed to record {}: {error}", record.display()));
+    }
+
+    Ok(Backup {
+        path: backup_path,
+        record,
+    })
+}
+
+fn restore_previous(path: &Path, previous: Option<&[u8]>) {
+    if let Some(previous) = previous {
+        let _ = crate::atomic_file::write_atomic(
+            path,
+            previous,
+            crate::atomic_file::ModePolicy::Force(0o600),
+        );
+    }
+}
+
+/// Resolve a backup left by a crashed replace. Never deletes the only good copy.
+pub fn recover_config(path: &Path) -> Result<(), String> {
+    let Some(backup_path) = newest_backup(path) else {
+        return Ok(());
+    };
+    let record = PathBuf::from(format!("{}.new", backup_path.display()));
+    let intended = std::fs::read_to_string(&record)
+        .ok()
+        .and_then(|text| parse_record(&text));
+    let previous = std::fs::read(&backup_path).ok();
+    let current = std::fs::read(path).ok();
+
+    let discard = || {
+        let _ = std::fs::remove_file(&backup_path);
+        let _ = std::fs::remove_file(&record);
+    };
+
+    match (current, previous) {
+        (None, None) => Err(format!("config unavailable: {}", path.display())),
+        (None, Some(previous)) => {
+            let usable = std::fs::symlink_metadata(&backup_path)
+                .map(|metadata| {
+                    metadata.is_file() && backup_length(&backup_path) == Some(previous.len() as u64)
+                })
+                .unwrap_or(false);
+            if !usable {
+                return Err(format!(
+                    "config unavailable: {}; backup kept at {}",
+                    path.display(),
+                    backup_path.display()
+                ));
+            }
+            crate::atomic_file::write_atomic(
+                path,
+                &previous,
+                crate::atomic_file::ModePolicy::Force(0o600),
+            )
+            .map_err(|error| format!("failed to restore {}: {error}", path.display()))?;
+            discard();
+            Ok(())
+        }
+        (Some(current), Some(previous)) => {
+            let landed = intended.is_some_and(|(len, sum)| {
+                current.len() as u64 == len && crate::checkpoint::fnv1a64(&current) == sum
+            });
+            if landed || current == previous {
+                discard();
+                return Ok(());
+            }
+            Err(format!(
+                "config recovery conflict: {}; backup kept at {}",
+                path.display(),
+                backup_path.display()
+            ))
+        }
+        // An unreadable backup cannot be used; leave it for the user.
+        (Some(_), None) => Ok(()),
+    }
+}
+
+fn parse_record(text: &str) -> Option<(u64, u64)> {
+    let (len, sum) = text.trim().split_once('\t')?;
+    Some((len.parse().ok()?, sum.parse().ok()?))
+}
+
+fn backup_length(backup: &Path) -> Option<u64> {
+    let name = backup.file_name()?.to_str()?;
+    let (_, length) = name.rsplit_once('-')?;
+    length.parse().ok()
+}
+
+fn newest_backup(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    let prefix = format!("{name}{BAK_MARKER}");
+    let mut backups: Vec<PathBuf> = std::fs::read_dir(path.parent()?)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                // The `.new` record shares the prefix but is not a backup.
+                .map(|file| {
+                    let file = file.to_string_lossy();
+                    file.starts_with(&prefix) && !file.ends_with(".new")
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    backups.sort();
+    backups.pop()
 }
 
 /// Create `.seavx/config.toml` when missing. Returns `(path, created)`.
@@ -449,10 +788,13 @@ pub fn init_workspace(workspace_root: &Path) -> Result<(PathBuf, bool), String> 
         return Ok((path, false));
     }
 
-    let default_toml = format!(
-        "model = \"{DEFAULT_MODEL}\"\nmax_turns = {DEFAULT_MAX_TURNS}\nbase_url = \"{DEFAULT_BASE_URL}\"\napi_key = \"\"\n"
-    );
-    write_atomic(&path, &default_toml)?;
+    update_config(&path, |document| {
+        document["model"] = toml_edit::value(DEFAULT_MODEL);
+        document["max_turns"] = toml_edit::value(DEFAULT_MAX_TURNS);
+        document["base_url"] = toml_edit::value(DEFAULT_BASE_URL);
+        document["api_key"] = toml_edit::value("");
+        Ok(())
+    })?;
     Ok((path, true))
 }
 

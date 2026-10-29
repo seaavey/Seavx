@@ -17,9 +17,15 @@ pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Resul
     if let Some(chosen_model) = model {
         config.model = chosen_model;
         if let Some(eff) = effort {
+            // Both fields are validated before the one write, so a bad effort
+            // cannot leave the model changed.
+            if crate::agent::engine::parse_reasoning_effort(&eff).is_none() {
+                anyhow::bail!("unknown reasoning effort '{eff}'");
+            }
             config.reasoning_effort = Some(eff);
         }
-        config.write_to(&config_path)?;
+        crate::cli::config::write_agent_config(&config_path, &config)
+            .map_err(anyhow::Error::msg)?;
         println!(
             "Updated .seavx/config.toml: model = {}, effort = {:?}",
             config.model, config.reasoning_effort
@@ -90,7 +96,7 @@ pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Resul
         config.reasoning_effort = Some(chosen_effort.to_string());
     }
 
-    config.write_to(&config_path)?;
+    crate::cli::config::write_agent_config(&config_path, &config).map_err(anyhow::Error::msg)?;
     println!("\nSuccessfully saved to .seavx/config.toml!");
     println!("  Model : {}", config.model);
     println!(

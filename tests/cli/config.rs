@@ -122,3 +122,280 @@ fn written_config_is_owner_only() {
         0o600
     );
 }
+
+// ---- Crash-recoverable config writer (phase 0.5, task 4) -------------------
+
+fn config_file(dir: &Path) -> PathBuf {
+    let path = dir.join(".seavx/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    path
+}
+
+/// Plant the pair a crashed replace leaves behind: `.bak-<nanos>-<len>` plus the
+/// `.new` record naming the bytes that replace was writing.
+fn plant_backup(path: &Path, previous: &[u8], next: &[u8]) -> PathBuf {
+    let name = path.file_name().unwrap().to_string_lossy().to_string();
+    let backup = path.with_file_name(format!("{name}.bak-1000-{}", previous.len()));
+    fs::write(&backup, previous).unwrap();
+    let record = format!("{}\t{}\n", next.len(), crate::checkpoint::fnv1a64(next));
+    fs::write(PathBuf::from(format!("{}.new", backup.display())), record).unwrap();
+    backup
+}
+
+fn stash_written_config(path: &Path) -> String {
+    fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn config_writer_preserves_comments_and_unknown_keys() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(
+        &path,
+        "# keep me\nmodel = \"old\"\nmax_turns = 10\ncustom = 1\n",
+    )
+    .unwrap();
+
+    update_config(&path, |document| {
+        document["model"] = toml_edit::value("new-model");
+        Ok(())
+    })
+    .unwrap();
+
+    let text = stash_written_config(&path);
+    assert!(text.contains("# keep me"), "{text}");
+    assert!(text.contains("custom = 1"), "{text}");
+    assert!(text.contains("model = \"new-model\""), "{text}");
+
+    // The whole-config write used by `seavx model`/`seavx setup` keeps them too.
+    let config = crate::agent::engine::AgentConfig {
+        model: "third".to_string(),
+        max_turns: 11,
+        base_url: None,
+        api_key: None,
+        reasoning_effort: None,
+        system_prompt: None,
+    };
+    write_agent_config(&path, &config).unwrap();
+    let text = stash_written_config(&path);
+    assert!(text.contains("# keep me"), "{text}");
+    assert!(text.contains("custom = 1"), "{text}");
+    assert!(text.contains("model = \"third\""), "{text}");
+    assert!(text.contains("max_turns = 11"), "{text}");
+}
+
+#[test]
+fn config_writer_validates_all_changes_before_write() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    let original = "model = \"old\"\nmax_turns = 10\n";
+    fs::write(&path, original).unwrap();
+
+    let error = update_config(&path, |document| {
+        document["model"] = toml_edit::value("changed");
+        Err("invalid combination".to_string())
+    })
+    .unwrap_err();
+
+    assert!(error.contains("invalid combination"), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn set_model_and_effort_writes_both_fields_or_neither() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    let original = "model = \"old\"\nmax_turns = 10\n";
+    fs::write(&path, original).unwrap();
+
+    let error = set_model_and_effort(&path, "new-model", Some("turbo")).unwrap_err();
+    assert!(error.contains("reasoning_effort"), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    set_model_and_effort(&path, "new-model", Some("high")).unwrap();
+    let text = stash_written_config(&path);
+    assert!(text.contains("model = \"new-model\""), "{text}");
+    assert!(text.contains("reasoning_effort = \"high\""), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn config_writer_tightens_0644_to_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"old\"\nmax_turns = 10\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    set_value(&path, ConfigKey::Model, "new").unwrap();
+
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn config_writer_never_echoes_url_userinfo_or_query() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+
+    let shown = set_value(
+        &path,
+        ConfigKey::BaseUrl,
+        "https://user:pass@host/v1?token=abc123",
+    )
+    .unwrap();
+    assert!(!shown.contains("user:pass"), "{shown}");
+    assert!(!shown.contains("pass"), "{shown}");
+    assert!(!shown.contains("abc123"), "{shown}");
+    assert!(shown.contains("host"), "{shown}");
+    // The stored value keeps the credentials the endpoint needs.
+    assert!(stash_written_config(&path).contains("host"));
+
+    let error =
+        set_value(&path, ConfigKey::BaseUrl, "https://user:pass@?token=abc123").unwrap_err();
+    assert!(!error.contains("user:pass"), "{error}");
+    assert!(!error.contains("abc123"), "{error}");
+}
+
+#[test]
+fn config_writer_rechecks_target_before_remove() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"old\"\n").unwrap();
+
+    let error = replace_config_with(
+        &path,
+        b"model = \"new\"\n",
+        Some(Fault::ChangeTargetDuringWrite),
+    )
+    .unwrap_err();
+
+    assert!(error.contains("config changed during write"), "{error}");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("concurrent = true"), "{text}");
+}
+
+#[test]
+fn config_recovery_handles_new_old_missing_and_both_missing() {
+    let temp = tempdir().unwrap();
+
+    // Target already holds the new bytes: the stale backup is dropped.
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"new\"\n").unwrap();
+    let backup = plant_backup(&path, b"model = \"old\"\n", b"model = \"new\"\n");
+    recover_config(&path).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "model = \"new\"\n");
+    assert!(!backup.exists(), "a landed replace drops its backup");
+
+    // Target still holds the old bytes: the replace never landed.
+    let path = config_file(&temp.path().join("old"));
+    fs::write(&path, "model = \"old\"\n").unwrap();
+    let backup = plant_backup(&path, b"model = \"old\"\n", b"model = \"new\"\n");
+    recover_config(&path).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "model = \"old\"\n");
+    assert!(!backup.exists());
+
+    // Target removed by the crash: restore it from the backup.
+    let path = config_file(&temp.path().join("missing"));
+    fs::write(&path, "model = \"old\"\n").unwrap();
+    plant_backup(&path, b"model = \"old\"\n", b"model = \"new\"\n");
+    fs::remove_file(&path).unwrap();
+    recover_config(&path).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "model = \"old\"\n");
+
+    // Both gone: report instead of inventing a config.
+    let path = config_file(&temp.path().join("both-gone"));
+    let name = path.file_name().unwrap().to_string_lossy().to_string();
+    fs::create_dir(path.with_file_name(format!("{name}.bak-1000-5"))).unwrap();
+    let error = recover_config(&path).unwrap_err();
+    assert!(error.contains("config unavailable"), "{error}");
+    assert!(!path.exists());
+}
+
+#[test]
+fn config_recovery_keeps_third_state_and_backup() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"third\"\n").unwrap();
+    let backup = plant_backup(&path, b"model = \"old\"\n", b"model = \"new\"\n");
+
+    let error = recover_config(&path).unwrap_err();
+
+    assert!(error.contains("config recovery conflict"), "{error}");
+    assert!(error.contains(&backup.display().to_string()), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "model = \"third\"\n");
+    assert!(backup.exists(), "the backup is kept for the user");
+    assert!(
+        PathBuf::from(format!("{}.new", backup.display())).exists(),
+        "the record of the interrupted write is kept"
+    );
+}
+
+#[test]
+fn config_writer_conflicts_if_target_changes_after_final_recheck() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"old\"\n").unwrap();
+
+    let error = replace_config_with(
+        &path,
+        b"model = \"new\"\n",
+        Some(Fault::ThirdStateAfterRemove),
+    )
+    .unwrap_err();
+
+    assert!(error.contains("config recovery conflict"), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "third = 3\n");
+    let backups: Vec<_> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.contains(".bak-") && !name.ends_with(".new")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "the backup is kept");
+}
+
+#[test]
+fn config_writer_faults_leave_old_or_new() {
+    let temp = tempdir().unwrap();
+    let old = b"model = \"old\"\n";
+    let new = b"model = \"new\"\n";
+
+    for fault in [Fault::BackupCreate, Fault::TargetRemove, Fault::Rename] {
+        let path = config_file(&temp.path().join(format!("{fault:?}")));
+        fs::write(&path, old).unwrap();
+
+        let result = replace_config_with(&path, new, Some(fault));
+
+        let text = fs::read(&path).unwrap();
+        assert!(
+            text == old || text == new,
+            "{fault:?} left neither the old nor the new config: {text:?}"
+        );
+        assert!(result.is_err(), "{fault:?} must not report success");
+        assert!(
+            fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains("seavx-tmp")),
+            "{fault:?} left a staging temp behind"
+        );
+    }
+
+    // A failing backup cleanup keeps the new config and the stale backup.
+    let path = config_file(&temp.path().join("cleanup"));
+    fs::write(&path, old).unwrap();
+    replace_config_with(&path, new, Some(Fault::BackupCleanup)).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), new);
+    assert!(
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".bak-")),
+        "the backup survives a failed cleanup"
+    );
+}

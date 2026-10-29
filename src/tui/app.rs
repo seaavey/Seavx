@@ -399,20 +399,10 @@ impl<'a> App<'a> {
         };
 
         let config_path = crate::cli::config::workspace_config_path(std::path::Path::new("."));
+        // One write: the model and the effort change together or not at all.
         let mut errors = Vec::new();
-        if let Err(error) = crate::cli::config::set_value(
-            &config_path,
-            crate::cli::config::ConfigKey::Model,
-            &resolved_model,
-        ) {
-            errors.push(error);
-        }
-        if let Some(effort) = effort
-            && let Err(error) = crate::cli::config::set_value(
-                &config_path,
-                crate::cli::config::ConfigKey::ReasoningEffort,
-                effort,
-            )
+        if let Err(error) =
+            crate::cli::config::set_model_and_effort(&config_path, &resolved_model, effort)
         {
             errors.push(error);
         }
@@ -1208,11 +1198,15 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     app.config.model = model.clone();
                                     app.config.reasoning_effort = Some(chosen_effort.clone());
 
-                                    // Persist to .seavx/config.toml
-                                    let _ = app.config.save(std::path::Path::new("."));
+                                    // Persist through the one config writer.
+                                    let saved = app.config.save(std::path::Path::new("."));
 
+                                    let saved_line = match &saved {
+                                        Ok(()) => "Saved to .seavx/config.toml".to_string(),
+                                        Err(error) => format!("Failed to save config: {error}"),
+                                    };
                                     app.set_text(format!(
-                                        "✓ Switched model to: {}\n✓ Reasoning effort: {}\nSaved to .seavx/config.toml",
+                                        "Switched model to: {}\nReasoning effort: {}\n{saved_line}",
                                         app.config.model,
                                         app.config.reasoning_effort.as_deref().unwrap_or("none")
                                     ));

@@ -76,7 +76,7 @@ fn create_temp_file(temp_path: &Path) -> std::io::Result<File> {
     options.open(temp_path)
 }
 
-fn unique_temp_path(path: &Path) -> PathBuf {
+pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()

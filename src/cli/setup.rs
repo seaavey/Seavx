@@ -131,14 +131,9 @@ pub async fn providers() -> anyhow::Result<()> {
         config.reasoning_effort = Some(effort.to_lowercase());
     }
 
-    config.write_to(&config_path)?;
-
-    // The file holds an API key, so keep it private to the user.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    // One writer: it validates, preserves unknown keys and forces mode `0600`,
+    // which a file holding an API key needs.
+    crate::cli::config::write_agent_config(&config_path, &config).map_err(anyhow::Error::msg)?;
 
     screen(
         &config_path,
