@@ -17,7 +17,6 @@ pub(crate) enum ModePolicy {
     /// Keep the target's permissions; a new file follows `umask`.
     Preserve,
     /// Apply exactly this mode.
-    #[allow(dead_code)] // constructed by the checkpoint store and config writer
     Force(u32),
 }
 
@@ -132,11 +131,19 @@ fn umask() -> u32 {
         .unwrap_or(0o022)
 }
 
-// shortcut: the umask is read from /proc on Linux only, so another Unix keeps
-// 0644 for brand-new files. Upgrade when Seavx ships there.
+/// Other Unix systems have no `/proc`, so the umask has to be read by clearing
+/// it for an instant. The value is cached: the window exists once per process.
 #[cfg(all(unix, not(target_os = "linux")))]
 fn umask() -> u32 {
-    0o022
+    static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UMASK.get_or_init(|| {
+        // SAFETY: reading the umask requires setting it; it is restored at once.
+        unsafe {
+            let current = libc::umask(0);
+            libc::umask(current);
+            current as u32
+        }
+    })
 }
 
 #[cfg(unix)]

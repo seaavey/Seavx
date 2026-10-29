@@ -2027,6 +2027,7 @@ dependencies = [
  "futures",
  "genai",
  "indicatif",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "reqwest",

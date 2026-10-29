@@ -5,6 +5,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::tempdir;
 
+/// Changing the process umask is global, so the mode tests take turns.
+static UMASK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct UmaskRestore(libc::mode_t);
+
+impl Drop for UmaskRestore {
+    fn drop(&mut self) {
+        // SAFETY: restoring the value this guard replaced.
+        unsafe { libc::umask(self.0) };
+    }
+}
+
 /// Deterministic temp path inside `dir`, so collision and cleanup tests can name it.
 fn temp_beside(target: &Path, dir: &Path) -> std::path::PathBuf {
     let name = target.file_name().unwrap().to_string_lossy().to_string();
@@ -55,6 +67,33 @@ fn atomic_write_forces_requested_mode() {
     write_atomic(&target, b"new", ModePolicy::Force(0o600)).unwrap();
 
     assert_eq!(mode_of(&target), 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn force_mode_ignores_a_permissive_umask() {
+    let _serial = UMASK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: reading the process umask requires setting it; the guard restores it.
+    let previous = unsafe { libc::umask(0) };
+    let _restore = UmaskRestore(previous);
+
+    let temp = tempdir().unwrap();
+    let forced = temp.path().join("forced.toml");
+    write_atomic(&forced, b"x", ModePolicy::Force(0o600)).unwrap();
+    assert_eq!(mode_of(&forced), 0o600, "Force ignores the umask");
+
+    // Preserve on a new file follows the umask the process really has.
+    let permissive = temp.path().join("permissive.txt");
+    write_atomic(&permissive, b"x", ModePolicy::Preserve).unwrap();
+    assert_eq!(mode_of(&permissive), 0o666);
+
+    // SAFETY: same guard, second value; the drop restores the original.
+    unsafe { libc::umask(0o077) };
+    let restricted = temp.path().join("restricted.txt");
+    write_atomic(&restricted, b"x", ModePolicy::Preserve).unwrap();
+    assert_eq!(mode_of(&restricted), 0o600);
 }
 
 #[cfg(unix)]

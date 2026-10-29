@@ -220,6 +220,39 @@ fn set_model_and_effort_writes_both_fields_or_neither() {
 
 #[cfg(unix)]
 #[test]
+fn legacy_config_0644_becomes_0600_while_source_0644_stays_0644() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+
+    let config = config_file(temp.path());
+    fs::write(&config, "model = \"old\"\nmax_turns = 10\n").unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    set_value(&config, ConfigKey::Model, "new").unwrap();
+    assert_eq!(
+        fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "Force applies to config writes"
+    );
+
+    let source = temp.path().join("src.rs");
+    fs::write(&source, "fn main() {}\n").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+    crate::atomic_file::write_atomic(
+        &source,
+        b"fn main() { }\n",
+        crate::atomic_file::ModePolicy::Preserve,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "Preserve keeps an ordinary file's mode"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn config_writer_tightens_0644_to_0600() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempdir().unwrap();
