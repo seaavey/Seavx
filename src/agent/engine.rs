@@ -1,5 +1,5 @@
 use crate::agent::prompt::{PLAN_POLICY, load_system_prompt};
-use crate::agent::security::WorkspaceSecurity;
+use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
 use genai::Client;
 use genai::adapter::AdapterKind;
@@ -476,7 +476,11 @@ impl AgentRuntime {
                     "Task completed.".to_string()
                 };
 
-                tracing::info!(turns = turn + 1, final_output = %return_text, "Agent completed task");
+                tracing::info!(
+                    turns = turn + 1,
+                    final_output = %security::redact(&return_text),
+                    "Agent completed task"
+                );
 
                 // Auto-Skill Evaluation: a completed task that ran at least two tools is a
                 // candidate workflow (a single call is not), regardless of how many turns it took.
@@ -521,8 +525,9 @@ impl AgentRuntime {
                     other => other.to_string(),
                 };
 
+                let args_summary = security::redact(&args_summary);
                 event_sink(&format!("Tool: {tool_name}({args_summary})"));
-                tracing::info!(tool = %tool_name, args = %args_summary, id = %call.call_id, "Executing agent tool");
+                Self::log_tool_call(tool_name, &args_summary, &call.call_id);
                 steps.push(format!("{tool_name}({args_summary})"));
 
                 let (result_str, is_err) = match self.registry.get_for_mode(tool_name, mode) {
@@ -536,7 +541,8 @@ impl AgentRuntime {
                     Err(err) => (format!("Error executing {tool_name}: {err}"), true),
                 };
 
-                tracing::info!(tool = %tool_name, is_error = is_err, output = %result_str, "Agent tool completed");
+                let result_str = security::redact(&result_str);
+                Self::log_tool_result(tool_name, is_err, &result_str);
 
                 // Emit preview snippet of tool output (first 3 lines or 150 chars)
                 let preview = result_str.lines().take(3).collect::<Vec<_>>().join("\n");
@@ -578,7 +584,17 @@ impl AgentRuntime {
         }
     }
 
-    fn log_request_payload(
+    /// The only place tool activity is logged, so redaction cannot be forgotten
+    /// by a new call site: the argument is masked here, not by the caller.
+    pub(crate) fn log_tool_call(tool: &str, args: &str, id: &str) {
+        tracing::info!(tool = %tool, args = %security::redact(args), id = %id, "Executing agent tool");
+    }
+
+    pub(crate) fn log_tool_result(tool: &str, is_error: bool, output: &str) {
+        tracing::info!(tool = %tool, is_error = is_error, output = %security::redact(output), "Agent tool completed");
+    }
+
+    pub(crate) fn log_request_payload(
         model: &str,
         turn: usize,
         chat_req: &ChatRequest,
@@ -631,7 +647,11 @@ impl AgentRuntime {
                         }
                     }
                 };
-                summary.push_str(&format!("  msg[{}][{role}]: {content_summary}\n", idx));
+                summary.push_str(&format!(
+                    "  msg[{}][{role}]: {}\n",
+                    idx,
+                    security::redact(&content_summary)
+                ));
             }
 
             // List tool names concisely instead of thousands of JSON schema lines

@@ -186,3 +186,82 @@ async fn undo_does_not_delete_an_unreadable_target() {
     );
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
+
+#[tokio::test]
+async fn tool_output_and_logs_never_contain_a_fake_key() {
+    let (_temp, root, security) = prepare().await;
+    let key = "sk-live-test";
+    std::fs::write(
+        root.join(".seavx/config.toml"),
+        format!("api_key = \"{key}\"\n"),
+    )
+    .unwrap();
+
+    let registry = ToolRegistry::with_default_tools();
+
+    // A read of the config is refused, and the refusal does not echo the key.
+    let refused = registry
+        .get("read_file")
+        .unwrap()
+        .execute(json!({ "path": ".seavx/config.toml" }), &security)
+        .await
+        .unwrap_err();
+    assert!(
+        !refused.contains(key),
+        "the error echoed the key: {refused}"
+    );
+
+    // A search over the workspace returns no line from it.
+    let found = registry
+        .get("search_files")
+        .unwrap()
+        .execute(json!({ "pattern": "api_key" }), &security)
+        .await
+        .unwrap_or_default();
+    assert!(!found.contains(key), "the search echoed the key: {found}");
+
+    // The log sinks are written by the engine's own helpers, so a real file on
+    // disk is the evidence, not the redactor's unit test.
+    let debug_log = root.join(".seavx/debug.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&debug_log)
+        .unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(file)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    crate::agent::engine::AgentRuntime::log_tool_call(
+        "read_file",
+        &format!("api_key = \"{key}\""),
+        "call-1",
+    );
+    crate::agent::engine::AgentRuntime::log_tool_result(
+        "read_file",
+        true,
+        &format!("Error: api_key = \"{key}\""),
+    );
+    crate::agent::engine::AgentRuntime::log_request_payload(
+        "test-model",
+        0,
+        &genai::chat::ChatRequest::from_user(format!("api_key = \"{key}\"")),
+        &genai::chat::ChatOptions::default(),
+        &root,
+    );
+
+    let debug = std::fs::read_to_string(&debug_log).unwrap();
+    assert!(
+        debug.contains("Agent tool completed"),
+        "the log sink received nothing: {debug}"
+    );
+    assert!(!debug.contains(key), "debug.log kept the key: {debug}");
+
+    let request = std::fs::read_to_string(root.join(".seavx/request.log")).unwrap();
+    assert!(
+        !request.contains(key),
+        "request.log kept the key: {request}"
+    );
+}

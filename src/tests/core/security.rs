@@ -164,3 +164,28 @@ mod verified_open {
         assert!(result.is_err(), "a socket must be refused");
     }
 }
+
+#[test]
+fn redact_masks_every_documented_shape() {
+    let cases = [
+        ("api_key = \"sk-live-123\"", "sk-live-123"),
+        ("Authorization: Bearer abc.def", "abc.def"),
+        ("token=ghp_abcdef", "ghp_abcdef"),
+        ("password: hunter2", "hunter2"),
+        ("key «redacted:AKIA…»", "«redacted:AKIA…»"),
+    ];
+    for (line, secret) in cases {
+        let redacted = crate::agent::security::redact(line);
+        assert!(!redacted.contains(secret), "{line} leaked as {redacted}");
+    }
+
+    let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END-----";
+    let redacted = crate::agent::security::redact(pem);
+    assert!(redacted.contains("-----BEGIN OPENSSH PRIVATE KEY-----"));
+    assert!(!redacted.contains("AAAA"));
+
+    assert_eq!(
+        crate::agent::security::redact("ordinary text"),
+        "ordinary text"
+    );
+}

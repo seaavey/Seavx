@@ -88,6 +88,139 @@ pub fn check_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Assignment keys whose value is masked to the end of the line.
+const SECRET_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+];
+/// Token shapes masked wherever they appear. Heuristic, not a secret scanner:
+/// a determined format change slips through until it is added here.
+const TOKEN_PREFIXES: &[&str] = &[
+    "sk-", "ghp_", "gho_", "xoxb-", "xoxa-", "xoxp-", "ntn_", "AKIA",
+];
+
+/// Mask every documented secret shape so tool text can reach a log, an error or
+/// the model without carrying a credential. Ordinary text is returned unchanged.
+pub fn redact(text: &str) -> String {
+    mask_pem_bodies(text)
+        .split('\n')
+        .map(redact_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A private-key block keeps its BEGIN header and loses its body.
+fn mask_pem_bodies(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_body = false;
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        if in_body {
+            if line.contains("-----END") {
+                in_body = false;
+                out.push_str(line);
+            } else {
+                out.push_str("[redacted]");
+            }
+            continue;
+        }
+        if line.starts_with("-----BEGIN") && line.contains("PRIVATE KEY-----") {
+            in_body = true;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn redact_line(line: &str) -> String {
+    if let Some(start) = secret_value_start(line) {
+        return format!("{}[redacted]", &line[..start]);
+    }
+    mask_tokens(line)
+}
+
+/// Byte offset where an assignment's value begins, for the earliest key that has
+/// a `:` or `=` separator after its name.
+fn secret_value_start(line: &str) -> Option<usize> {
+    let lower = line.to_ascii_lowercase();
+    let mut earliest: Option<usize> = None;
+    for key in SECRET_KEYS {
+        let mut from = 0;
+        while let Some(found) = lower[from..].find(key) {
+            let start = from + found;
+            let rest = &line[start + key.len()..];
+            let separator = rest
+                .char_indices()
+                .find(|(_, ch)| !matches!(ch, ' ' | '\t'));
+            if let Some((offset, ch)) = separator
+                && matches!(ch, '=' | ':')
+            {
+                let value = line[start + key.len() + offset + ch.len_utf8()..].trim_start();
+                if !value.is_empty() {
+                    let value_start = line.len() - value.len();
+                    earliest =
+                        Some(earliest.map_or(value_start, |current| current.min(value_start)));
+                    break;
+                }
+            }
+            from = start + key.len();
+        }
+    }
+    earliest
+}
+
+fn mask_tokens(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut index = 0;
+    while index < line.len() {
+        let boundary = index == 0
+            || !line[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_alphanumeric());
+        if boundary && let Some(len) = token_len_at(line, index) {
+            out.push_str("[redacted]");
+            index += len;
+            continue;
+        }
+        let ch = line[index..].chars().next().unwrap_or_default();
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn token_len_at(line: &str, index: usize) -> Option<usize> {
+    let rest = &line[index..];
+    let prefix = TOKEN_PREFIXES
+        .iter()
+        .find(|prefix| rest.starts_with(**prefix))?;
+    let mut len = prefix.len();
+    let mut truncated = false;
+    for ch in rest[prefix.len()..].chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            len += ch.len_utf8();
+        } else if ch == '…' {
+            // An ellipsis marks a secret that was already cut short for display.
+            truncated = true;
+            len += ch.len_utf8();
+            break;
+        } else {
+            break;
+        }
+    }
+    // A run shorter than this is prose ("risk-averse"), not a secret.
+    let minimum = if *prefix == "AKIA" { 8 } else { 4 };
+    (truncated || len - prefix.len() >= minimum).then_some(len)
+}
+
 /// Identity of a path as seen before opening it. Proving what was validated is
 /// the point: the opened handle must match this, or the path changed in between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
