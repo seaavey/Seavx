@@ -615,3 +615,74 @@ fn resending_a_pending_prompt_creates_one_row_and_one_request() {
         .unwrap();
     assert_eq!(first, "complete", "the stored status is untouched");
 }
+
+#[test]
+fn esc_cancels_while_busy_and_quits_only_when_idle() {
+    let mut busy = test_app();
+    busy.status = AgentState::Streaming;
+    busy.escape();
+    assert!(busy.cancel.is_cancelled(), "Esc cancels the running turn");
+    assert!(!busy.should_quit, "a running turn is not a reason to quit");
+    assert_eq!(
+        busy.status,
+        AgentState::Streaming,
+        "the worker owns the status"
+    );
+
+    let mut idle = test_app();
+    idle.escape();
+    assert!(idle.should_quit, "Esc quits when nothing is running");
+
+    // With a popup on screen, Esc closes it and touches neither.
+    let mut popup = test_app();
+    popup.status = AgentState::Thinking;
+    popup.input.insert_str("/he");
+    assert!(popup.popup_open());
+    popup.escape();
+    assert!(!popup.popup_open(), "the popup closes first");
+    assert!(!popup.cancel.is_cancelled(), "the turn keeps running");
+    assert!(!popup.should_quit, "and the session is not ended");
+}
+
+#[test]
+fn a_cancelled_turn_prints_one_line_and_returns_to_idle() {
+    use crate::agent::cancel::{Cleanup, TurnStatus};
+
+    let mut app = test_app();
+    app.status = AgentState::Streaming;
+    app.finish_turn(TurnStatus::Cancelled, Some(Cleanup::Confirmed), Some(4242));
+    assert_eq!(app.status, AgentState::Idle);
+    let text = transcript(&app);
+    assert!(text.contains("System: cancelled"), "{text}");
+    assert!(
+        !text.contains("could not be confirmed"),
+        "a confirmed kill claims nothing extra: {text}"
+    );
+
+    let mut unconfirmed = test_app();
+    unconfirmed.status = AgentState::Streaming;
+    unconfirmed.finish_turn(
+        TurnStatus::Cancelled,
+        Some(Cleanup::Unconfirmed),
+        Some(4242),
+    );
+    let text = transcript(&unconfirmed);
+    assert!(text.contains("System: cancelled"), "{text}");
+    assert!(
+        text.contains("cancellation could not be confirmed; pid 4242 may still be running"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn agent_done_fires_exactly_once_per_turn() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let _guard = DoneGuard(tx.clone());
+    }
+    assert!(matches!(rx.try_recv(), Ok(Action::AgentDone)));
+    assert!(
+        rx.try_recv().is_err(),
+        "one turn, one AgentDone, even when the task returned early"
+    );
+}

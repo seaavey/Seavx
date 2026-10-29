@@ -184,6 +184,8 @@ pub struct App<'a> {
     /// Summary retained from `/compact` and prepended to later requests.
     pub session_context: Option<String>,
     pub should_quit: bool,
+    /// The running turn's cancel handle. Fresh per turn.
+    pub cancel: crate::agent::cancel::CancelToken,
     pub config: crate::agent::engine::AgentConfig,
     pub mode: AgentMode,
     pub modal: Option<ModalSelection>,
@@ -214,6 +216,8 @@ pub struct TurnRequest {
     pub prompt: String,
     pub session_id: Option<i64>,
     pub store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
+    /// This turn's cancel handle, shared with the UI thread.
+    pub cancel: crate::agent::cancel::CancelToken,
 }
 
 /// A permission question and the channel its answer travels back on.
@@ -336,6 +340,7 @@ impl<'a> App<'a> {
             session_title: None,
             session_context: None,
             should_quit: false,
+            cancel: crate::agent::cancel::CancelToken::new(),
             config,
             mode: AgentMode::Build,
             modal: None,
@@ -442,11 +447,14 @@ impl<'a> App<'a> {
         self.status = AgentState::Thinking;
         self.input = new_input();
         self.reset_history_nav();
+        // A cancelled turn must not poison the next one.
+        self.cancel = crate::agent::cancel::CancelToken::new();
 
         Some(TurnRequest {
             prompt,
             session_id: self.session_id,
             store: self.store.clone(),
+            cancel: self.cancel.clone(),
         })
     }
 
@@ -541,6 +549,42 @@ impl<'a> App<'a> {
         self.push_text(&format!("\n{text}\n"));
         self.scroll = self.line_count();
         self.auto_scroll = true;
+    }
+
+    /// Esc, in order: close the ghost, close a popup, cancel the running turn,
+    /// and only quit when nothing else on screen claims the key.
+    pub fn escape(&mut self) {
+        if self.ghost_active() {
+            self.clear_ghost();
+        } else if self.popup_open() {
+            self.dismiss_popups();
+        } else if self.status != AgentState::Idle {
+            self.cancel.cancel();
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    /// The turn ended: the spinner stops, and a cancel says so once.
+    pub fn finish_turn(
+        &mut self,
+        status: crate::agent::cancel::TurnStatus,
+        cleanup: Option<crate::agent::cancel::Cleanup>,
+        pid: Option<u32>,
+    ) {
+        self.status = AgentState::Idle;
+        if status != crate::agent::cancel::TurnStatus::Cancelled {
+            return;
+        }
+        let mut line = String::from("System: cancelled");
+        if cleanup == Some(crate::agent::cancel::Cleanup::Unconfirmed) {
+            line.push('\n');
+            line.push_str("System: ");
+            line.push_str(&crate::agent::cancel::cleanup_notice(
+                pid.unwrap_or_default(),
+            ));
+        }
+        self.push_notice(line);
     }
 
     /// Open the cached-model picker. Returns `false` when the cache is empty.
@@ -1077,6 +1121,7 @@ pub async fn run_agent_worker(
             prompt,
             session_id,
             mut store,
+            cancel,
         } = request;
         let mut session_id = session_id;
 
@@ -1140,7 +1185,6 @@ pub async fn run_agent_worker(
         // the turn must not append it a second time.
         let streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let streamed_evt = streamed.clone();
-        let self_cancel = crate::agent::cancel::CancelToken::new();
         let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
         let result = runtime
             .execute_task(
@@ -1148,7 +1192,7 @@ pub async fn run_agent_worker(
                 mode,
                 history,
                 &TuiConfirmer::new(tx.clone()),
-                &self_cancel,
+                &cancel,
                 move |evt| {
                     if let Some(rest) = evt.strip_prefix("USAGE:") {
                         let parts: Vec<&str> = rest.split(':').collect();
@@ -1191,6 +1235,12 @@ pub async fn run_agent_worker(
                 },
             )
             .await;
+
+        let _ = tx.send(Action::TurnFinished {
+            status: result.status,
+            cleanup: result.cleanup,
+            pid: result.pid,
+        });
 
         match result.result {
             Ok(answer) => {
@@ -1600,16 +1650,7 @@ pub async fn start_tui(
                     }
 
                     match key.code {
-                        KeyCode::Esc => {
-                            // Close what is on screen before ending the session.
-                            if app.ghost_active() {
-                                app.clear_ghost();
-                            } else if app.popup_open() {
-                                app.dismiss_popups();
-                            } else {
-                                app.should_quit = true;
-                            }
-                        }
+                        KeyCode::Esc => app.escape(),
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.should_quit = true;
                         }
@@ -1763,6 +1804,11 @@ pub async fn start_tui(
                         app.scroll = lines;
                     }
                 }
+                Action::TurnFinished {
+                    status,
+                    cleanup,
+                    pid,
+                } => app.finish_turn(status, cleanup, pid),
                 Action::AgentDone => {
                     app.status = AgentState::Idle;
                 }

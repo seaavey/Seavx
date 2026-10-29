@@ -511,6 +511,8 @@ fn halve_turns(request: &ChatRequest) -> ChatRequest {
 pub struct TurnOutcome {
     pub status: TurnStatus,
     pub cleanup: Option<Cleanup>,
+    /// The pid of a killed tree whose cleanup could not be confirmed.
+    pub pid: Option<u32>,
     pub result: Result<String, BackendError>,
 }
 
@@ -708,6 +710,7 @@ impl AgentRuntime {
         TurnOutcome {
             status: turn.status(),
             cleanup: turn.cleanup(),
+            pid: turn.pid(),
             result,
         }
     }
@@ -975,8 +978,8 @@ impl AgentRuntime {
 
                 let result_str = security::redact(&result_str);
                 // A cancelled command reports what the OS said; the turn carries it.
-                if let Some((_, cleanup)) = cancel.last_cleanup() {
-                    turn_state.set_cleanup(cleanup);
+                if let Some((pid, cleanup)) = cancel.last_cleanup() {
+                    turn_state.set_cleanup(pid, cleanup);
                 }
 
                 Self::log_tool_result(tool_name, is_err, &result_str);

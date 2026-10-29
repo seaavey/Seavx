@@ -15,6 +15,13 @@ pub enum Action {
         total_tokens: i32,
         prompt_tokens: i32,
     },
+    /// The turn's terminal status, plus what the OS said about a killed
+    /// process tree and which pid was abandoned.
+    TurnFinished {
+        status: crate::agent::cancel::TurnStatus,
+        cleanup: Option<crate::agent::cancel::Cleanup>,
+        pid: Option<u32>,
+    },
     AgentDone,
     /// The worker created or adopted a session row.
     SessionStarted(i64),

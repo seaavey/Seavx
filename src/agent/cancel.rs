@@ -148,14 +148,15 @@ pub fn cleanup_notice(pid: u32) -> String {
 #[derive(Debug)]
 pub struct TurnState {
     status: TurnStatus,
-    cleanup: Option<Cleanup>,
+    /// The last killed process tree: what the OS said, and which pid.
+    killed: Option<(u32, Cleanup)>,
 }
 
 impl Default for TurnState {
     fn default() -> Self {
         Self {
             status: TurnStatus::Running,
-            cleanup: None,
+            killed: None,
         }
     }
 }
@@ -170,11 +171,15 @@ impl TurnState {
     }
 
     pub fn cleanup(&self) -> Option<Cleanup> {
-        self.cleanup
+        self.killed.map(|(_, cleanup)| cleanup)
     }
 
-    pub fn set_cleanup(&mut self, cleanup: Cleanup) {
-        self.cleanup = Some(cleanup);
+    pub fn pid(&self) -> Option<u32> {
+        self.killed.map(|(pid, _)| pid)
+    }
+
+    pub fn set_cleanup(&mut self, pid: u32, cleanup: Cleanup) {
+        self.killed = Some((pid, cleanup));
     }
 
     /// `true` when the edge exists; a rejected edge leaves the status alone.
