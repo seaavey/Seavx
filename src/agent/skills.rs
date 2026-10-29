@@ -52,8 +52,12 @@ impl SkillManager {
             .map_err(|e| format!("Failed to create skill directory: {e}"))?;
 
         let skill_file = skill_dir.join("SKILL.md");
-        std::fs::write(&skill_file, content)
-            .map_err(|e| format!("Failed to write SKILL.md: {e}"))?;
+        crate::atomic_file::write_atomic(
+            &skill_file,
+            content.as_bytes(),
+            crate::atomic_file::ModePolicy::Preserve,
+        )
+        .map_err(|e| format!("Failed to write SKILL.md: {e}"))?;
 
         Ok(skill_file)
     }

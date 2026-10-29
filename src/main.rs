@@ -1,4 +1,5 @@
 pub mod agent;
+mod atomic_file;
 mod cli;
 mod history;
 mod home;

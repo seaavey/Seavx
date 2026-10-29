@@ -1,5 +1,6 @@
 use crate::agent::engine::AgentMode;
 use crate::agent::security::WorkspaceSecurity;
+use crate::atomic_file::{ModePolicy, write_atomic};
 use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
@@ -33,14 +34,10 @@ fn schema<T: JsonSchema>() -> Value {
     serde_json::to_value(schema_for!(T)).unwrap_or_default()
 }
 
-/// Create parent directories when needed, then write content. Shared core of
-/// `write_file` and `skill_write`; `ctx` labels the target in error messages.
-async fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    tokio::fs::write(path, content)
-        .await
+/// Create parent directories when needed, then write content atomically. Shared
+/// core of `write_file` and `skill_write`; `ctx` labels the target in errors.
+fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), String> {
+    write_atomic(path, content.as_bytes(), ModePolicy::Preserve)
         .map_err(|e| format!("Failed to write {ctx}: {e}"))
 }
 
@@ -61,8 +58,7 @@ async fn replace_first(
     }
 
     let updated = content.replacen(old_string, new_string, 1);
-    tokio::fs::write(path, updated)
-        .await
+    write_atomic(path, updated.as_bytes(), ModePolicy::Preserve)
         .map_err(|e| format!("Failed to save {ctx} edit: {e}"))
 }
 
@@ -152,7 +148,7 @@ impl AgentTool for WriteFileTool {
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<WriteFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        write_with_parents(&path, parsed.content, "file").await?;
+        write_with_parents(&path, parsed.content, "file")?;
         Ok(format!("Successfully wrote {}", parsed.path))
     }
 }
@@ -547,8 +543,7 @@ impl AgentTool for SaveMemoryTool {
 
         updated.push_str(&format!("- [{confidence}%] {lesson}\n"));
 
-        tokio::fs::write(&target_file, updated)
-            .await
+        write_atomic(&target_file, updated.as_bytes(), ModePolicy::Preserve)
             .map_err(|e| format!("Failed to write memory: {e}"))?;
 
         Ok(format!(
@@ -634,7 +629,7 @@ impl AgentTool for SkillWriteTool {
 
         // Overwrite in place when the skill already exists (could live in a shared skills root).
         if let Ok(path) = find_skill_file(security, &parsed.name) {
-            write_with_parents(&path, parsed.content, "skill").await?;
+            write_with_parents(&path, parsed.content, "skill")?;
             return Ok(format!("Successfully updated {}", path.display()));
         }
 
