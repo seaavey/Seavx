@@ -67,6 +67,12 @@ enum Commands {
     /// Inspect agent memory
     Memory,
 
+    /// List, show, resume or export stored sessions
+    Sessions {
+        #[command(subcommand)]
+        command: cli::sessions::SessionsCommand,
+    },
+
     /// Self-update SEAVX to the latest release
     Update {
         /// Force update even if already up to date
@@ -196,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Model { model, effort }) => cli::model::run(model, effort).await?,
         Some(Commands::Memory) => cli::memory::run()?,
+        Some(Commands::Sessions { command }) => cli::sessions::run(command).await?,
         Some(Commands::Update { force }) => cli::update::run(force).await?,
         Some(Commands::Uninstall) => cli::uninstall::run()?,
         None => {
