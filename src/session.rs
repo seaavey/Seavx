@@ -6,14 +6,42 @@
 //! budget without holding a lock across a turn.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use genai::chat::{ChatMessage, ChatRole};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Serde format of a message payload. Bumped only if `genai` changes its
 /// `ChatMessage` shape; a mismatch opens the session read-only.
 pub const PAYLOAD_FORMAT: &str = "genai-chat-v1";
 /// Schema version this build understands.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Total budget for one write: three attempts, 100 ms and 200 ms waits.
+pub const WRITE_BUDGET: Duration = Duration::from_secs(5);
+const ATTEMPTS: u32 = 3;
+/// Per-attempt `busy_timeout` cap; the deadline shrinks it further when needed.
+const BUSY_TIMEOUT_CAP_MS: u64 = 2000;
+
+/// Status of one stored message, from the schema's `CHECK` list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageStatus {
+    Complete,
+    Partial,
+    Cancelled,
+    Interrupted,
+}
+
+impl MessageStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions(
@@ -49,6 +77,14 @@ pub enum SessionError {
     Newer { found: u32, supported: u32 },
     /// Cannot be opened, read or migrated; the run continues unpersisted.
     Unavailable(String),
+    /// No session with this id.
+    Unknown(i64),
+    /// The session predates this build's payload format or payload.
+    ReadOnly(String),
+    /// The write itself broke an ordering invariant; a programming error.
+    Refused(String),
+    /// Three attempts inside the write budget could not get the lock.
+    Busy,
 }
 
 impl std::fmt::Display for SessionError {
@@ -59,6 +95,14 @@ impl std::fmt::Display for SessionError {
                 "session database version {found} is newer than this build ({supported}); refusing to open it"
             ),
             SessionError::Unavailable(detail) => write!(f, "session store unavailable: {detail}"),
+            SessionError::Unknown(id) => write!(f, "unknown session {id}"),
+            SessionError::ReadOnly(reason) => write!(f, "session is read-only: {reason}"),
+            SessionError::Refused(detail) => write!(f, "session write refused: {detail}"),
+            SessionError::Busy => write!(
+                f,
+                "session store busy: gave up after {ATTEMPTS} attempts inside {} s",
+                WRITE_BUDGET.as_secs()
+            ),
         }
     }
 }
@@ -141,6 +185,224 @@ impl SessionStore {
     pub fn connection(&self) -> &Connection {
         &self.connection
     }
+
+    /// Insert a session row and return its id.
+    pub fn create(
+        &self,
+        workspace: &str,
+        model: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<i64, SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        self.write(|connection| {
+            connection.execute(
+                "INSERT INTO sessions(workspace, title, model, payload_format, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)",
+                params![workspace, title, model, PAYLOAD_FORMAT, now],
+            )?;
+            Ok(connection.last_insert_rowid())
+        })
+    }
+
+    /// The one row a submitted prompt writes; never rewritten afterwards.
+    pub fn record_user(&self, session: i64, prompt: &str) -> Result<i64, SessionError> {
+        self.record_message(session, &ChatMessage::user(prompt), MessageStatus::Complete)
+    }
+
+    /// One transaction per message: validate first, then allocate `seq` and
+    /// insert under `BEGIN IMMEDIATE`.
+    pub fn record_message(
+        &self,
+        session: i64,
+        message: &ChatMessage,
+        status: MessageStatus,
+    ) -> Result<i64, SessionError> {
+        self.ensure_writable(session)?;
+        self.check_tool_pairs(session, message)?;
+        let payload = serde_json::to_string(message)
+            .map_err(|error| SessionError::Refused(error.to_string()))?;
+        self.insert_row(session, role_name(&message.role), status, &payload)
+    }
+
+    pub fn record_title(&self, session: i64, title: &str) -> Result<(), SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        self.write(|connection| {
+            connection
+                .execute(
+                    "UPDATE sessions SET title = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![session, title, now],
+                )
+                .map(|_| ())
+        })
+    }
+
+    pub fn set_usage(&self, session: i64, total: i64, prompt: i64) -> Result<(), SessionError> {
+        self.write(|connection| {
+            connection
+                .execute(
+                    "UPDATE sessions SET total_tokens = ?2, prompt_tokens = ?3 WHERE id = ?1",
+                    params![session, total, prompt],
+                )
+                .map(|_| ())
+        })
+    }
+
+    /// A session written by another payload format, or one that does not exist.
+    fn ensure_writable(&self, session: i64) -> Result<(), SessionError> {
+        let format: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload_format FROM sessions WHERE id = ?1",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match format {
+            None => Err(SessionError::Unknown(session)),
+            Some(format) if format != PAYLOAD_FORMAT => Err(SessionError::ReadOnly(format!(
+                "payload format {format} does not match {PAYLOAD_FORMAT}"
+            ))),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// An assistant row carrying tool calls is committed first; a result whose
+    /// `call_id` is not in the newest assistant row is a programming error.
+    fn check_tool_pairs(&self, session: i64, message: &ChatMessage) -> Result<(), SessionError> {
+        let responses = message.content.tool_responses();
+        if responses.is_empty() {
+            return Ok(());
+        }
+        let last_call_row: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM messages WHERE session_id = ?1 AND role = 'assistant'
+                 ORDER BY seq DESC LIMIT 1",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(payload) = last_call_row else {
+            return Err(SessionError::Refused(
+                "a tool result was written before any assistant row".to_string(),
+            ));
+        };
+        let calls: Vec<String> = match serde_json::from_str::<ChatMessage>(&payload) {
+            Ok(message) => message
+                .content
+                .tool_calls()
+                .iter()
+                .map(|call| call.call_id.clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for response in responses {
+            if !calls.contains(&response.call_id) {
+                tracing::error!(
+                    call_id = %response.call_id,
+                    surface = "session-store",
+                    "tool result has no committed assistant call"
+                );
+                return Err(SessionError::Refused(format!(
+                    "tool result for unknown call_id {}",
+                    response.call_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_row(
+        &self,
+        session: i64,
+        role: &str,
+        status: MessageStatus,
+        payload: &str,
+    ) -> Result<i64, SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let inserted = (|| {
+                // `seq` is allocated inside the same transaction as the insert,
+                // so two writers cannot receive the same number.
+                connection.execute(
+                    "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+                     SELECT ?1, COALESCE(MAX(seq), 0) + 1, ?2, ?3, ?4, ?5
+                     FROM messages WHERE session_id = ?1",
+                    params![session, role, status.as_str(), payload, now],
+                )?;
+                let seq: i64 = connection.query_row(
+                    "SELECT seq FROM messages WHERE id = last_insert_rowid()",
+                    [],
+                    |row| row.get(0),
+                )?;
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ?2, status = 'active' WHERE id = ?1",
+                    params![session, now],
+                )?;
+                Ok(seq)
+            })();
+            match inserted {
+                Ok(seq) => {
+                    connection.execute_batch("COMMIT")?;
+                    Ok(seq)
+                }
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    /// The single retry table: 3 attempts, 100/200 ms waits, one deadline
+    /// measured from `Instant::now()`, `busy_timeout` capped by what is left.
+    fn write<T>(
+        &self,
+        mut operation: impl FnMut(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, SessionError> {
+        let deadline = Instant::now() + WRITE_BUDGET;
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(100 << (attempt - 1)));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let busy_timeout = remaining.as_millis().min(BUSY_TIMEOUT_CAP_MS as u128) as u64;
+            self.connection
+                .pragma_update(None, "busy_timeout", busy_timeout)?;
+            match operation(&self.connection) {
+                Ok(value) => return Ok(value),
+                Err(error) if is_busy(&error) => {
+                    tracing::warn!(attempt, %error, "session store is busy");
+                }
+                Err(error) => return Err(SessionError::from(error)),
+            }
+        }
+        Err(SessionError::Busy)
+    }
+}
+
+fn role_name(role: &ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
+    }
+}
+
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 fn create_owner_only(path: &Path, mode: u32) -> std::io::Result<()> {
