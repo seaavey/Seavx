@@ -1069,3 +1069,119 @@ fn creators_tighten_existing_loose_modes() {
     let error = crate::util::ensure_private_dir(&blocker.join("nested"), 0o700).unwrap_err();
     assert!(!error.to_string().is_empty(), "{error}");
 }
+
+#[test]
+fn a_v1_database_fixture_opens_and_migrates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+
+    // The file a released 0.1.1-rc.2 wrote: the v1 tables, a version stamp, and
+    // one stored turn. No `.db` blob is committed.
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(super::SCHEMA).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 1;")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(workspace, title, model, payload_format, status, created_at, updated_at)
+                 VALUES ('ws', 'old session', 'm', ?1, 'active', 1, 1)",
+                [PAYLOAD_FORMAT],
+            )
+            .unwrap();
+        let user = serde_json::to_string(&ChatMessage::user("old prompt")).unwrap();
+        let answer = serde_json::to_string(&ChatMessage::assistant("old answer")).unwrap();
+        for (seq, role, payload) in [(1, "user", user), (2, "assistant", answer)] {
+            connection
+                .execute(
+                    "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+                     VALUES (1, ?1, ?2, 'complete', ?3, 1)",
+                    rusqlite::params![seq, role, payload],
+                )
+                .unwrap();
+        }
+    }
+
+    let store = SessionStore::open_at(&path).expect("a v1 file opens");
+    let version: u32 = store
+        .connection()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+
+    let loaded = store.load(1).expect("the stored turn is readable");
+    assert_eq!(loaded.title.as_deref(), Some("old session"));
+    assert!(loaded.read_only.is_none(), "{:?}", loaded.read_only);
+    let outcome = replay(&loaded);
+    let texts: Vec<&str> = outcome
+        .history
+        .iter()
+        .filter_map(|message| message.content.first_text())
+        .collect();
+    assert_eq!(texts, vec!["old prompt", "old answer"]);
+}
+
+#[test]
+fn stored_payloads_round_trip_every_message_shape() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create("ws", Some("m"), Some("shapes")).unwrap();
+
+    let shapes = vec![
+        ChatMessage::user("plain prompt"),
+        ChatMessage::assistant("plain answer"),
+        call_message(vec![
+            tool_call("call_a", "read_file"),
+            tool_call("call_b", "list_directory"),
+        ]),
+        result_message("call_a", "file body"),
+        result_message("call_b", "listing"),
+        ChatMessage::assistant("with reasoning")
+            .with_reasoning_content(Some("a thought".to_string())),
+    ];
+    for message in &shapes {
+        store
+            .record_message(id, message, MessageStatus::Complete)
+            .unwrap();
+    }
+
+    // Re-serialisation is stable, shape by shape.
+    for original in &shapes {
+        let payload = serde_json::to_string(original).unwrap();
+        let parsed: ChatMessage = serde_json::from_str(&payload).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), payload);
+    }
+
+    let loaded = store.load(id).unwrap();
+    let outcome = replay(&loaded);
+    let calls: Vec<String> = outcome
+        .history
+        .iter()
+        .flat_map(|message| message.content.tool_calls())
+        .map(|call| call.call_id.clone())
+        .collect();
+    assert_eq!(
+        calls,
+        vec!["call_a", "call_b"],
+        "the replayed call ids keep their order"
+    );
+    let answered: Vec<String> = outcome
+        .history
+        .iter()
+        .flat_map(|message| message.content.tool_responses())
+        .map(|response| response.call_id.clone())
+        .collect();
+    assert_eq!(answered, vec!["call_a", "call_b"]);
+    assert!(
+        outcome
+            .history
+            .iter()
+            .any(|message| !message.content.reasoning_contents().is_empty()),
+        "the reasoning part survives the round trip"
+    );
+    assert_eq!(
+        outcome.omitted, 0,
+        "nothing was dropped by the resume window"
+    );
+}

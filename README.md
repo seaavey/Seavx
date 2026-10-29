@@ -272,6 +272,7 @@ query or userinfo.
   - names: `credentials`, `credentials.json`, `secrets.{json,yaml,yml,toml}`, `.npmrc`, `.pypirc`, `.htpasswd`
   - suffixes: `.pem`, `.key`, `.p12`, `.pfx`, `.kdbx`, `.jks`, `.keystore`, `.ppk`
   - and `config.toml` inside `.seavx`, plus the checkpoint store and session database. `.seavx/MEMORY.md`, `USER.md`, specs and the debug log stay readable.
+- **Platform scope**: mode enforcement (the `0700`/`0600` policy on created files and directories, and the `0600` config/session files) and inode-based backup identity are **Unix-only**. On Windows the mode policy is a no-op and a backup is validated by length plus checksum instead of `(dev, ino)`. Nothing in this README should be read as platform-neutral about either.
 - **Permission Matrix**: every tool call is decided by one matrix. Writes inside the workspace are ungated because the path policy confines them and checkpoints make them reversible; anything that can leave the workspace asks.
 
   | `tool_permissions` | read | write (in workspace) | global write | allowlisted command | other command | network | destructive |
