@@ -257,6 +257,42 @@ fn call_ids_of(message: &ChatMessage) -> Vec<String> {
         .collect()
 }
 
+/// The workspace key `create`, `list` and the CLI agree on.
+pub fn workspace_key() -> String {
+    std::env::current_dir()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// The worker's pre-request step: ensure the session row exists, write the user
+/// row, then return the history the request replays. Runs off the UI thread.
+pub fn prepare_turn(
+    store: &SessionStore,
+    workspace: &str,
+    model: &str,
+    session: Option<i64>,
+    prompt: &str,
+) -> Result<(i64, Vec<ChatMessage>), SessionError> {
+    let id = match session {
+        Some(id) => id,
+        None => store.create(workspace, Some(model), Some(&title_from(prompt)))?,
+    };
+    store.record_user(id, prompt)?;
+    Ok((id, replay(&store.load(id)?).history))
+}
+
+/// A session title: the first line of the prompt, 60 chars at most.
+pub fn title_from(prompt: &str) -> String {
+    prompt
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(60)
+        .collect()
+}
+
 fn has_text(message: &ChatMessage) -> bool {
     message
         .content

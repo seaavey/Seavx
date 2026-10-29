@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 Some(prompt.join(" "))
             };
-            tui::app::start_tui(initial_prompt).await?;
+            tui::app::start_tui(initial_prompt, None).await?;
         }
         Some(Commands::Exec { prompt }) => {
             let task = prompt.join(" ");
@@ -199,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Update { force }) => cli::update::run(force).await?,
         Some(Commands::Uninstall) => cli::uninstall::run()?,
         None => {
-            tui::app::start_tui(None).await?;
+            tui::app::start_tui(None, None).await?;
         }
     }
 

@@ -377,3 +377,175 @@ fn mode_shortcuts_recognise_backtab_and_ctrl_tab() {
         KeyModifiers::NONE
     )));
 }
+
+fn stored(
+    seq: i64,
+    role: &str,
+    message: &genai::chat::ChatMessage,
+) -> crate::session::StoredMessage {
+    crate::session::StoredMessage {
+        seq,
+        role: role.to_string(),
+        status: crate::session::MessageStatus::Complete,
+        payload: serde_json::to_string(message).unwrap(),
+        created_at: 0,
+    }
+}
+
+fn loaded(messages: Vec<crate::session::StoredMessage>) -> crate::session::LoadedSession {
+    crate::session::LoadedSession {
+        id: 7,
+        workspace: crate::session::workspace_key(),
+        title: Some("restored".to_string()),
+        model: Some("fake-model".to_string()),
+        payload_format: crate::session::PAYLOAD_FORMAT.to_string(),
+        read_only: None,
+        messages,
+        total_tokens: 42,
+        prompt_tokens: 21,
+    }
+}
+
+fn transcript(app: &App) -> String {
+    app.segments
+        .iter()
+        .map(|segment| match segment {
+            Segment::Text(text) => text.clone(),
+            Segment::Thinking(text) => text.clone(),
+        })
+        .collect()
+}
+
+#[test]
+fn load_session_rebuilds_segments_in_order_and_reports_omissions() {
+    let mut app = test_app();
+    let session = loaded(vec![
+        stored(1, "user", &genai::chat::ChatMessage::user("old question")),
+        stored(
+            2,
+            "assistant",
+            &genai::chat::ChatMessage::assistant("x".repeat(100_000)),
+        ),
+        stored(3, "user", &genai::chat::ChatMessage::user("new question")),
+        stored(
+            4,
+            "assistant",
+            &genai::chat::ChatMessage::assistant("new answer"),
+        ),
+    ]);
+
+    app.load_session(session);
+
+    let text = transcript(&app);
+    assert!(
+        text.contains("System: 2 older messages omitted (resume budget)."),
+        "{text}"
+    );
+    assert!(!text.contains("old question"), "the window dropped it");
+    let question = text.find("User: new question").expect("user row rendered");
+    let answer = text.find("new answer").expect("answer rendered");
+    assert!(question < answer, "segments keep stored order: {text}");
+    assert_eq!(app.session_id, Some(7));
+    assert_eq!(app.total_tokens, 42);
+}
+
+#[test]
+fn a_pending_turn_is_prefilled_shown_once_and_replayed_never() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = crate::session::SessionStore::open_at(&path).unwrap();
+    let workspace = crate::session::workspace_key();
+    let id = store.create(&workspace, None, None).unwrap();
+    store.record_user(id, "left hanging").unwrap();
+
+    let mut app = test_app();
+    app.attach_store(std::sync::Arc::new(std::sync::Mutex::new(
+        crate::session::SessionStore::open_at(&path).unwrap(),
+    )));
+    app.load_session(store.load(id).unwrap());
+
+    let text = transcript(&app);
+    assert_eq!(
+        text.matches("left hanging").count(),
+        1,
+        "the pending turn is displayed once: {text}"
+    );
+    assert!(
+        text.contains("User: left hanging (pending, not sent)"),
+        "{text}"
+    );
+    assert_eq!(typed(&app), "left hanging", "the input is prefilled");
+    assert_eq!(app.status, AgentState::Idle, "no request was issued");
+
+    // One Enter: exactly one new user row and exactly one request.
+    let request = app
+        .submit_turn(&app.input_text())
+        .expect("one request for the submitted prompt");
+    assert_eq!(request.prompt, "left hanging");
+    let (new_id, history) =
+        crate::session::prepare_turn(&store, &workspace, "fake-model", Some(id), &request.prompt)
+            .unwrap();
+    assert_eq!(new_id, id);
+    assert!(history.is_empty(), "the unanswered rows are never replayed");
+
+    let rows: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE role = 'user'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 2, "exactly one new user row");
+    assert_eq!(
+        app.input_text(),
+        "",
+        "the input is cleared, so a second Enter sends nothing"
+    );
+    assert!(app.submit_turn(&app.input_text()).is_none());
+}
+
+#[test]
+fn clear_starts_a_new_session_and_keeps_the_old_one_loadable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = crate::session::SessionStore::open_at(&path).unwrap();
+
+    let mut app = test_app();
+    app.attach_store(std::sync::Arc::new(std::sync::Mutex::new(
+        crate::session::SessionStore::open_at(&path).unwrap(),
+    )));
+    let first = app.submit_turn("first prompt").expect("request");
+    let (first_id, _) = crate::session::prepare_turn(
+        &store,
+        &crate::session::workspace_key(),
+        "fake-model",
+        None,
+        &first.prompt,
+    )
+    .unwrap();
+    app.session_id = Some(first_id);
+    // The turn finished; /clear is refused while the agent is busy.
+    app.status = AgentState::Idle;
+
+    run_command(&mut app, "/clear");
+    assert_eq!(app.session_id, None, "/clear starts a new session");
+    assert!(app.segments.is_empty());
+
+    let second = app.submit_turn("second prompt").expect("request");
+    let (second_id, _) = crate::session::prepare_turn(
+        &store,
+        &crate::session::workspace_key(),
+        "fake-model",
+        app.session_id,
+        &second.prompt,
+    )
+    .unwrap();
+    assert_ne!(first_id, second_id);
+    let old = store.load(first_id).unwrap();
+    assert_eq!(old.messages.len(), 1, "the old session is still there");
+    assert!(
+        old.messages[0].payload.contains("first prompt"),
+        "nothing was deleted"
+    );
+}

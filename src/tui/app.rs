@@ -198,6 +198,22 @@ pub struct App<'a> {
     pub last_ctrl_c: Option<std::time::Instant>,
     /// The question the worker is blocked on, until the user answers it.
     pub pending_permission: Option<PendingPermission>,
+    /// The one store handle; `None` when persistence is off for this run.
+    pub store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
+    /// Session this transcript belongs to, `None` until the first prompt.
+    pub session_id: Option<i64>,
+    /// One notice text when the store failed and the run continued unpersisted.
+    pub persistence_error: Option<String>,
+    /// Set when the loaded session cannot be appended to.
+    pub read_only: Option<String>,
+}
+
+/// What the worker needs to run one turn: the raw prompt, the replayed history
+/// and the store handle the rows are written through.
+pub struct TurnRequest {
+    pub prompt: String,
+    pub session_id: Option<i64>,
+    pub store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
 }
 
 /// A permission question and the channel its answer travels back on.
@@ -330,7 +346,92 @@ impl<'a> App<'a> {
             toast: None,
             last_ctrl_c: None,
             pending_permission: None,
+            store: None,
+            session_id: None,
+            persistence_error: None,
+            read_only: None,
         }
+    }
+
+    /// Hand the app the store it writes through, or the run is unpersisted.
+    pub fn attach_store(
+        &mut self,
+        store: std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>,
+    ) {
+        self.store = Some(store);
+    }
+
+    /// Rebuild the transcript from stored rows, prefill the pending prompt and
+    /// report what the resume budget left out.
+    pub fn load_session(&mut self, session: crate::session::LoadedSession) {
+        self.session_id = Some(session.id);
+        self.session_title = session.title.clone();
+        self.total_tokens = session.total_tokens as i32;
+        self.prompt_tokens = session.prompt_tokens as i32;
+        if let Some(reason) = session.read_only.clone() {
+            self.read_only = Some(reason.clone());
+            self.push_notice(format!("Session {} is read-only: {reason}", session.id));
+        }
+
+        let outcome = crate::session::replay(&session);
+        let body = crate::session::render_messages(&outcome.history);
+        if !body.is_empty() {
+            self.push_text(body.trim_end());
+            self.push_text("\n\n");
+        }
+        if outcome.omitted > 0 {
+            self.push_notice(format!(
+                "System: {} older messages omitted (resume budget).",
+                outcome.omitted
+            ));
+        }
+        if let Some(draft) = outcome.draft {
+            self.push_text(&format!("User: {draft} (pending, not sent)\n\n"));
+            self.set_input(&draft);
+        }
+        self.scroll = self.line_count();
+        self.auto_scroll = true;
+    }
+
+    /// `/clear` and `/new`: a fresh session id, transcript and compaction
+    /// context; nothing stored is deleted.
+    pub fn start_new_session(&mut self) {
+        self.clear_transcript();
+        self.session_title = None;
+        self.session_id = None;
+        self.read_only = None;
+    }
+
+    /// Show the prompt and hand the worker everything it needs. The user row is
+    /// written by the worker, so the UI thread never waits on SQLite.
+    pub fn submit_turn(&mut self, prompt: &str) -> Option<TurnRequest> {
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            return None;
+        }
+        if let Some(reason) = self.read_only.clone() {
+            self.push_notice(format!(
+                "This session is read-only ({reason}). Use /clear to start a new one."
+            ));
+            return None;
+        }
+
+        self.remember_prompt(&prompt);
+        if !self.segments.is_empty() {
+            self.push_text("\n\n");
+        }
+        self.push_text(&format!("User: {prompt}\n\n"));
+        self.scroll = self.line_count();
+        self.auto_scroll = true;
+        self.status = AgentState::Thinking;
+        self.input = new_input();
+        self.reset_history_nav();
+
+        Some(TurnRequest {
+            prompt,
+            session_id: self.session_id,
+            store: self.store.clone(),
+        })
     }
 
     /// Switch modes only when no task is running. Returns whether the mode changed.
@@ -933,8 +1034,18 @@ fn cached_models(app: &App) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The store is behind a mutex: the connection is `Send` but not `Sync`, and
+/// every write holds the lock for one insert.
+fn lock_store(
+    store: &std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>,
+) -> std::sync::MutexGuard<'_, crate::session::SessionStore> {
+    store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub async fn run_agent_worker(
-    prompt: String,
+    request: TurnRequest,
     tx: mpsc::UnboundedSender<Action>,
     is_first_turn: bool,
     mode: AgentMode,
@@ -945,6 +1056,41 @@ pub async fn run_agent_worker(
         let security = crate::agent::security::WorkspaceSecurity::new(".");
         let config = crate::agent::engine::AgentConfig::load(security.root());
         let runtime = crate::agent::engine::AgentRuntime::new(config.clone(), security);
+
+        let TurnRequest {
+            prompt,
+            session_id,
+            mut store,
+        } = request;
+        let mut session_id = session_id;
+
+        // The user row and the history for this request, off the UI thread.
+        let mut history = Vec::new();
+        if let Some(handle) = store.clone() {
+            let prepared = {
+                let guard = lock_store(&handle);
+                crate::session::prepare_turn(
+                    &guard,
+                    &crate::session::workspace_key(),
+                    &config.model,
+                    session_id,
+                    &prompt,
+                )
+            };
+            match prepared {
+                Ok((id, replayed)) => {
+                    session_id = Some(id);
+                    history = replayed;
+                    let _ = tx.send(Action::SessionStarted(id));
+                }
+                Err(error) => {
+                    let _ = tx.send(Action::SessionFailed(format!(
+                        "Session history disabled: {error}"
+                    )));
+                    store = None;
+                }
+            }
+        }
 
         // Generate quick concise title only on the first turn of the session
         if is_first_turn {
@@ -972,12 +1118,14 @@ pub async fn run_agent_worker(
         }
 
         let tx_clone = tx.clone();
+        let row_store = store.clone();
+        let row_tx = tx.clone();
         let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
         let result = runtime
             .execute_task(
                 &task,
                 mode,
-                Vec::new(),
+                history,
                 &TuiConfirmer::new(tx.clone()),
                 move |evt| {
                     if let Some(rest) = evt.strip_prefix("USAGE:") {
@@ -999,7 +1147,20 @@ pub async fn run_agent_worker(
                         let _ = tx_clone.send(Action::AgentToken(format!("\n  {note}\n")));
                     }
                 },
-                |_| {},
+                // The single persistence channel: every appended message, once.
+                move |message| {
+                    let (Some(handle), Some(id)) = (&row_store, session_id) else {
+                        return;
+                    };
+                    let guard = lock_store(handle);
+                    if let Err(error) =
+                        guard.record_message(id, message, crate::session::MessageStatus::Complete)
+                    {
+                        let _ = row_tx.send(Action::SessionFailed(format!(
+                            "Session history disabled: {error}"
+                        )));
+                    }
+                },
             )
             .await;
 
@@ -1017,7 +1178,10 @@ pub async fn run_agent_worker(
     });
 }
 
-pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
+pub async fn start_tui(
+    initial_prompt: Option<String>,
+    loaded: Option<crate::session::LoadedSession>,
+) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1067,14 +1231,29 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
 
     let mut app = App::new();
 
+    // One store handle for the run; a store that cannot open degrades to one
+    // notice and an unpersisted session instead of failing the TUI.
+    match crate::session::SessionStore::open() {
+        Ok(store) => app.attach_store(std::sync::Arc::new(std::sync::Mutex::new(store))),
+        Err(error) => {
+            let notice = format!("Session history disabled: {error}");
+            app.persistence_error = Some(notice.clone());
+            app.push_notice(notice);
+        }
+    }
+
+    // `seavx sessions resume` loads before the loop starts, so the indicator is
+    // the transcript itself: no async restore to wait for.
+    if let Some(session) = loaded {
+        app.load_session(session);
+    }
+
     // Trigger initial prompt if provided via CLI args
     if let Some(prompt) = initial_prompt
-        && !prompt.trim().is_empty()
+        && let Some(request) = app.submit_turn(&prompt)
     {
-        app.remember_prompt(&prompt);
-        app.push_text(&format!("User: {prompt}\n\n"));
-        app.status = AgentState::Thinking;
-        run_agent_worker(prompt, tx.clone(), true, AgentMode::Build, None).await;
+        let is_first_turn = app.session_title.is_none();
+        run_agent_worker(request, tx.clone(), is_first_turn, AgentMode::Build, None).await;
     }
 
     // A batch the last process never finished is reported once, loudly, and
@@ -1473,24 +1652,19 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     continue;
                                 }
 
-                                app.remember_prompt(&prompt);
-                                if !app.segments.is_empty() {
-                                    app.push_text("\n\n");
+                                // One Enter: one request, one new user row. The
+                                // worker writes the row before it sends.
+                                if let Some(request) = app.submit_turn(&prompt) {
+                                    let is_first_turn = app.session_title.is_none();
+                                    run_agent_worker(
+                                        request,
+                                        tx.clone(),
+                                        is_first_turn,
+                                        app.mode,
+                                        app.session_context.clone(),
+                                    )
+                                    .await;
                                 }
-                                app.push_text(&format!("User: {prompt}\n\n"));
-                                app.scroll = app.line_count();
-                                app.auto_scroll = true;
-                                app.status = AgentState::Thinking;
-                                app.input = new_input();
-                                let is_first_turn = app.session_title.is_none();
-                                run_agent_worker(
-                                    prompt,
-                                    tx.clone(),
-                                    is_first_turn,
-                                    app.mode,
-                                    app.session_context.clone(),
-                                )
-                                .await;
                             }
                         }
                         _ => {
@@ -1520,7 +1694,15 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                     }
                 }
                 Action::AgentTitle(title) => {
-                    app.session_title = Some(title);
+                    app.session_title = Some(title.clone());
+                    if let (Some(store), Some(id)) = (app.store.clone(), app.session_id) {
+                        tokio::task::spawn_blocking(move || {
+                            let guard = lock_store(&store);
+                            if let Err(error) = guard.record_title(id, &title) {
+                                tracing::warn!(%error, "could not store the session title");
+                            }
+                        });
+                    }
                 }
                 Action::AgentUsage {
                     total_tokens,
@@ -1528,6 +1710,24 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                 } => {
                     app.total_tokens = total_tokens;
                     app.prompt_tokens = prompt_tokens;
+                    if let (Some(store), Some(id)) = (app.store.clone(), app.session_id) {
+                        tokio::task::spawn_blocking(move || {
+                            let guard = lock_store(&store);
+                            if let Err(error) =
+                                guard.set_usage(id, total_tokens as i64, prompt_tokens as i64)
+                            {
+                                tracing::warn!(%error, "could not store session usage");
+                            }
+                        });
+                    }
+                }
+                Action::SessionStarted(id) => {
+                    app.session_id = Some(id);
+                }
+                Action::SessionFailed(message) => {
+                    app.store = None;
+                    app.persistence_error = Some(message.clone());
+                    app.push_notice(message);
                 }
                 Action::AgentToolStart(tool) => {
                     app.status = AgentState::ExecutingTool(tool.clone());

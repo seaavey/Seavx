@@ -204,8 +204,8 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
 
     match command {
         SlashCommand::Clear => {
-            app.clear_transcript();
-            app.session_title = None;
+            // A new session id; nothing stored is deleted or asked about.
+            app.start_new_session();
             app.scroll = 0;
             app.auto_scroll = true;
             CommandEffect::Handled

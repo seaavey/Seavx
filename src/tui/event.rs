@@ -16,6 +16,10 @@ pub enum Action {
         prompt_tokens: i32,
     },
     AgentDone,
+    /// The worker created or adopted a session row.
+    SessionStarted(i64),
+    /// Persistence degraded for the rest of the run; one notice, no retry.
+    SessionFailed(String),
     DoctorDone(DoctorReport),
     CompactDone {
         result: Result<crate::tui::compact::CompactResult, String>,
