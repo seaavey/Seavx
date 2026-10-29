@@ -1,5 +1,4 @@
 use crate::agent::prompt::{PLAN_POLICY, load_system_prompt};
-use crate::agent::protocol::Message;
 use crate::agent::security::WorkspaceSecurity;
 use crate::agent::tools::ToolRegistry;
 use genai::Client;
@@ -43,6 +42,10 @@ pub(crate) fn with_mode_policy(mut prompt: String, mode: AgentMode) -> String {
     }
     prompt
 }
+
+/// Canonical reasoning-effort options, in menu order. Single source for the
+/// TUI modal, the CLI prompts and `parse_reasoning_effort`.
+pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx", "max"];
 
 /// Endpoint used when the config does not set `base_url`.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
@@ -133,11 +136,8 @@ impl AgentConfig {
         let local_config = workspace_root.join(".seavx/config.toml");
         let path = if local_config.exists() {
             Some(local_config)
-        } else if let Some(home) = crate::home::dir() {
-            let global = home.join(".seavx/config.toml");
-            if global.exists() { Some(global) } else { None }
         } else {
-            None
+            crate::util::global_config_path().filter(|global| global.exists())
         };
 
         if let Some(cfg_path) = path
@@ -165,6 +165,22 @@ impl AgentConfig {
         }
 
         config
+    }
+
+    /// Persist as pretty TOML under the workspace's `.seavx/config.toml`,
+    /// creating the directory when missing. TUI call-sites ignore errors.
+    pub fn save(&self, workspace_root: &Path) -> std::io::Result<()> {
+        self.write_to(&workspace_root.join(".seavx/config.toml"))
+    }
+
+    /// Write the config as pretty TOML, creating parent directories if needed.
+    pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let toml_str =
+            toml::to_string_pretty(self).map_err(|e| std::io::Error::other(e.to_string()))?;
+        std::fs::write(path, toml_str)
     }
 }
 
@@ -225,10 +241,6 @@ impl AgentRuntime {
         }
     }
 
-    pub fn tool_registry(&mut self) -> &mut ToolRegistry {
-        &mut self.registry
-    }
-
     pub fn client(&self) -> &Client {
         &self.client
     }
@@ -272,8 +284,6 @@ impl AgentRuntime {
             .with_tools(self.registry.to_genai_tools(mode))
             .append_message(ChatMessage::system(&system_prompt))
             .append_message(ChatMessage::user(task));
-
-        let mut history = vec![Message::system(&system_prompt), Message::user(task)];
 
         tracing::info!(model = %self.config.model, "Starting Seavx agent task");
 
@@ -324,7 +334,6 @@ impl AgentRuntime {
                     "Task completed.".to_string()
                 };
 
-                history.push(Message::assistant_text(&return_text));
                 tracing::info!(turns = turn + 1, final_output = %return_text, "Agent completed task");
 
                 // Auto-Skill Evaluation: a completed task that ran at least two tools is a
@@ -342,16 +351,6 @@ impl AgentRuntime {
             }
 
             let owned_calls = response.into_tool_calls();
-
-            let mut internal_calls = Vec::new();
-            for call in &owned_calls {
-                internal_calls.push(crate::agent::protocol::ToolCallRequest {
-                    id: call.call_id.clone(),
-                    name: call.fn_name.clone(),
-                    arguments: call.fn_arguments.clone(),
-                });
-            }
-            history.push(Message::assistant_tool_calls(internal_calls));
 
             for call in owned_calls {
                 let tool_name = &call.fn_name;
@@ -407,7 +406,6 @@ impl AgentRuntime {
 
                 event_sink(&format!("Output:\n{truncated_preview}"));
 
-                history.push(Message::tool_result(&call.call_id, &result_str, is_err));
                 chat_req = chat_req.append_message(ChatMessage::from(ToolResponse::new(
                     call.call_id.clone(),
                     result_str,
@@ -455,10 +453,7 @@ impl AgentRuntime {
             .append(true)
             .open(&log_file)
         {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let timestamp = crate::util::epoch_secs();
 
             let effort = chat_options
                 .reasoning_effort
@@ -567,20 +562,11 @@ impl AgentRuntime {
             return;
         }
 
-        let name = trimmed
-            .lines()
-            .find(|l| l.trim().starts_with("name:"))
-            .map(|l| {
-                l.trim()
-                    .trim_start_matches("name:")
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-            })
-            .unwrap_or("auto-workflow");
+        let name = crate::util::frontmatter_value(trimmed, "name")
+            .unwrap_or_else(|| "auto-workflow".to_string());
 
         let mgr = crate::agent::skills::SkillManager::new(self.security.root());
-        match mgr.save_skill(name, trimmed) {
+        match mgr.save_skill(&name, trimmed) {
             Ok(saved_path) => {
                 tracing::info!(skill = %name, "Automatically created high-confidence skill from workflow");
                 event_sink(&format!(

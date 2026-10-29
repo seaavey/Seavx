@@ -2,6 +2,7 @@ pub mod agent;
 mod cli;
 mod home;
 mod tui;
+mod util;
 
 use clap::{Parser, Subcommand};
 use std::fs::OpenOptions;
@@ -75,7 +76,7 @@ enum SetupSection {
     Providers,
 }
 
-fn init_tracing(_debug: bool) -> anyhow::Result<Option<PathBuf>> {
+fn init_tracing(debug_flag: bool) -> anyhow::Result<Option<PathBuf>> {
     let log_dir = PathBuf::from(".seavx");
     std::fs::create_dir_all(&log_dir)?;
     let log_file_path = log_dir.join("debug.log");
@@ -89,8 +90,13 @@ fn init_tracing(_debug: bool) -> anyhow::Result<Option<PathBuf>> {
         .with_writer(file)
         .with_ansi(false);
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("seavx=debug,genai=debug"));
+    // An explicit `--debug` raises the filter; otherwise the env or a default applies.
+    let filter = if debug_flag {
+        EnvFilter::new("seavx=trace,genai=debug")
+    } else {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("seavx=debug,genai=debug"))
+    };
 
     tracing_subscriber::registry()
         .with(filter)
@@ -109,13 +115,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     let args = Cli::parse();
-    let debug_enabled = args.debug
-        || cfg!(debug_assertions)
-        || std::env::var("SEAVX_DEBUG")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
-
-    let _log_path = init_tracing(debug_enabled)?;
+    let _log_path = init_tracing(args.debug)?;
 
     match args.command {
         Some(Commands::Run { prompt }) => {
@@ -151,15 +151,15 @@ async fn main() -> anyhow::Result<()> {
             println!("\nFinal Response:\n{result}");
         }
         Some(Commands::Init) => {
-            let seavx_dir = PathBuf::from(".seavx");
-            std::fs::create_dir_all(&seavx_dir)?;
-            let config_path = seavx_dir.join("config.toml");
+            let config_path = PathBuf::from(".seavx/config.toml");
             if !config_path.exists() {
-                let default_toml = format!(
-                    "model = \"openai/gpt-4o-mini\"\nmax_turns = 1000\nbase_url = \"{}\"\napi_key = \"\"\n",
-                    agent::engine::DEFAULT_BASE_URL
-                );
-                std::fs::write(&config_path, default_toml)?;
+                let config = agent::engine::AgentConfig {
+                    model: "openai/gpt-4o-mini".to_string(),
+                    base_url: Some(agent::engine::DEFAULT_BASE_URL.to_string()),
+                    api_key: Some(String::new()),
+                    ..agent::engine::AgentConfig::default()
+                };
+                config.write_to(&config_path)?;
                 println!("Created default config at {}", config_path.display());
             } else {
                 println!("Config already exists at {}", config_path.display());

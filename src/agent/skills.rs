@@ -76,6 +76,15 @@ fn scan_dir(base: &Path, list: &mut Vec<SkillMetadata>, depth: usize) {
             continue;
         }
 
+        // Skip hidden dirs, build artifacts and dependencies like every other walk.
+        if crate::util::is_skipped(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default(),
+        ) {
+            continue;
+        }
+
         let skill_file = path.join("SKILL.md");
         if skill_file.exists()
             && let Ok(content) = std::fs::read_to_string(&skill_file)
@@ -101,18 +110,5 @@ fn scan_dir(base: &Path, list: &mut Vec<SkillMetadata>, depth: usize) {
 }
 
 fn extract_description(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("description:") {
-            return Some(
-                trimmed
-                    .trim_start_matches("description:")
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string(),
-            );
-        }
-    }
-    None
+    crate::util::frontmatter_value(content, "description")
 }

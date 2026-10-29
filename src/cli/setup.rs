@@ -26,22 +26,14 @@ fn screen(config_path: &std::path::Path, rows: &[(&str, String)]) {
 pub async fn providers() -> anyhow::Result<()> {
     use std::io::{self, Write};
 
-    let home = crate::home::dir()
+    let config_path = crate::util::global_config_path()
         .ok_or_else(|| anyhow::anyhow!("home directory is not set, cannot locate config"))?;
-    let config_path = home.join(".seavx/config.toml");
 
     // A malformed file is replaced, matching AgentConfig::load's fallback to defaults.
     let mut config: crate::agent::engine::AgentConfig = std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|content| toml::from_str(&content).ok())
-        .unwrap_or(crate::agent::engine::AgentConfig {
-            model: "openai/gpt-4o-mini".to_string(),
-            max_turns: 1000,
-            base_url: None,
-            api_key: None,
-            reasoning_effort: None,
-            system_prompt: None,
-        });
+        .unwrap_or_default();
 
     let mask = |key: &str| {
         if key.is_empty() {
@@ -108,6 +100,7 @@ pub async fn providers() -> anyhow::Result<()> {
         rows.pop();
     }
     screen(&config_path, &rows);
+    let efforts = crate::agent::engine::EFFORT_LEVELS.join("|");
     let model = prompt::line("Model", &config.model)?;
     if !available_models.is_empty() && !available_models.contains(&model) {
         println!("warning: '{model}' is not in the endpoint's model list");
@@ -116,7 +109,7 @@ pub async fn providers() -> anyhow::Result<()> {
     rows.push(("model", model.clone()));
     screen(&config_path, &rows);
     let effort = prompt::line(
-        "Reasoning effort (none|minimal|medium|high|highx|max)",
+        &format!("Reasoning effort ({efforts})"),
         config.reasoning_effort.as_deref().unwrap_or(""),
     )?;
 
@@ -133,17 +126,12 @@ pub async fn providers() -> anyhow::Result<()> {
     }
     if !effort.is_empty() {
         if crate::agent::engine::parse_reasoning_effort(&effort).is_none() {
-            anyhow::bail!(
-                "Unknown reasoning effort '{effort}', expected none|minimal|medium|high|highx|max"
-            );
+            anyhow::bail!("Unknown reasoning effort '{effort}', expected {efforts}");
         }
         config.reasoning_effort = Some(effort.to_lowercase());
     }
 
-    if let Some(dir) = config_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
+    config.write_to(&config_path)?;
 
     // The file holds an API key, so keep it private to the user.
     #[cfg(unix)]

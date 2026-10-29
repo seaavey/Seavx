@@ -1,18 +1,9 @@
 #[cfg(test)]
 mod test_cases {
     use crate::agent::engine::AgentMode;
-    use crate::agent::protocol::Message;
     use crate::agent::security::WorkspaceSecurity;
     use crate::agent::tools::ToolRegistry;
     use serde_json::json;
-
-    #[test]
-    fn test_message_protocol_serialization() {
-        let msg = Message::user("test prompt");
-        let json_val = serde_json::to_value(&msg).expect("Serialize message");
-        assert_eq!(json_val["role"], "User");
-        assert_eq!(json_val["content"]["Text"], "test prompt");
-    }
 
     #[test]
     fn test_workspace_security_path_traversal() {

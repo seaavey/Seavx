@@ -1,8 +1,7 @@
+use crate::util::epoch_secs;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
-
-pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 3600); // 24 jam default TTL
+use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ModelCache {
@@ -20,13 +19,8 @@ impl ModelManager {
     pub fn new(workspace_root: &Path) -> Self {
         Self {
             cache_dir: workspace_root.join(".seavx/cache"),
-            ttl: DEFAULT_CACHE_TTL,
+            ttl: Duration::from_secs(24 * 3600), // 24 jam default TTL
         }
-    }
-
-    pub fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
-        self
     }
 
     /// Extract clean domain/slug for cache filename: .seavx/cache/models-[domain].json
@@ -64,10 +58,7 @@ impl ModelManager {
         let content = std::fs::read_to_string(&path).ok()?;
         let cache: ModelCache = serde_json::from_str(&content).ok()?;
 
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = epoch_secs();
 
         if now.saturating_sub(cache.fetched_at) < self.ttl.as_secs() {
             Some(cache.models)
@@ -81,10 +72,7 @@ impl ModelManager {
         let _ = std::fs::create_dir_all(&self.cache_dir);
         let path = self.cache_path(domain_slug);
 
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = epoch_secs();
 
         let cache = ModelCache {
             fetched_at: now,
