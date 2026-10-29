@@ -242,3 +242,102 @@ async fn stream_false_skips_the_stream_attempt() {
     assert_eq!(answer, "plain answer");
     assert_eq!(fake.calls(), vec!["send"]);
 }
+
+#[cfg(test)]
+mod history_halving {
+    use crate::agent::engine::halve_turns;
+    use genai::chat::{ChatMessage, ChatRequest, ChatRole};
+
+    fn history(turns: usize) -> ChatRequest {
+        let mut request = ChatRequest::default().append_message(ChatMessage::system("system"));
+        for index in 0..turns {
+            request = request
+                .append_message(ChatMessage::user(format!("u{index}")))
+                .append_message(ChatMessage::assistant(format!("a{index}")));
+        }
+        request.append_message(ChatMessage::user("newest"))
+    }
+
+    #[test]
+    fn a_body_without_a_user_row_is_not_halved() {
+        // The replay retry used to index past the single boundary this history
+        // has, which panicked instead of retrying.
+        let request = ChatRequest::default()
+            .append_message(ChatMessage::system("system"))
+            .append_message(ChatMessage::assistant("a"))
+            .append_message(ChatMessage::assistant("b"))
+            .append_message(ChatMessage::user("newest"));
+        let halved = halve_turns(&request);
+        assert_eq!(
+            halved.messages.len(),
+            request.messages.len(),
+            "nothing to halve keeps the whole history"
+        );
+    }
+
+    #[test]
+    fn halving_keeps_the_newest_turns_and_starts_at_a_user_row() {
+        let request = history(6);
+        let halved = halve_turns(&request);
+        assert!(halved.messages.len() < request.messages.len());
+        assert_eq!(halved.messages[0].role, ChatRole::System);
+        assert_eq!(
+            halved.messages[1].role,
+            ChatRole::User,
+            "a turn is cut at its user row, so no tool pair is split"
+        );
+        assert_eq!(halved.messages.last().unwrap().role, ChatRole::User);
+    }
+
+    #[test]
+    fn a_short_history_is_returned_unchanged() {
+        let request = history(1);
+        assert_eq!(halve_turns(&request).messages.len(), request.messages.len());
+    }
+}
+
+#[cfg(test)]
+mod destination_kind {
+    use crate::agent::engine::effective_kind;
+    use crate::agent::permissions::ActionKind;
+    use crate::agent::security::WorkspaceSecurity;
+
+    #[test]
+    fn a_global_destination_is_a_global_write_whatever_the_tool_says() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let security = WorkspaceSecurity::new(workspace.path());
+        let memory = home.path().join(".seavx/MEMORY.md");
+        let skill = home.path().join(".seavx/skills/review/SKILL.md");
+
+        for destination in [memory, skill] {
+            assert_eq!(
+                effective_kind(
+                    Some(home.path()),
+                    &security,
+                    ActionKind::Write,
+                    Some(&destination),
+                ),
+                ActionKind::GlobalWrite,
+                "{} must ask: it leaves the workspace",
+                destination.display()
+            );
+        }
+
+        assert_eq!(
+            effective_kind(
+                Some(home.path()),
+                &security,
+                ActionKind::Write,
+                Some(&workspace.path().join("notes.txt")),
+            ),
+            ActionKind::Write,
+            "a workspace destination keeps the tool's own kind"
+        );
+        assert_eq!(
+            effective_kind(Some(home.path()), &security, ActionKind::Read, None),
+            ActionKind::Read,
+            "a tool with no destination is judged by what it declares"
+        );
+    }
+}

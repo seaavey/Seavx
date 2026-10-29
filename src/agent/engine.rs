@@ -478,9 +478,24 @@ pub fn classify_failure(error: &(dyn std::error::Error + 'static)) -> Option<Ret
     None
 }
 
+/// The kind the permission matrix must see. A tool that picks its own
+/// destination is judged by where that destination lives: a skill or a memory
+/// write lands under the global root, so it is a global write however the tool
+/// classifies itself, and the matrix asks for it.
+pub(crate) fn effective_kind(
+    home: Option<&Path>,
+    security: &WorkspaceSecurity,
+    declared: ActionKind,
+    destination: Option<&Path>,
+) -> ActionKind {
+    destination
+        .and_then(|path| permissions::classify_target_with_home(home, security, path).ok())
+        .unwrap_or(declared)
+}
+
 /// The replay-rejection retry: keep the newest half of the turns, cut at a user
 /// row, so a tool-call pair is never split.
-fn halve_turns(request: &ChatRequest) -> ChatRequest {
+pub(crate) fn halve_turns(request: &ChatRequest) -> ChatRequest {
     let messages = &request.messages;
     if messages.len() < 4 {
         return request.clone();
@@ -493,7 +508,9 @@ fn halve_turns(request: &ChatRequest) -> ChatRequest {
             starts.push(index);
         }
     }
-    let keep_from = starts[starts.len().div_ceil(2)];
+    // The newest half, measured in turn boundaries. A single boundary keeps
+    // everything: there is nothing to halve, and indexing past it panicked.
+    let keep_from = starts[starts.len() / 2];
 
     let mut rebuilt = ChatRequest::default();
     if let Some(tools) = &request.tools {
@@ -960,9 +977,14 @@ impl AgentRuntime {
                 let (result_str, is_err) = match self.registry.get_for_mode(tool_name, mode) {
                     Ok(tool) => {
                         let args = call.fn_arguments.clone();
-                        let kind = tool.classify(&args, &self.security);
-                        let detail = tool
-                            .destination(&args, &self.security)
+                        let destination = tool.destination(&args, &self.security);
+                        let kind = effective_kind(
+                            crate::home::dir().as_deref(),
+                            &self.security,
+                            tool.classify(&args, &self.security),
+                            destination.as_deref(),
+                        );
+                        let detail = destination
                             .map(|path| path.display().to_string())
                             .unwrap_or_else(|| args_summary.clone());
                         match self.gate(confirm, kind, tool_name, &detail).await {
