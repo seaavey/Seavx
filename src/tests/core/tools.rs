@@ -570,3 +570,109 @@ async fn a_cancelled_command_returns_a_complete_result_naming_the_outcome() {
         "a cancel is not a timeout: {result}"
     );
 }
+
+// ---- Audit regressions ------------------------------------------------------
+
+#[tokio::test]
+async fn a_create_patch_over_an_existing_file_is_refused() {
+    let (_temp, root, security) = prepare().await;
+    std::fs::write(root.join("existing.txt"), "user content\n").unwrap();
+
+    let diff = "--- /dev/null\n+++ b/existing.txt\n@@ -0,0 +1,1 @@\n+NEW LINE\n";
+    let error = ToolRegistry::with_default_tools()
+        .get("apply_patch")
+        .unwrap()
+        .execute(
+            json!({ "patch": diff }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("existing.txt")).unwrap(),
+        "user content\n",
+        "a refused create patch writes nothing"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn search_does_not_follow_a_symlinked_directory() {
+    let (_temp, root, security) = prepare().await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.md"), "PRIVATE_KEY here\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+
+    let output = ToolRegistry::with_default_tools()
+        .get("search_files")
+        .unwrap()
+        .execute(
+            json!({ "pattern": "PRIVATE_KEY" }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !output.contains("secret.md") && !output.contains("PRIVATE_KEY here"),
+        "a symlinked directory is not part of the workspace: {output}"
+    );
+}
+
+#[tokio::test]
+async fn a_background_child_does_not_hold_the_turn_open() {
+    let (_temp, _root, security) = prepare().await;
+    let cancel = crate::agent::cancel::CancelToken::new();
+
+    // The shell exits at once; the sleep it left behind keeps the pipe open.
+    let call = async {
+        let registry = ToolRegistry::with_default_tools();
+        let tool = registry.get("run_command").unwrap();
+        tool.execute(
+            json!({ "command": "sleep 30 & exit 0" }),
+            &security,
+            &cancel,
+        )
+        .await
+    };
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+        .await
+        .expect("a background child must not hold the turn open");
+    let result = result.expect("the command itself succeeded");
+    assert!(!result.contains("timed out"), "{result}");
+}
+
+#[tokio::test]
+async fn undo_refuses_a_file_the_user_edited_after_the_write() {
+    let (_temp, root, security) = prepare().await;
+    let registry = ToolRegistry::with_default_tools();
+    let cancel = crate::agent::cancel::CancelToken::new();
+
+    registry
+        .get("write_file")
+        .unwrap()
+        .execute(
+            json!({ "path": "notes.txt", "content": "agent wrote this" }),
+            &security,
+            &cancel,
+        )
+        .await
+        .unwrap();
+    std::fs::write(root.join("notes.txt"), "the user wrote this instead").unwrap();
+
+    let error = CheckpointStore::undo_latest(&root).unwrap_err();
+    assert!(
+        error.to_string().contains("changed since it was written"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "the user wrote this instead",
+        "the newer edit survives the undo"
+    );
+}
