@@ -10,7 +10,12 @@ pub enum Action {
     AgentToken(String),
     AgentThinking(String),
     AgentToolStart(String),
-    AgentTitle(String),
+    /// The session the title belongs to: a late answer must not rename the
+    /// session the user already started.
+    AgentTitle {
+        title: String,
+        session: Option<i64>,
+    },
     AgentUsage {
         total_tokens: i32,
         prompt_tokens: i32,

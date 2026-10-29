@@ -143,6 +143,9 @@ type AtCache = Option<(String, Vec<(bool, String)>)>;
 
 pub struct App<'a> {
     pub workspace: String,
+    /// The canonical workspace root: the directory the checkpoint store and the
+    /// agent's security policy both use.
+    pub root: std::path::PathBuf,
     pub input: TextArea<'a>,
     pub segments: Vec<Segment>,
     pub revision: u64,
@@ -316,6 +319,9 @@ impl<'a> App<'a> {
                     }
                 })
                 .unwrap_or_default(),
+            root: crate::agent::security::WorkspaceSecurity::new(".")
+                .root()
+                .to_path_buf(),
             input: new_input(),
             segments: Vec::new(),
             revision: 0,
@@ -451,6 +457,12 @@ impl<'a> App<'a> {
             ));
             return None;
         }
+        // One turn at a time: a second request would replace `self.cancel` and
+        // leave the running turn with a token nobody can reach.
+        if self.status != AgentState::Idle {
+            self.push_notice("A task is already running. Press Esc to cancel it first.");
+            return None;
+        }
 
         self.remember_prompt(&prompt);
         if !self.segments.is_empty() {
@@ -471,6 +483,17 @@ impl<'a> App<'a> {
             store: self.store.clone(),
             cancel: self.cancel.clone(),
         })
+    }
+
+    /// Show a title only for the session that asked for it. A title request is
+    /// spawned, so its answer can arrive after the user started another session;
+    /// renaming that one would be wrong.
+    pub fn apply_title(&mut self, session: Option<i64>, title: String) -> bool {
+        if session != self.session_id {
+            return false;
+        }
+        self.session_title = Some(title);
+        true
     }
 
     /// Switch modes only when no task is running. Returns whether the mode changed.
@@ -1073,25 +1096,25 @@ fn apply_command_effect(
         CommandEffect::RunUndo => {
             app.status = AgentState::Checking;
             let tx = tx.clone();
+            let root = app.root.clone();
             tokio::task::spawn_blocking(move || {
                 let result =
-                    crate::checkpoint::CheckpointStore::undo_latest(std::path::Path::new("."))
-                        .map_err(|error| {
-                            // A half-done undo must say what it already changed.
-                            let restored = error.restored();
-                            if restored.is_empty() {
-                                return error.to_string();
-                            }
-                            let paths: Vec<String> = restored
-                                .iter()
-                                .map(|path| path.display().to_string())
-                                .collect();
-                            format!(
-                                "{error}\nRestored {} file(s) before the failure:\n{}",
-                                paths.len(),
-                                paths.join("\n")
-                            )
-                        });
+                    crate::checkpoint::CheckpointStore::undo_latest(&root).map_err(|error| {
+                        // A half-done undo must say what it already changed.
+                        let restored = error.restored();
+                        if restored.is_empty() {
+                            return error.to_string();
+                        }
+                        let paths: Vec<String> = restored
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect();
+                        format!(
+                            "{error}\nRestored {} file(s) before the failure:\n{}",
+                            paths.len(),
+                            paths.join("\n")
+                        )
+                    });
                 let _ = tx.send(Action::UndoDone(result));
             });
         }
@@ -1214,6 +1237,7 @@ pub async fn run_agent_worker(
         // Generate quick concise title only on the first turn of the session
         if is_first_turn {
             let title_tx = tx.clone();
+            let title_session = session_id;
             let title_prompt = prompt.clone();
             let client_clone = runtime.client().clone();
             let model_name = config.model.clone();
@@ -1230,7 +1254,10 @@ pub async fn run_agent_worker(
                 {
                     let clean = crate::util::unquote(text.trim()).to_string();
                     if !clean.is_empty() {
-                        let _ = title_tx.send(Action::AgentTitle(clean));
+                        let _ = title_tx.send(Action::AgentTitle {
+                            title: clean,
+                            session: title_session,
+                        });
                     }
                 }
             });
@@ -1311,6 +1338,9 @@ pub async fn run_agent_worker(
                     }
                 }
             }
+            // A cancelled turn already said so through its status; the error it
+            // carries is the same news, and printing both reads as a failure.
+            Err(_) if result.status == crate::agent::cancel::TurnStatus::Cancelled => {}
             Err(e) => {
                 let _ = tx.send(Action::AgentToken(format!("\n\nError: {e}\n")));
             }
@@ -1391,9 +1421,7 @@ pub async fn start_tui(
 
     // A batch the last process never finished is reported once, loudly, and
     // only undone when the user asks for it.
-    for batch in
-        crate::checkpoint::recover_pending(&std::path::PathBuf::from(".")).unwrap_or_default()
-    {
+    for batch in crate::checkpoint::recover_pending(&app.root).unwrap_or_default() {
         app.push_notice(batch.render());
     }
 
@@ -1812,16 +1840,19 @@ pub async fn start_tui(
                         app.scroll = app.line_count();
                     }
                 }
-                Action::AgentTitle(title) => {
-                    app.session_title = Some(title.clone());
-                    if let (Some(store), Some(id)) = (app.store.clone(), app.session_id) {
+                Action::AgentTitle { title, session } => {
+                    // The title is stored against the session that asked for it,
+                    // and only shown when that session is still the open one.
+                    if let (Some(store), Some(id)) = (app.store.clone(), session) {
+                        let stored = title.clone();
                         tokio::task::spawn_blocking(move || {
                             let guard = lock_store(&store);
-                            if let Err(error) = guard.record_title(id, &title) {
+                            if let Err(error) = guard.record_title(id, &stored) {
                                 tracing::warn!(%error, "could not store the session title");
                             }
                         });
                     }
+                    app.apply_title(session, title);
                 }
                 Action::AgentUsage {
                     total_tokens,

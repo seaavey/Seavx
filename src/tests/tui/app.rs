@@ -724,3 +724,49 @@ async fn agent_done_fires_exactly_once_per_turn() {
         "one turn, one AgentDone, even when the task returned early"
     );
 }
+
+// ---- Audit regressions ------------------------------------------------------
+
+#[test]
+fn a_second_prompt_is_refused_while_a_turn_runs() {
+    use crate::tui::event::AgentState;
+
+    let mut app = test_app();
+    let first = app.submit_turn("first prompt").expect("the first request");
+    assert_eq!(app.status, AgentState::Thinking);
+
+    assert!(
+        app.submit_turn("second prompt").is_none(),
+        "one turn at a time: the running turn keeps its cancel token"
+    );
+    assert_eq!(
+        app.status,
+        AgentState::Thinking,
+        "the running turn is untouched"
+    );
+    assert_eq!(
+        transcript(&app).matches("User:").count(),
+        1,
+        "the refused prompt never reaches the transcript"
+    );
+    assert!(!first.cancel.is_cancelled());
+
+    // The turn finished (or was cancelled): the next prompt goes through.
+    app.status = AgentState::Idle;
+    assert!(app.submit_turn("second prompt").is_some());
+}
+
+#[test]
+fn a_title_for_another_session_does_not_rename_this_one() {
+    let mut app = test_app();
+    app.session_id = Some(2);
+
+    assert!(
+        !app.apply_title(Some(1), "old session".to_string()),
+        "a late title belongs to the session that asked for it"
+    );
+    assert!(app.session_title.is_none());
+
+    assert!(app.apply_title(Some(2), "this session".to_string()));
+    assert_eq!(app.session_title.as_deref(), Some("this session"));
+}
