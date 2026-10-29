@@ -12,13 +12,14 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
+    layout::Rect,
     style::{Color, Style},
     widgets::{Block, BorderType, Borders},
 };
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
-use crate::agent::engine::AgentMode;
+use crate::agent::engine::{AgentMode, EFFORT_LEVELS};
 use crate::tui::event::{Action, AgentState};
 use crate::tui::ui;
 
@@ -40,7 +41,7 @@ pub fn scan_workspace_entries(query: &str) -> Vec<(bool, String)> {
             }
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
+            if crate::util::is_skipped(name) {
                 continue;
             }
             let rel = path
@@ -86,6 +87,20 @@ pub enum PlanCommand {
     Invalid,
 }
 
+/// Wrap-around previous index; no-op-safe when the list is empty.
+fn prev_index(sel: usize, len: usize) -> usize {
+    if sel == 0 {
+        len.saturating_sub(1)
+    } else {
+        sel - 1
+    }
+}
+
+/// Wrap-around next index; no-op-safe when the list is empty.
+fn next_index(sel: usize, len: usize) -> usize {
+    if sel + 1 >= len { 0 } else { sel + 1 }
+}
+
 fn parse_plan_command(input: &str) -> Option<PlanCommand> {
     let mut parts = input.split_whitespace();
     if parts.next() != Some("/plan") {
@@ -102,6 +117,19 @@ fn parse_plan_command(input: &str) -> Option<PlanCommand> {
 fn is_mode_shortcut(key: &KeyEvent) -> bool {
     key.code == KeyCode::BackTab
         || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Whether a key edits the prompt text (as opposed to only moving the cursor).
+/// Only these regrow the ghost suggestion after the raw key is applied.
+fn edits_text(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(_) => {
+            !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+        }
+        KeyCode::Backspace | KeyCode::Enter | KeyCode::Tab => true,
+        _ => false,
+    }
 }
 
 fn apply_plan_command(app: &mut App, input: &str) -> bool {
@@ -142,6 +170,9 @@ pub struct TranscriptCache {
     pub lines: Vec<ratatui::text::Line<'static>>,
 }
 
+/// Cached `@` query and its matches, so rendering never walks the workspace.
+type AtCache = Option<(String, Vec<(bool, String)>)>;
+
 pub struct App<'a> {
     pub workspace: String,
     pub input: TextArea<'a>,
@@ -153,6 +184,15 @@ pub struct App<'a> {
     history_view: Vec<String>,
     history_cursor: Option<usize>,
     history_draft: String,
+    /// Prompt history persisted to `.seavx/svx_history`.
+    pub history_file: crate::history::ChatHistory,
+    /// Last seen mtime of the history file, used to pick up external edits.
+    history_mtime: Option<std::time::SystemTime>,
+    /// Character index where the dimmed suggestion tail starts; `None` when
+    /// no ghost is showing. The typed part is always `chars[..ghost_typed]`.
+    ghost_typed: Option<usize>,
+    /// Terminal width, refreshed each frame; fits ghost suggestions inside the box.
+    pub terminal_width: u16,
     pub scroll: u16,
     pub auto_scroll: bool,
     pub total_tokens: i32,
@@ -165,6 +205,11 @@ pub struct App<'a> {
     pub modal: Option<ModalSelection>,
     pub slash_selected: usize,
     pub at_selected: usize,
+    /// `@` matches for the current query; rendering must not walk the workspace
+    /// once per frame.
+    at_cache: std::cell::RefCell<AtCache>,
+    /// Prompt text whose popups the user already closed with Esc.
+    dismissed_popup: Option<String>,
     pub toast: Option<(String, std::time::Instant)>,
     pub last_ctrl_c: Option<std::time::Instant>,
 }
@@ -173,6 +218,9 @@ pub struct App<'a> {
 pub fn new_input<'a>() -> TextArea<'a> {
     let mut input = TextArea::default();
     input.set_cursor_line_style(Style::default());
+    // Ghost-completions are drawn with the dim selection style. No selection
+    // exists elsewhere in the app, so this style is never seen otherwise.
+    input.set_selection_style(Style::default().fg(Color::DarkGray));
     input.set_placeholder_text("Ask anything, / for commands, @ for files");
     input.set_block(
         Block::default()
@@ -185,7 +233,17 @@ pub fn new_input<'a>() -> TextArea<'a> {
 
 impl<'a> App<'a> {
     pub fn new() -> Self {
+        Self::with_history(crate::history::ChatHistory::load(
+            &crate::history::config_dir(),
+        ))
+    }
+
+    /// Like [`App::new`] but with an explicit history store, so tests never
+    /// touch the workspace's real `.seavx/svx_history`.
+    fn with_history(history_file: crate::history::ChatHistory) -> Self {
         let config = crate::agent::engine::AgentConfig::load(std::path::Path::new("."));
+        let history = history_file.entries();
+        let history_mtime = history_file.modified();
         Self {
             workspace: std::env::current_dir()
                 .map(|p| {
@@ -202,10 +260,14 @@ impl<'a> App<'a> {
             segments: Vec::new(),
             revision: 0,
             transcript_cache: std::cell::RefCell::new(None),
-            history: Vec::new(),
+            history,
             history_view: Vec::new(),
             history_cursor: None,
             history_draft: String::new(),
+            history_file,
+            history_mtime,
+            ghost_typed: None,
+            terminal_width: 80,
             scroll: 0,
             auto_scroll: true,
             total_tokens: 0,
@@ -218,6 +280,8 @@ impl<'a> App<'a> {
             modal: None,
             slash_selected: 0,
             at_selected: 0,
+            at_cache: std::cell::RefCell::new(None),
+            dismissed_popup: None,
             toast: None,
             last_ctrl_c: None,
         }
@@ -281,6 +345,8 @@ impl<'a> App<'a> {
     }
 
     /// Remember a submitted prompt; slash commands and repeats are not worth recalling.
+    /// Every kept prompt is appended to `.seavx/svx_history` so it survives
+    /// restarts and feeds cross-session autocomplete.
     pub fn remember_prompt(&mut self, prompt: &str) {
         let prompt = prompt.trim();
         if prompt.is_empty() || prompt.starts_with('/') {
@@ -288,17 +354,90 @@ impl<'a> App<'a> {
         }
         if self.history.last().map(String::as_str) != Some(prompt) {
             self.history.push(prompt.to_string());
+            self.history_file.append(prompt);
+            self.history_mtime = self.history_file.modified();
         }
         self.reset_history_nav();
+    }
+
+    /// Re-read `.seavx/svx_history` when it changed on disk, so manually
+    /// added prompts (and prompts from other sessions) feed autocomplete without
+    /// restarting the TUI.
+    pub fn sync_history(&mut self) {
+        let modified = self.history_file.modified();
+        if modified == self.history_mtime {
+            return;
+        }
+        self.history = self.history_file.entries();
+        self.history_mtime = modified;
+        self.reset_history_nav();
+
+        // Regrow the ghost from the new list instead of leaving a stale tail.
+        if self.ghost_active() {
+            self.clear_ghost();
+            self.refresh_ghost();
+        }
+    }
+
+    /// The typed prefix (everything left of the cursor) of a single-line prompt.
+    fn typed_prefix(&self) -> Option<String> {
+        let lines = self.input.lines();
+        if lines.len() != 1 {
+            return None;
+        }
+        let (row, col) = self.input.cursor();
+        if row != 0 {
+            return None;
+        }
+        Some(lines[0].chars().take(col).collect())
+    }
+
+    /// Newest history entry branching from the typed text, for ghost autocomplete.
+    /// Only offered at the end of a single-line prompt (where the user types),
+    /// hidden while arrow browsing history or nothing is typed yet. Multi-line
+    /// entries are skipped: their tail cannot be taken back once inserted.
+    pub fn history_suggestion(&self) -> Option<String> {
+        if self.history_cursor.is_some() {
+            return None;
+        }
+        let lines = self.input.lines();
+        if lines.len() != 1 {
+            return None;
+        }
+        let (row, col) = self.input.cursor();
+        if row != 0 || col != lines[0].chars().count() {
+            return None;
+        }
+        let typed = lines[0].clone();
+        if typed.is_empty() {
+            return None;
+        }
+        self.history
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.as_str() != typed.as_str()
+                    && entry.starts_with(&typed)
+                    && !entry.contains('\n')
+            })
+            .cloned()
+    }
+
+    /// Whether the ghost suggestion currently fits the prompt box: the cursor
+    /// cell plus the suggestion must leave room inside the bordered box.
+    pub fn suggestion_fits(&self, suggestion: &str) -> bool {
+        let interior = self.terminal_width.saturating_sub(2) as usize;
+        // Display cells, not chars: CJK and emoji take two columns each. The
+        // cursor sits past the last typed cell, so the text must stay narrower.
+        unicode_width::UnicodeWidthStr::width(suggestion) < interior
     }
 
     /// Recall an older prompt, filtered by whatever is already typed.
     pub fn history_previous(&mut self) {
         if self.history_view.is_empty() {
-            let typed = self.input.lines().join("\n").trim().to_string();
-            if typed.contains('\n') {
+            let Some(typed) = self.typed_prefix() else {
                 return;
-            }
+            };
             self.history_view = self
                 .history
                 .iter()
@@ -343,8 +482,70 @@ impl<'a> App<'a> {
     }
 
     fn set_input(&mut self, text: &str) {
+        self.ghost_typed = None;
         self.input = new_input();
         self.input.insert_str(text);
+    }
+
+    /// Dim the ghost tail: select from `col` (end of the typed part) to the
+    /// end of the single-line prompt so the tail characters render dimmed.
+    fn dim_tail(&mut self, col: usize) {
+        self.input.cancel_selection();
+        let lines = self.input.lines().to_vec();
+        if lines.len() != 1 || col >= lines[0].chars().count() {
+            return;
+        }
+        self.input.move_cursor(tui_textarea::CursorMove::End);
+        self.input.start_selection();
+        self.input
+            .move_cursor(tui_textarea::CursorMove::Jump(0, col as u16));
+    }
+
+    /// Whether a dimmed suggestion tail is currently shown.
+    pub fn ghost_active(&self) -> bool {
+        self.ghost_typed.is_some()
+    }
+
+    /// Drop the ghost tail while keeping the typed text and cursor position.
+    pub fn clear_ghost(&mut self) {
+        let Some(start) = self.ghost_typed.take() else {
+            self.input.cancel_selection();
+            return;
+        };
+        self.input.cancel_selection();
+        let lines = self.input.lines().to_vec();
+        if lines.len() == 1 && lines[0].chars().count() > start {
+            let typed: String = lines[0].chars().take(start).collect();
+            self.set_input(&typed);
+        }
+    }
+
+    /// Keep the ghost suggestion in step with the prompt after a key edit.
+    /// The caller clears the stale tail first, applies the raw key, then calls
+    /// this: the newest history entry matching the typed prefix grows back as
+    /// dimmed text past the cursor for the current single line.
+    pub fn refresh_ghost(&mut self) {
+        self.input.cancel_selection();
+        let lines = self.input.lines().to_vec();
+        let (row, col) = self.input.cursor();
+        if lines.len() != 1 || row != 0 || col != lines[0].chars().count() {
+            // Mid-line cursors and multi-line prompts never carry suggestions.
+            return;
+        }
+
+        let Some(suggestion) = self.history_suggestion() else {
+            return;
+        };
+        if !self.suggestion_fits(&suggestion) {
+            return;
+        }
+        let tail: String = suggestion.chars().skip(col).collect();
+        if tail.is_empty() {
+            return;
+        }
+        self.input.insert_str(tail);
+        self.ghost_typed = Some(col);
+        self.dim_tail(col);
     }
 
     /// Rendered line count for scroll math (each reasoning block adds a header line).
@@ -357,6 +558,130 @@ impl<'a> App<'a> {
             })
             .sum::<usize>() as u16
     }
+
+    /// Rendered prompt-box height; kept in sync with the vertical layout in `ui::render`.
+    pub fn input_height(&self) -> u16 {
+        (self.input.lines().len() as u16).clamp(1, 6) + 2
+    }
+
+    /// Geometry of the `@` reference popup, shared by rendering and mouse hit-testing.
+    pub fn at_popup_layout(&self, area: Rect, match_count: usize) -> AtPopupLayout {
+        const MAX_VISIBLE: usize = 8;
+
+        let menu_height = (match_count.min(MAX_VISIBLE) as u16 + 2).min(10);
+        let menu_width = 70.min(area.width.saturating_sub(4));
+        // Prompt box starts where the footer (1) and prompt (input_height) leave room.
+        let prompt_y = area.height.saturating_sub(self.input_height() + 2);
+        let menu_y = prompt_y.saturating_sub(menu_height);
+        let selected = self.at_selected.min(match_count.saturating_sub(1));
+
+        AtPopupLayout {
+            area: Rect::new(area.x + 2, menu_y, menu_width, menu_height),
+            window_start: selected.saturating_sub(MAX_VISIBLE - 1),
+            max_visible: MAX_VISIBLE,
+        }
+    }
+
+    /// Scroll the transcript up `n` lines, turning off auto-scroll.
+    pub fn scroll_up(&mut self, n: u16) {
+        let lines = self.line_count();
+        if self.auto_scroll {
+            self.scroll = lines;
+        }
+        self.auto_scroll = false;
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    /// Scroll the transcript down `n` lines, re-enabling auto-scroll at the bottom.
+    pub fn scroll_down(&mut self, n: u16) {
+        let lines = self.line_count();
+        let next = self.scroll.saturating_add(n);
+        if next >= lines {
+            self.scroll = lines;
+            self.auto_scroll = true;
+        } else {
+            self.scroll = next;
+        }
+    }
+
+    /// Current prompt as a single trimmed string.
+    pub fn input_text(&self) -> String {
+        self.input.lines().join("\n").trim().to_string()
+    }
+
+    /// Trailing `@word` in the prompt, if any.
+    pub fn at_query(&self) -> Option<String> {
+        self.input_text()
+            .split_whitespace()
+            .last()
+            .filter(|word| word.starts_with('@'))
+            .map(str::to_string)
+    }
+
+    /// Workspace entries matching the trailing `@word`, scanned once per query
+    /// so neither key handling nor rendering repeats the tree walk.
+    pub fn at_matches(&self) -> Vec<(bool, String)> {
+        let Some(query) = self.at_query() else {
+            return Vec::new();
+        };
+        if let Some((cached_query, matches)) = self.at_cache.borrow().as_ref()
+            && *cached_query == query
+        {
+            return matches.clone();
+        }
+        let matches = scan_workspace_entries(&query);
+        *self.at_cache.borrow_mut() = Some((query, matches.clone()));
+        matches
+    }
+
+    /// Slash commands matching the prompt; empty unless it is a bare `/word`.
+    pub fn slash_matches(&self) -> Vec<(&'static str, &'static str)> {
+        let input = self.input_text();
+        if !input.starts_with('/') || input.contains(' ') {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|(cmd, _)| cmd.starts_with(&input))
+            .collect()
+    }
+
+    /// Whether the user closed the popups for exactly this prompt text; typing
+    /// anything else brings them back.
+    pub fn popups_dismissed(&self) -> bool {
+        self.dismissed_popup.as_deref() == Some(self.input_text().as_str())
+    }
+
+    /// Hide the slash and `@` popups until the prompt text changes.
+    pub fn dismiss_popups(&mut self) {
+        self.dismissed_popup = Some(self.input_text());
+    }
+
+    /// Whether any autocomplete popup is showing, so Esc closes it first.
+    pub fn popup_open(&self) -> bool {
+        !self.popups_dismissed()
+            && (!self.at_matches().is_empty() || !self.slash_matches().is_empty())
+    }
+
+    /// Replace the trailing `@word` with a `[folder:…]` or `[file:…]` tag.
+    pub fn insert_at_tag(&mut self, is_dir: bool, path: &str) {
+        let tag = if is_dir {
+            format!("[folder:{path}] ")
+        } else {
+            format!("[file:{path}] ")
+        };
+        let full_input = self.input_text();
+        if let Some(last_at_idx) = full_input.rfind('@') {
+            let mut new_text = full_input[..last_at_idx].to_string();
+            new_text.push_str(&tag);
+            // The ghost tail belongs to the prompt being replaced; keeping the
+            // index would let the next keypress truncate the new tag.
+            self.ghost_typed = None;
+            self.input = new_input();
+            self.input.insert_str(new_text);
+        }
+    }
 }
 
 /// Ends the turn however the worker exits, panic included, so the UI never
@@ -367,6 +692,44 @@ impl Drop for DoneGuard {
     fn drop(&mut self) {
         let _ = self.0.send(Action::AgentDone);
     }
+}
+
+/// Geometry of the `@` reference popup. Shared so drawing and mouse clicks agree.
+pub struct AtPopupLayout {
+    pub area: Rect,
+    pub window_start: usize,
+    pub max_visible: usize,
+}
+
+/// Open the model-selection modal from cached models, or show a "no cache" hint.
+fn open_model_modal(app: &mut App, models: Vec<String>) {
+    if !models.is_empty() {
+        let current_idx = models
+            .iter()
+            .position(|m| *m == app.config.model)
+            .unwrap_or(0);
+        app.modal = Some(ModalSelection::Model {
+            models,
+            selected: current_idx,
+        });
+    } else {
+        app.set_text("No cached models found. Run `seavx model` once to populate cache.");
+        app.scroll = 0;
+        app.auto_scroll = true;
+    }
+}
+
+/// Cached models for the configured gateway; empty when the cache is cold.
+fn cached_models(app: &App) -> Vec<String> {
+    let base_url = app
+        .config
+        .base_url
+        .as_deref()
+        .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
+    let model_mgr = crate::agent::models::ModelManager::new(std::path::Path::new("."));
+    model_mgr
+        .get_cached_models(&crate::agent::models::ModelManager::domain_slug(base_url))
+        .unwrap_or_default()
 }
 
 pub async fn run_agent_worker(
@@ -398,7 +761,7 @@ pub async fn run_agent_worker(
                     .await
                     && let Some(text) = res.into_first_text()
                 {
-                    let clean = text.trim().trim_matches('"').trim_matches('\'').to_string();
+                    let clean = crate::util::unquote(text.trim()).to_string();
                     if !clean.is_empty() {
                         let _ = title_tx.send(Action::AgentTitle(clean));
                     }
@@ -505,82 +868,50 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
     }
 
     while !app.should_quit {
+        // Ghost suggestions must fit inside the prompt box, so track resize.
+        app.terminal_width = terminal
+            .size()
+            .map(|area| area.width)
+            .unwrap_or(app.terminal_width);
+        // Pick up prompts written to `.seavx/svx_history` while running.
+        app.sync_history();
         terminal.draw(|frame| ui::render(&app, frame))?;
 
         if let Some(action) = rx.recv().await {
             match action {
                 Action::Tick => {}
                 Action::Mouse(mouse) => {
-                    let input_text = app.input.lines().join("\n").trim().to_string();
-                    let at_query = input_text
-                        .split_whitespace()
-                        .last()
-                        .filter(|word| word.starts_with('@'));
-
-                    let at_matches = if let Some(query) = at_query {
-                        scan_workspace_entries(query)
-                    } else {
-                        Vec::new()
-                    };
+                    let at_matches = app.at_matches();
 
                     // Handle mouse click/scroll on `@` popup if active
-                    if !at_matches.is_empty() {
-                        let max_visible_items = 8;
-                        let menu_height =
-                            (at_matches.len().min(max_visible_items) as u16 + 2).min(10);
-                        let menu_width =
-                            70.min(terminal.size().unwrap_or_default().width.saturating_sub(4));
-                        let term_height = terminal.size().unwrap_or_default().height;
-                        let input_y = term_height.saturating_sub(4);
-                        let menu_y = input_y.saturating_sub(menu_height);
+                    if !app.popups_dismissed() && !at_matches.is_empty() {
+                        let size = terminal.size().unwrap_or_default();
+                        let screen = Rect::new(0, 0, size.width, size.height);
+                        let layout = app.at_popup_layout(screen, at_matches.len());
+                        let area = layout.area;
 
-                        let in_menu_x = mouse.column >= 2 && mouse.column <= 2 + menu_width;
-                        let in_menu_y = mouse.row >= menu_y && mouse.row <= menu_y + menu_height;
+                        let in_menu_x =
+                            mouse.column >= area.x && mouse.column < area.x + area.width;
+                        let in_menu_y = mouse.row >= area.y && mouse.row < area.y + area.height;
 
                         if in_menu_x && in_menu_y {
                             match mouse.kind {
                                 crossterm::event::MouseEventKind::ScrollUp => {
-                                    app.at_selected = if app.at_selected == 0 {
-                                        at_matches.len().saturating_sub(1)
-                                    } else {
-                                        app.at_selected - 1
-                                    };
+                                    app.at_selected = prev_index(app.at_selected, at_matches.len());
                                     continue;
                                 }
                                 crossterm::event::MouseEventKind::ScrollDown => {
-                                    app.at_selected = if app.at_selected + 1 >= at_matches.len() {
-                                        0
-                                    } else {
-                                        app.at_selected + 1
-                                    };
+                                    app.at_selected = next_index(app.at_selected, at_matches.len());
                                     continue;
                                 }
                                 crossterm::event::MouseEventKind::Down(
                                     crossterm::event::MouseButton::Left,
                                 ) => {
-                                    let relative_row = mouse.row.saturating_sub(menu_y + 1);
-                                    let selected = app.at_selected.min(at_matches.len() - 1);
-                                    let window_start = if selected >= max_visible_items {
-                                        selected + 1 - max_visible_items
-                                    } else {
-                                        0
-                                    };
-                                    let clicked_idx = window_start + relative_row as usize;
+                                    let relative_row = mouse.row.saturating_sub(area.y + 1);
+                                    let clicked_idx = layout.window_start + relative_row as usize;
                                     if clicked_idx < at_matches.len() {
-                                        let (is_dir, ref path) = at_matches[clicked_idx];
-                                        let tag = if is_dir {
-                                            format!("[folder:{path}] ")
-                                        } else {
-                                            format!("[file:{path}] ")
-                                        };
-                                        let full_input = app.input.lines().join("\n");
-                                        if let Some(last_at_idx) = full_input.rfind('@') {
-                                            let mut new_text =
-                                                full_input[..last_at_idx].to_string();
-                                            new_text.push_str(&tag);
-                                            app.input = new_input();
-                                            app.input.insert_str(new_text);
-                                        }
+                                        let (is_dir, path) = &at_matches[clicked_idx];
+                                        app.insert_at_tag(*is_dir, path);
                                         app.at_selected = 0;
                                         continue;
                                     }
@@ -591,24 +922,8 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                     }
 
                     match mouse.kind {
-                        crossterm::event::MouseEventKind::ScrollUp => {
-                            let lines = app.line_count();
-                            if app.auto_scroll {
-                                app.scroll = lines;
-                            }
-                            app.auto_scroll = false;
-                            app.scroll = app.scroll.saturating_sub(3);
-                        }
-                        crossterm::event::MouseEventKind::ScrollDown => {
-                            let lines = app.line_count();
-                            let next = app.scroll.saturating_add(3);
-                            if next >= lines {
-                                app.scroll = lines;
-                                app.auto_scroll = true;
-                            } else {
-                                app.scroll = next;
-                            }
-                        }
+                        crossterm::event::MouseEventKind::ScrollUp => app.scroll_up(3),
+                        crossterm::event::MouseEventKind::ScrollDown => app.scroll_down(3),
                         _ => {}
                     }
                 }
@@ -650,22 +965,14 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     app.modal = None;
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    let new_sel = if selected == 0 {
-                                        models.len().saturating_sub(1)
-                                    } else {
-                                        selected - 1
-                                    };
+                                    let new_sel = prev_index(selected, models.len());
                                     app.modal = Some(ModalSelection::Model {
                                         models,
                                         selected: new_sel,
                                     });
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    let new_sel = if selected + 1 >= models.len() {
-                                        0
-                                    } else {
-                                        selected + 1
-                                    };
+                                    let new_sel = next_index(selected, models.len());
                                     app.modal = Some(ModalSelection::Model {
                                         models,
                                         selected: new_sel,
@@ -714,9 +1021,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                 KeyCode::Enter => {
                                     if !models.is_empty() && selected < models.len() {
                                         let chosen_model = models[selected].clone();
-                                        let options = vec![
-                                            "none", "minimal", "medium", "high", "highx", "max",
-                                        ];
+                                        let options = EFFORT_LEVELS.to_vec();
                                         let current_eff = app
                                             .config
                                             .reasoning_effort
@@ -746,11 +1051,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     app.modal = None;
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    let new_sel = if selected == 0 {
-                                        options.len().saturating_sub(1)
-                                    } else {
-                                        selected - 1
-                                    };
+                                    let new_sel = prev_index(selected, options.len());
                                     app.modal = Some(ModalSelection::Effort {
                                         model,
                                         options,
@@ -758,11 +1059,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     });
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    let new_sel = if selected + 1 >= options.len() {
-                                        0
-                                    } else {
-                                        selected + 1
-                                    };
+                                    let new_sel = next_index(selected, options.len());
                                     app.modal = Some(ModalSelection::Effort {
                                         model,
                                         options,
@@ -775,12 +1072,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     app.config.reasoning_effort = Some(chosen_effort.clone());
 
                                     // Persist to .seavx/config.toml
-                                    let config_dir = std::path::PathBuf::from(".seavx");
-                                    let _ = std::fs::create_dir_all(&config_dir);
-                                    let config_path = config_dir.join("config.toml");
-                                    if let Ok(toml_str) = toml::to_string_pretty(&app.config) {
-                                        let _ = std::fs::write(config_path, toml_str);
-                                    }
+                                    let _ = app.config.save(std::path::Path::new("."));
 
                                     app.set_text(format!(
                                         "✓ Switched model to: {}\n✓ Reasoning effort: {}\nSaved to .seavx/config.toml",
@@ -802,53 +1094,22 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                         continue;
                     }
 
-                    let input_text = app.input.lines().join("\n").trim().to_string();
-                    let at_query = input_text
-                        .split_whitespace()
-                        .last()
-                        .filter(|word| word.starts_with('@'));
+                    let at_matches = app.at_matches();
 
-                    let at_matches = if let Some(query) = at_query {
-                        scan_workspace_entries(query)
-                    } else {
-                        Vec::new()
-                    };
-
-                    if !at_matches.is_empty() {
+                    if !app.popups_dismissed() && !at_matches.is_empty() {
                         match key.code {
                             KeyCode::Up => {
-                                app.at_selected = if app.at_selected == 0 {
-                                    at_matches.len().saturating_sub(1)
-                                } else {
-                                    app.at_selected - 1
-                                };
+                                app.at_selected = prev_index(app.at_selected, at_matches.len());
                                 continue;
                             }
                             KeyCode::Down => {
-                                app.at_selected = if app.at_selected + 1 >= at_matches.len() {
-                                    0
-                                } else {
-                                    app.at_selected + 1
-                                };
+                                app.at_selected = next_index(app.at_selected, at_matches.len());
                                 continue;
                             }
                             KeyCode::Tab | KeyCode::Enter => {
-                                let (is_dir, ref path) =
-                                    at_matches[app.at_selected.min(at_matches.len() - 1)];
-                                let tag = if is_dir {
-                                    format!("[folder:{path}] ")
-                                } else {
-                                    format!("[file:{path}] ")
-                                };
-
-                                // Replace the trailing @word with tag
-                                let full_input = app.input.lines().join("\n");
-                                if let Some(last_at_idx) = full_input.rfind('@') {
-                                    let mut new_text = full_input[..last_at_idx].to_string();
-                                    new_text.push_str(&tag);
-                                    app.input = new_input();
-                                    app.input.insert_str(new_text);
-                                }
+                                let (is_dir, path) =
+                                    &at_matches[app.at_selected.min(at_matches.len() - 1)];
+                                app.insert_at_tag(*is_dir, path);
                                 app.at_selected = 0;
                                 continue;
                             }
@@ -856,34 +1117,18 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                         }
                     }
 
-                    let in_slash_mode = input_text.starts_with('/') && !input_text.contains(' ');
-                    let filtered_cmds: Vec<(&str, &str)> = if in_slash_mode {
-                        SLASH_COMMANDS
-                            .iter()
-                            .copied()
-                            .filter(|(cmd, _)| cmd.starts_with(&input_text))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let filtered_cmds = app.slash_matches();
 
-                    if in_slash_mode && !filtered_cmds.is_empty() {
+                    if !app.popups_dismissed() && !filtered_cmds.is_empty() {
                         match key.code {
                             KeyCode::Up => {
-                                app.slash_selected = if app.slash_selected == 0 {
-                                    filtered_cmds.len().saturating_sub(1)
-                                } else {
-                                    app.slash_selected - 1
-                                };
+                                app.slash_selected =
+                                    prev_index(app.slash_selected, filtered_cmds.len());
                                 continue;
                             }
                             KeyCode::Down => {
                                 app.slash_selected =
-                                    if app.slash_selected + 1 >= filtered_cmds.len() {
-                                        0
-                                    } else {
-                                        app.slash_selected + 1
-                                    };
+                                    next_index(app.slash_selected, filtered_cmds.len());
                                 continue;
                             }
                             KeyCode::Tab => {
@@ -892,6 +1137,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                 app.input = new_input();
                                 app.input.insert_str(format!("{selected_cmd} "));
                                 app.slash_selected = 0;
+                                app.refresh_ghost();
                                 continue;
                             }
                             KeyCode::Enter => {
@@ -899,35 +1145,8 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     filtered_cmds[app.slash_selected.min(filtered_cmds.len() - 1)];
                                 if selected_cmd == "/model" {
                                     app.input = new_input();
-                                    let base_url = app
-                                        .config
-                                        .base_url
-                                        .as_deref()
-                                        .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
-                                    let model_mgr = crate::agent::models::ModelManager::new(
-                                        std::path::Path::new("."),
-                                    );
-                                    let models = model_mgr
-                                        .get_cached_models(
-                                            &crate::agent::models::ModelManager::domain_slug(
-                                                base_url,
-                                            ),
-                                        )
-                                        .unwrap_or_default();
-                                    if !models.is_empty() {
-                                        let current_idx = models
-                                            .iter()
-                                            .position(|m| *m == app.config.model)
-                                            .unwrap_or(0);
-                                        app.modal = Some(ModalSelection::Model {
-                                            models,
-                                            selected: current_idx,
-                                        });
-                                    } else {
-                                        app.set_text("No cached models found. Run `seavx model` once to populate cache.");
-                                        app.scroll = 0;
-                                        app.auto_scroll = true;
-                                    }
+                                    let models = cached_models(&app);
+                                    open_model_modal(&mut app, models);
                                     continue;
                                 } else if selected_cmd == "/plan" {
                                     app.input = new_input();
@@ -945,6 +1164,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                 } else {
                                     app.input = new_input();
                                     app.input.insert_str(format!("{selected_cmd} "));
+                                    app.refresh_ghost();
                                     continue;
                                 }
                             }
@@ -953,49 +1173,59 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                     }
 
                     match key.code {
-                        KeyCode::Esc => app.should_quit = true,
+                        KeyCode::Esc => {
+                            // Close what is on screen before ending the session.
+                            if app.ghost_active() {
+                                app.clear_ghost();
+                            } else if app.popup_open() {
+                                app.dismiss_popups();
+                            } else {
+                                app.should_quit = true;
+                            }
+                        }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.should_quit = true;
                         }
-                        KeyCode::PageUp => {
-                            let lines = app.line_count();
-                            if app.auto_scroll {
-                                app.scroll = lines;
-                            }
-                            app.auto_scroll = false;
-                            app.scroll = app.scroll.saturating_sub(5);
-                        }
-                        KeyCode::PageDown => {
-                            let lines = app.line_count();
-                            let next = app.scroll.saturating_add(5);
-                            if next >= lines {
-                                app.scroll = lines;
-                                app.auto_scroll = true;
-                            } else {
-                                app.scroll = next;
-                            }
-                        }
+                        KeyCode::PageUp => app.scroll_up(5),
+                        KeyCode::PageDown => app.scroll_down(5),
                         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            let lines = app.line_count();
-                            if app.auto_scroll {
-                                app.scroll = lines;
-                            }
-                            app.auto_scroll = false;
-                            app.scroll = app.scroll.saturating_sub(2);
+                            app.scroll_up(2);
                         }
                         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            let lines = app.line_count();
-                            let next = app.scroll.saturating_add(2);
-                            if next >= lines {
-                                app.scroll = lines;
-                                app.auto_scroll = true;
-                            } else {
-                                app.scroll = next;
-                            }
+                            app.scroll_down(2);
                         }
                         // Single-line prompt: arrows recall history, filtered by the typed prefix.
                         KeyCode::Up if app.input.lines().len() == 1 => app.history_previous(),
                         KeyCode::Down if app.input.lines().len() == 1 => app.history_next(),
+                        // Accept or eat the ghost suggestion at the end of the line.
+                        KeyCode::Tab => {
+                            if app.ghost_active() {
+                                // Accept: the tail becomes part of the prompt.
+                                app.set_input(&app.input.lines()[0].clone());
+                                app.refresh_ghost();
+                            } else {
+                                app.reset_history_nav();
+                                app.input.input(key);
+                            }
+                        }
+                        KeyCode::Right => {
+                            if app.ghost_active() {
+                                app.set_input(&app.input.lines()[0].clone());
+                                app.refresh_ghost();
+                            } else {
+                                app.clear_ghost();
+                                app.input.input(key);
+                            }
+                        }
+                        KeyCode::Delete => {
+                            if app.ghost_active() {
+                                // First Delete swallows the suggestion, like fish.
+                                app.clear_ghost();
+                            } else {
+                                app.reset_history_nav();
+                                app.input.input(key);
+                            }
+                        }
                         KeyCode::Home => {
                             app.auto_scroll = false;
                             app.scroll = 0;
@@ -1017,38 +1247,11 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     let parts: Vec<&str> = prompt.split_whitespace().collect();
                                     app.input = new_input();
 
-                                    let base_url = app
-                                        .config
-                                        .base_url
-                                        .as_deref()
-                                        .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
-                                    let model_mgr = crate::agent::models::ModelManager::new(
-                                        std::path::Path::new("."),
-                                    );
-                                    let models = model_mgr
-                                        .get_cached_models(
-                                            &crate::agent::models::ModelManager::domain_slug(
-                                                base_url,
-                                            ),
-                                        )
-                                        .unwrap_or_default();
+                                    let models = cached_models(&app);
 
                                     if parts.len() == 1 || (parts.len() == 2 && parts[1] == "list")
                                     {
-                                        if !models.is_empty() {
-                                            let current_idx = models
-                                                .iter()
-                                                .position(|m| *m == app.config.model)
-                                                .unwrap_or(0);
-                                            app.modal = Some(ModalSelection::Model {
-                                                models,
-                                                selected: current_idx,
-                                            });
-                                        } else {
-                                            app.set_text("No cached models found. Run `seavx model` once to populate cache.");
-                                            app.scroll = 0;
-                                            app.auto_scroll = true;
-                                        }
+                                        open_model_modal(&mut app, models);
                                     } else {
                                         let target_arg = parts[1];
                                         let resolved_model = if let Ok(num) =
@@ -1067,12 +1270,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                             app.config.reasoning_effort = Some(eff.clone());
                                         }
 
-                                        let config_dir = std::path::PathBuf::from(".seavx");
-                                        let _ = std::fs::create_dir_all(&config_dir);
-                                        let config_path = config_dir.join("config.toml");
-                                        if let Ok(toml_str) = toml::to_string_pretty(&app.config) {
-                                            let _ = std::fs::write(config_path, toml_str);
-                                        }
+                                        let _ = app.config.save(std::path::Path::new("."));
 
                                         app.set_text(format!(
                                             "Switched model to: {}\nEffort: {}\nSaved to .seavx/config.toml",
@@ -1103,7 +1301,12 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                         }
                         _ => {
                             app.reset_history_nav();
+                            // Cursor moves dismiss the ghost; edits regrow it.
+                            app.clear_ghost();
                             app.input.input(key);
+                            if edits_text(&key) {
+                                app.refresh_ghost();
+                            }
                         }
                     }
                 }
@@ -1175,163 +1378,20 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// App with an isolated history file so tests never read or write the
+/// workspace's real `.seavx/svx_history`.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn app_with(history: &[&str]) -> App<'static> {
-        let mut app = App::new();
-        for entry in history {
-            app.remember_prompt(entry);
-        }
-        app
-    }
-
-    fn typed(app: &App) -> String {
-        app.input.lines().join("\n")
-    }
-
-    #[test]
-    fn arrows_recall_history_newest_first() {
-        let mut app = app_with(&["first", "second", "third"]);
-
-        app.history_previous();
-        assert_eq!(typed(&app), "third");
-        app.history_previous();
-        assert_eq!(typed(&app), "second");
-        app.history_previous();
-        assert_eq!(typed(&app), "first");
-        app.history_previous();
-        assert_eq!(typed(&app), "first", "stays on the oldest entry");
-
-        app.history_next();
-        assert_eq!(typed(&app), "second");
-        app.history_next();
-        app.history_next();
-        assert_eq!(
-            typed(&app),
-            "",
-            "past the newest entry restores what was typed"
-        );
-    }
-
-    #[test]
-    fn typed_prefix_filters_history_and_restores_the_draft() {
-        let mut app = app_with(&["cargo test", "cargo clippy", "git status"]);
-        app.input.insert_str("cargo");
-
-        app.history_previous();
-        assert_eq!(typed(&app), "cargo clippy");
-        app.history_previous();
-        assert_eq!(typed(&app), "cargo test");
-        app.history_next();
-        app.history_next();
-        assert_eq!(
-            typed(&app),
-            "cargo",
-            "draft is restored after the last match"
-        );
-    }
-
-    #[test]
-    fn unmatched_prefix_leaves_the_input_alone() {
-        let mut app = app_with(&["cargo test"]);
-        app.input.insert_str("zig build");
-        app.history_previous();
-        assert_eq!(typed(&app), "zig build");
-    }
-
-    #[test]
-    fn slash_commands_and_repeats_stay_out_of_history() {
-        let mut app = App::new();
-        app.remember_prompt("/model");
-        app.remember_prompt("do the thing");
-        app.remember_prompt("do the thing");
-        app.remember_prompt("   ");
-        assert_eq!(app.history, vec!["do the thing".to_string()]);
-    }
-
-    #[test]
-    fn multiline_input_is_left_to_the_textarea() {
-        let mut app = app_with(&["older prompt"]);
-        app.input.insert_str("line one");
-        app.input.insert_newline();
-        app.input.insert_str("line two");
-        app.history_previous();
-        assert_eq!(typed(&app), "line one\nline two");
-    }
-
-    #[test]
-    fn plan_command_parses_supported_forms() {
-        assert!(matches!(
-            parse_plan_command("/plan"),
-            Some(PlanCommand::Enter)
-        ));
-        assert!(matches!(
-            parse_plan_command("/plan on"),
-            Some(PlanCommand::Enter)
-        ));
-        assert!(matches!(
-            parse_plan_command("/plan off"),
-            Some(PlanCommand::Exit)
-        ));
-        assert!(matches!(
-            parse_plan_command("/plan nope"),
-            Some(PlanCommand::Invalid)
-        ));
-        assert_eq!(parse_plan_command("/model"), None);
-        assert_eq!(parse_plan_command("plan"), None);
-    }
-
-    #[test]
-    fn apply_plan_command_enters_and_leaves_plan_mode() {
-        let mut app = App::new();
-        assert!(apply_plan_command(&mut app, "/plan"));
-        assert_eq!(app.mode, AgentMode::Plan);
-        assert!(apply_plan_command(&mut app, "/plan off"));
-        assert_eq!(app.mode, AgentMode::Build);
-    }
-
-    #[test]
-    fn mode_change_is_rejected_while_busy() {
-        let mut app = App::new();
-        app.status = AgentState::Streaming;
-        assert!(apply_plan_command(&mut app, "/plan"));
-        assert_eq!(app.mode, AgentMode::Build);
-        assert!(app.segments.is_empty());
-    }
-
-    #[test]
-    fn switching_modes_does_not_write_to_the_transcript() {
-        let mut app = App::new();
-        app.toggle_mode();
-        app.toggle_mode();
-        assert_eq!(app.mode, AgentMode::Build);
-        assert!(app.segments.is_empty());
-    }
-
-    #[test]
-    fn second_plan_command_is_idempotent() {
-        let mut app = App::new();
-        assert!(apply_plan_command(&mut app, "/plan"));
-        assert!(apply_plan_command(&mut app, "/plan"));
-        assert_eq!(app.mode, AgentMode::Plan);
-    }
-
-    #[test]
-    fn mode_shortcuts_recognise_backtab_and_ctrl_tab() {
-        assert!(is_mode_shortcut(&KeyEvent::new(
-            KeyCode::BackTab,
-            KeyModifiers::NONE
-        )));
-        assert!(is_mode_shortcut(&KeyEvent::new(
-            KeyCode::Tab,
-            KeyModifiers::CONTROL
-        )));
-        assert!(!is_mode_shortcut(&KeyEvent::new(
-            KeyCode::Tab,
-            KeyModifiers::NONE
-        )));
-    }
+pub(crate) fn test_app() -> App<'static> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join("seavx-tui-tests").join(format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    App::with_history(crate::history::ChatHistory::load(&dir))
 }
+
+#[cfg(test)]
+#[path = "../../tests/tui/app.rs"]
+mod tests;
