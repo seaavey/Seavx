@@ -3,8 +3,10 @@ use crate::agent::security::WorkspaceSecurity;
 use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 #[async_trait]
@@ -19,6 +21,49 @@ pub trait AgentTool: Send + Sync {
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String>;
+}
+
+// ---- Shared cores ----------------------------------------------------------
+
+fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, String> {
+    serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))
+}
+
+fn schema<T: JsonSchema>() -> Value {
+    serde_json::to_value(schema_for!(T)).unwrap_or_default()
+}
+
+/// Create parent directories when needed, then write content. Shared core of
+/// `write_file` and `skill_write`; `ctx` labels the target in error messages.
+async fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    tokio::fs::write(path, content)
+        .await
+        .map_err(|e| format!("Failed to write {ctx}: {e}"))
+}
+
+/// Read a file, replace the first occurrence of `old_string`, and write it back.
+/// Shared core of `edit_file` and `skill_patch`; `ctx` labels the target in errors.
+async fn replace_first(
+    path: &Path,
+    old_string: &str,
+    new_string: &str,
+    ctx: &str,
+) -> Result<(), String> {
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| format!("Failed to read {ctx} for editing: {e}"))?;
+
+    if !content.contains(old_string) {
+        return Err(format!("Target old_string not found in {ctx}"));
+    }
+
+    let updated = content.replacen(old_string, new_string, 1);
+    tokio::fs::write(path, updated)
+        .await
+        .map_err(|e| format!("Failed to save {ctx} edit: {e}"))
 }
 
 // 1. read_file
@@ -46,12 +91,11 @@ impl AgentTool for ReadFileTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(ReadFileArgs)).unwrap_or_default()
+        schema::<ReadFileArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: ReadFileArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<ReadFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
         let content = tokio::fs::read_to_string(path)
             .await
@@ -102,19 +146,13 @@ impl AgentTool for WriteFileTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(WriteFileArgs)).unwrap_or_default()
+        schema::<WriteFileArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: WriteFileArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<WriteFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        tokio::fs::write(&path, parsed.content)
-            .await
-            .map_err(|e| format!("Failed to write file: {e}"))?;
+        write_with_parents(&path, parsed.content, "file").await?;
         Ok(format!("Successfully wrote {}", parsed.path))
     }
 }
@@ -140,25 +178,13 @@ impl AgentTool for EditFileTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(EditFileArgs)).unwrap_or_default()
+        schema::<EditFileArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: EditFileArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<EditFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| format!("Failed to read file for editing: {e}"))?;
-
-        if !content.contains(&parsed.old_string) {
-            return Err("Target old_string not found in file".to_string());
-        }
-
-        let updated = content.replacen(&parsed.old_string, &parsed.new_string, 1);
-        tokio::fs::write(&path, updated)
-            .await
-            .map_err(|e| format!("Failed to save edit: {e}"))?;
+        replace_first(&path, &parsed.old_string, &parsed.new_string, "file").await?;
         Ok(format!("Successfully updated {}", parsed.path))
     }
 }
@@ -186,12 +212,11 @@ impl AgentTool for ListDirectoryTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(ListDirArgs)).unwrap_or_default()
+        schema::<ListDirArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: ListDirArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<ListDirArgs>(args)?;
         let req_path = match parsed.path {
             Some(ref p) if p != "None" && !p.trim().is_empty() => p.as_str(),
             _ => ".",
@@ -236,12 +261,11 @@ impl AgentTool for RunCommandTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(RunCommandArgs)).unwrap_or_default()
+        schema::<RunCommandArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: RunCommandArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<RunCommandArgs>(args)?;
 
         let blocked = ["rm -rf /", ":(){ :|:& };:"];
         for b in &blocked {
@@ -309,12 +333,11 @@ impl AgentTool for SearchFilesTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(SearchFilesArgs)).unwrap_or_default()
+        schema::<SearchFilesArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: SearchFilesArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<SearchFilesArgs>(args)?;
         let target_mode = parsed.target.unwrap_or_else(|| "content".to_string());
         let search_path = parsed.path.unwrap_or_else(|| ".".to_string());
         let root = security.validate_path(&search_path)?;
@@ -337,8 +360,8 @@ impl AgentTool for SearchFilesTool {
                         .map(|s| s.to_string_lossy())
                         .unwrap_or_default();
 
-                    // Skip hidden git and target build artifacts
-                    if file_name == ".git" || file_name == "target" || file_name == "node_modules" {
+                    // Skip hidden dirs, build artifacts and dependencies like every other walk.
+                    if crate::util::is_skipped(&file_name) {
                         continue;
                     }
 
@@ -444,12 +467,11 @@ impl AgentTool for SaveMemoryTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(SaveMemoryArgs)).unwrap_or_default()
+        schema::<SaveMemoryArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: SaveMemoryArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<SaveMemoryArgs>(args)?;
 
         let lesson = parsed.lesson.trim();
         if lesson.is_empty() {
@@ -475,10 +497,7 @@ impl AgentTool for SaveMemoryTool {
             }
         }
 
-        let is_debug = std::env::var("SEAVX_DEBUG")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false)
-            || cfg!(debug_assertions);
+        let is_debug = crate::util::is_debug();
 
         let target = parsed.target.unwrap_or_else(|| "project".to_string());
         let target_file = if target == "user" {
@@ -572,12 +591,11 @@ impl AgentTool for SkillViewTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(SkillViewArgs)).unwrap_or_default()
+        schema::<SkillViewArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: SkillViewArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<SkillViewArgs>(args)?;
         let path = find_skill_file(security, &parsed.name)?;
         tokio::fs::read_to_string(path)
             .await
@@ -605,21 +623,18 @@ impl AgentTool for SkillWriteTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(SkillWriteArgs)).unwrap_or_default()
+        schema::<SkillWriteArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: SkillWriteArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<SkillWriteArgs>(args)?;
         if parsed.content.trim().is_empty() {
             return Err("Skill content cannot be empty".to_string());
         }
 
         // Overwrite in place when the skill already exists (could live in a shared skills root).
         if let Ok(path) = find_skill_file(security, &parsed.name) {
-            tokio::fs::write(&path, parsed.content)
-                .await
-                .map_err(|e| format!("Failed to write skill: {e}"))?;
+            write_with_parents(&path, parsed.content, "skill").await?;
             return Ok(format!("Successfully updated {}", path.display()));
         }
 
@@ -650,25 +665,13 @@ impl AgentTool for SkillPatchTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        serde_json::to_value(schema_for!(SkillPatchArgs)).unwrap_or_default()
+        schema::<SkillPatchArgs>()
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
-        let parsed: SkillPatchArgs =
-            serde_json::from_value(args).map_err(|e| format!("Invalid args: {e}"))?;
+        let parsed = parse_args::<SkillPatchArgs>(args)?;
         let path = find_skill_file(security, &parsed.name)?;
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| format!("Failed to read skill: {e}"))?;
-
-        if !content.contains(&parsed.old_string) {
-            return Err("Target old_string not found in skill".to_string());
-        }
-
-        let updated = content.replacen(&parsed.old_string, &parsed.new_string, 1);
-        tokio::fs::write(&path, updated)
-            .await
-            .map_err(|e| format!("Failed to save skill patch: {e}"))?;
+        replace_first(&path, &parsed.old_string, &parsed.new_string, "skill").await?;
         Ok(format!("Successfully patched {}", parsed.name))
     }
 }
