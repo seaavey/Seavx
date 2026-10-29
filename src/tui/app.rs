@@ -139,12 +139,8 @@ fn apply_plan_command(app: &mut App, input: &str) -> bool {
 
     app.input = new_input();
     match command {
-        PlanCommand::Enter => {
-            app.set_mode(AgentMode::Plan);
-        }
-        PlanCommand::Exit => {
-            app.set_mode(AgentMode::Build);
-        }
+        PlanCommand::Enter => app.request_mode(AgentMode::Plan),
+        PlanCommand::Exit => app.request_mode(AgentMode::Build),
         PlanCommand::Invalid => app.push_mode_notice("Usage: /plan [on|off]"),
     }
     true
@@ -298,12 +294,20 @@ impl<'a> App<'a> {
         true
     }
 
-    pub fn toggle_mode(&mut self) -> bool {
+    /// Switch modes for the user's `/plan` or shortcut, explaining a refusal so
+    /// a switch that cannot happen is never silent.
+    pub fn request_mode(&mut self, mode: AgentMode) {
+        if !self.set_mode(mode) && self.mode != mode {
+            self.push_mode_notice("Cannot switch mode while a task is running");
+        }
+    }
+
+    pub fn toggle_mode(&mut self) {
         let next = match self.mode {
             AgentMode::Build => AgentMode::Plan,
             AgentMode::Plan => AgentMode::Build,
         };
-        self.set_mode(next)
+        self.request_mode(next);
     }
 
     fn push_mode_notice(&mut self, text: &str) {
@@ -1150,7 +1154,7 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
                                     continue;
                                 } else if selected_cmd == "/plan" {
                                     app.input = new_input();
-                                    app.set_mode(AgentMode::Plan);
+                                    app.request_mode(AgentMode::Plan);
                                     continue;
                                 } else if selected_cmd == "/clear" {
                                     app.input = new_input();

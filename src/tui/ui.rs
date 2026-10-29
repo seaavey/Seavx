@@ -233,7 +233,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         format!("{total}/{}k", max_context_limit / 1_000)
     };
 
-    const HINTS: &str = "↑↓ history  ·  ⏎ send  ·  ctrl+c exit";
+    const HINTS: &str = "↑↓ history  ·  tab complete  ·  ⏎ send  ·  ctrl+c exit";
     let separator = Span::styled("  ·  ", dim);
     let left_area = Rect {
         width: chunks[4]
