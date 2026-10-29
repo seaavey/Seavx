@@ -23,12 +23,25 @@ use crate::agent::engine::{AgentMode, EFFORT_LEVELS};
 use crate::tui::event::{Action, AgentState};
 use crate::tui::ui;
 
+const MAX_COMPLETION_RESULTS: usize = 20;
+
 pub fn scan_workspace_entries(query: &str) -> Vec<(bool, String)> {
+    scan_workspace_entries_at(std::path::Path::new("."), query)
+}
+
+/// Root-aware core of [`scan_workspace_entries`]. Tests scan an isolated tree
+/// without changing the process working directory.
+fn scan_workspace_entries_at(root: &std::path::Path, query: &str) -> Vec<(bool, String)> {
     let clean_query = query.trim_start_matches('@').to_lowercase();
     let mut results = Vec::new();
 
-    fn walk_dir(dir: &std::path::Path, results: &mut Vec<(bool, String)>, query: &str) {
-        if results.len() >= 20 {
+    fn walk_dir(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        results: &mut Vec<(bool, String)>,
+        query: &str,
+    ) {
+        if results.len() >= MAX_COMPLETION_RESULTS {
             return;
         }
         let entries = match std::fs::read_dir(dir) {
@@ -36,7 +49,7 @@ pub fn scan_workspace_entries(query: &str) -> Vec<(bool, String)> {
             Err(_) => return,
         };
         for entry in entries.flatten() {
-            if results.len() >= 20 {
+            if results.len() >= MAX_COMPLETION_RESULTS {
                 break;
             }
             let path = entry.path();
@@ -45,21 +58,24 @@ pub fn scan_workspace_entries(query: &str) -> Vec<(bool, String)> {
                 continue;
             }
             let rel = path
-                .strip_prefix(".")
+                .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
-            let is_dir = path.is_dir();
+            // `DirEntry::file_type` does not follow symlinks: a linked directory
+            // is listed as a candidate but never traversed, so it cannot expose
+            // names outside the workspace or walk a cycle.
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
             if query.is_empty() || rel.to_lowercase().contains(query) {
                 results.push((is_dir, rel));
             }
             if is_dir {
-                walk_dir(&path, results, query);
+                walk_dir(&path, root, results, query);
             }
         }
     }
 
-    walk_dir(std::path::Path::new("."), &mut results, &clean_query);
+    walk_dir(root, root, &mut results, &clean_query);
     results.sort_by(|a, b| a.1.cmp(&b.1));
     results
 }

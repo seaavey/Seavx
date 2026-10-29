@@ -14,6 +14,64 @@ fn typed(app: &App) -> String {
 }
 
 #[test]
+fn workspace_scan_still_traverses_regular_directories_and_caps_results() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+    std::fs::write(root.join("nested/deeper/needle.rs"), "").unwrap();
+    for index in 0..30 {
+        std::fs::write(root.join(format!("match_{index:02}.txt")), "").unwrap();
+    }
+
+    let nested = scan_workspace_entries_at(root, "@needle");
+    assert_eq!(
+        nested,
+        vec![(false, "nested/deeper/needle.rs".to_string())],
+        "nested regular directories are still traversed"
+    );
+
+    let capped = scan_workspace_entries_at(root, "@match_");
+    assert_eq!(capped.len(), 20, "the result cap is unchanged");
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_scan_does_not_follow_symlinked_directories() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("outside_secret.rs"), "").unwrap();
+    std::os::unix::fs::symlink(outside.path(), workspace.path().join("linked")).unwrap();
+
+    let entries = scan_workspace_entries_at(workspace.path(), "@outside_secret");
+    assert!(entries.is_empty(), "{entries:?}");
+
+    let linked = scan_workspace_entries_at(workspace.path(), "@linked");
+    assert_eq!(
+        linked,
+        vec![(false, "linked".to_string())],
+        "the link itself stays a non-directory candidate"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_scan_terminates_on_symlink_cycle_without_matches() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(workspace.path().join("a/b")).unwrap();
+    std::os::unix::fs::symlink(workspace.path(), workspace.path().join("a/b/back")).unwrap();
+    let root = workspace.path().to_path_buf();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(scan_workspace_entries_at(&root, "@zzz_no_match"));
+    });
+    let entries = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("completion scan did not terminate within one second");
+    assert!(entries.is_empty(), "{entries:?}");
+}
+
+#[test]
 fn arrows_recall_history_newest_first() {
     let mut app = app_with(&["first", "second", "third"]);
 
