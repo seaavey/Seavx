@@ -38,6 +38,7 @@ fn schema<T: JsonSchema>() -> Value {
 /// Create parent directories when needed, then write content atomically. Shared
 /// core of `write_file` and `skill_write`; `ctx` labels the target in errors.
 fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), String> {
+    crate::agent::security::check_write_target(path)?;
     write_atomic(path, content.as_bytes(), ModePolicy::Preserve)
         .map_err(|e| format!("Failed to write {ctx}: {e}"))
 }
@@ -110,7 +111,7 @@ async fn replace_first(
     new_string: &str,
     ctx: &str,
 ) -> Result<(), String> {
-    let content = tokio::fs::read_to_string(path)
+    let content = crate::agent::security::read_verified(path)
         .await
         .map_err(|e| format!("Failed to read {ctx} for editing: {e}"))?;
 
@@ -119,6 +120,7 @@ async fn replace_first(
     }
 
     let updated = content.replacen(old_string, new_string, 1);
+    crate::agent::security::check_write_target(path)?;
     write_atomic(path, updated.as_bytes(), ModePolicy::Preserve)
         .map_err(|e| format!("Failed to save {ctx} edit: {e}"))
 }
@@ -154,9 +156,7 @@ impl AgentTool for ReadFileTool {
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<ReadFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| format!("Failed to read file: {e}"))?;
+        let content = crate::agent::security::read_verified(&path).await?;
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
