@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use genai::chat::{ChatMessage, ChatRole};
+use genai::chat::{ChatMessage, ChatRole, ToolResponse};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Serde format of a message payload. Bumped only if `genai` changes its
@@ -106,6 +106,171 @@ pub struct LoadedSession {
     pub messages: Vec<StoredMessage>,
     pub total_tokens: i64,
     pub prompt_tokens: i64,
+}
+
+/// Stored payload bytes a resume may replay before it starts cutting turns.
+pub const RESUME_BUDGET_BYTES: usize = 80_000;
+
+/// The synthetic result for a tool call that never returned.
+pub const INTERRUPTED_RESULT: &str =
+    "Tool call interrupted: no result was recorded before the session stopped.";
+
+/// What one replay pass produces: the provider history, the prompt to prefill,
+/// and how many stored rows were left out.
+#[derive(Debug, Clone, Default)]
+pub struct ReplayOutcome {
+    pub history: Vec<ChatMessage>,
+    pub draft: Option<String>,
+    pub omitted: usize,
+    pub synthetic: Vec<ChatMessage>,
+}
+
+/// The one replay function, in the fixed order: unanswered-turn rule, then
+/// status rules, then the byte window, then the tool-call repair.
+pub fn replay(session: &LoadedSession) -> ReplayOutcome {
+    let rows = &session.messages[..];
+
+    // 1. Split into turns at user rows.
+    let mut turns: Vec<&[StoredMessage]> = Vec::new();
+    let mut start = 0;
+    for (index, row) in rows.iter().enumerate() {
+        if index > start && row.role == "user" {
+            turns.push(&rows[start..index]);
+            start = index;
+        }
+    }
+    if start < rows.len() {
+        turns.push(&rows[start..]);
+    }
+
+    // 2. An unanswered user row is not history, whatever its status; the last
+    // one is the draft instead.
+    let mut draft = None;
+    let mut surviving: Vec<&[StoredMessage]> = Vec::new();
+    let last_turn = turns.len().saturating_sub(1);
+    for (index, turn) in turns.iter().enumerate() {
+        if turn.len() == 1 && turn[0].role == "user" {
+            if index == last_turn {
+                draft = text_of(&turn[0].payload);
+            }
+            continue;
+        }
+        surviving.push(turn);
+    }
+
+    // 3. Per-status rules inside the surviving rows.
+    let mut kept: Vec<(usize, ChatMessage)> = Vec::new();
+    for row in surviving.into_iter().flatten() {
+        let Ok(message) = serde_json::from_str::<ChatMessage>(&row.payload) else {
+            continue;
+        };
+        let keep = match row.status {
+            MessageStatus::Interrupted => row.role != "assistant",
+            MessageStatus::Cancelled | MessageStatus::Partial => has_text(&message),
+            MessageStatus::Complete => true,
+        };
+        if keep {
+            kept.push((row.payload.len(), message));
+        }
+    }
+
+    // 4. The window cuts at a user boundary, newest first; the newest turn is
+    // kept whole even when it alone exceeds the budget.
+    let mut groups: Vec<Vec<(usize, ChatMessage)>> = Vec::new();
+    for (size, message) in kept {
+        if message.role == ChatRole::User || groups.is_empty() {
+            groups.push(Vec::new());
+        }
+        if let Some(group) = groups.last_mut() {
+            group.push((size, message));
+        }
+    }
+    let mut windowed: Vec<Vec<(usize, ChatMessage)>> = Vec::new();
+    let mut used = 0;
+    for group in groups.into_iter().rev() {
+        let size: usize = group.iter().map(|(size, _)| size).sum();
+        if !windowed.is_empty() && used + size > RESUME_BUDGET_BYTES {
+            break;
+        }
+        used += size;
+        windowed.push(group);
+    }
+    windowed.reverse();
+
+    let kept_rows: usize = windowed.iter().map(Vec::len).sum();
+    let omitted = rows.len().saturating_sub(kept_rows);
+
+    // 5. Repair: a tool row whose call is outside the window is dropped, a call
+    // inside it with no result gets the synthetic interrupted row.
+    let flat: Vec<ChatMessage> = windowed.into_iter().flatten().map(|(_, m)| m).collect();
+    let called: Vec<String> = flat.iter().flat_map(call_ids_of).collect();
+    let answered: Vec<String> = flat
+        .iter()
+        .filter(|message| message.role == ChatRole::Tool)
+        .filter_map(|message| {
+            message
+                .content
+                .tool_responses()
+                .first()
+                .map(|response| response.call_id.clone())
+        })
+        .collect();
+
+    let mut history = Vec::with_capacity(flat.len());
+    let mut synthetic = Vec::new();
+    for message in flat {
+        if message.role == ChatRole::Tool
+            && message
+                .content
+                .tool_responses()
+                .first()
+                .is_none_or(|response| !called.contains(&response.call_id))
+        {
+            continue;
+        }
+        let missing: Vec<String> = call_ids_of(&message)
+            .into_iter()
+            .filter(|call_id| !answered.contains(call_id))
+            .collect();
+        history.push(message);
+        for call_id in missing {
+            let patch = ChatMessage::from(ToolResponse::new(call_id, INTERRUPTED_RESULT));
+            synthetic.push(patch.clone());
+            history.push(patch);
+        }
+    }
+
+    ReplayOutcome {
+        history,
+        draft,
+        omitted,
+        synthetic,
+    }
+}
+
+fn call_ids_of(message: &ChatMessage) -> Vec<String> {
+    message
+        .content
+        .tool_calls()
+        .iter()
+        .map(|call| call.call_id.clone())
+        .collect()
+}
+
+fn has_text(message: &ChatMessage) -> bool {
+    message
+        .content
+        .first_text()
+        .is_some_and(|text| !text.trim().is_empty())
+}
+
+fn text_of(payload: &str) -> Option<String> {
+    let message: ChatMessage = serde_json::from_str(payload).ok()?;
+    message
+        .content
+        .first_text()
+        .map(str::to_string)
+        .filter(|text| !text.is_empty())
 }
 
 const SCHEMA: &str = "

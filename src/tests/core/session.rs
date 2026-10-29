@@ -1,6 +1,6 @@
 use crate::session::{
-    MessageStatus, PAYLOAD_FORMAT, SCHEMA_VERSION, SessionError, SessionStore, TurnState,
-    WRITE_BUDGET,
+    LoadedSession, MessageStatus, PAYLOAD_FORMAT, RESUME_BUDGET_BYTES, SCHEMA_VERSION,
+    SessionError, SessionStore, StoredMessage, TurnState, WRITE_BUDGET, replay,
 };
 use genai::chat::{ChatMessage, MessageContent, ToolCall, ToolResponse};
 
@@ -376,4 +376,230 @@ fn a_second_store_sees_pending_while_the_first_is_mid_turn() {
         TurnState::Pending,
         "a live writer is pending, never interrupted"
     );
+}
+
+fn stored(seq: i64, role: &str, status: MessageStatus, message: &ChatMessage) -> StoredMessage {
+    StoredMessage {
+        seq,
+        role: role.to_string(),
+        status,
+        payload: serde_json::to_string(message).unwrap(),
+        created_at: 0,
+    }
+}
+
+fn loaded(messages: Vec<StoredMessage>) -> LoadedSession {
+    LoadedSession {
+        id: 1,
+        workspace: "/ws".to_string(),
+        title: None,
+        model: None,
+        payload_format: PAYLOAD_FORMAT.to_string(),
+        read_only: None,
+        messages,
+        total_tokens: 0,
+        prompt_tokens: 0,
+    }
+}
+
+fn replayed_text(outcome: &crate::session::ReplayOutcome) -> Vec<String> {
+    outcome
+        .history
+        .iter()
+        .map(|message| message.content.texts().join(""))
+        .collect()
+}
+
+#[test]
+fn replay_policy_table() {
+    // An answered user row is replayed; an unanswered one followed by another
+    // user row is dropped even though its status is `complete`.
+    let rows = vec![
+        stored(1, "user", MessageStatus::Complete, &ChatMessage::user("q1")),
+        stored(
+            2,
+            "assistant",
+            MessageStatus::Complete,
+            &ChatMessage::assistant("a1"),
+        ),
+        stored(
+            3,
+            "user",
+            MessageStatus::Complete,
+            &ChatMessage::user("unanswered"),
+        ),
+        stored(4, "user", MessageStatus::Complete, &ChatMessage::user("q2")),
+        stored(
+            5,
+            "assistant",
+            MessageStatus::Complete,
+            &ChatMessage::assistant("a2"),
+        ),
+    ];
+    let outcome = replay(&loaded(rows));
+    assert_eq!(replayed_text(&outcome), vec!["q1", "a1", "q2", "a2"]);
+    assert_eq!(outcome.draft, None);
+    assert_eq!(outcome.omitted, 1);
+
+    // The last unanswered user row becomes the draft and is never replayed.
+    let rows = vec![
+        stored(1, "user", MessageStatus::Complete, &ChatMessage::user("q1")),
+        stored(
+            2,
+            "assistant",
+            MessageStatus::Complete,
+            &ChatMessage::assistant("a1"),
+        ),
+        stored(
+            3,
+            "user",
+            MessageStatus::Complete,
+            &ChatMessage::user("draft"),
+        ),
+    ];
+    let outcome = replay(&loaded(rows));
+    assert_eq!(replayed_text(&outcome), vec!["q1", "a1"]);
+    assert_eq!(outcome.draft.as_deref(), Some("draft"));
+
+    // Assistant statuses: complete and partial-with-text replay, cancelled
+    // without text is skipped.
+    let rows = vec![
+        stored(1, "user", MessageStatus::Complete, &ChatMessage::user("q")),
+        stored(
+            2,
+            "assistant",
+            MessageStatus::Cancelled,
+            &ChatMessage::assistant(""),
+        ),
+        stored(
+            3,
+            "assistant",
+            MessageStatus::Partial,
+            &ChatMessage::assistant("half"),
+        ),
+        stored(
+            4,
+            "assistant",
+            MessageStatus::Complete,
+            &ChatMessage::assistant("full"),
+        ),
+    ];
+    let outcome = replay(&loaded(rows));
+    assert_eq!(replayed_text(&outcome), vec!["q", "half", "full"]);
+
+    // Tool rows: complete replays, interrupted replays only with its call.
+    let rows = vec![
+        stored(1, "user", MessageStatus::Complete, &ChatMessage::user("q")),
+        stored(
+            2,
+            "assistant",
+            MessageStatus::Complete,
+            &call_message(vec![tool_call("call_a", "read_file")]),
+        ),
+        stored(
+            3,
+            "tool",
+            MessageStatus::Complete,
+            &result_message("call_a", "content"),
+        ),
+        stored(
+            4,
+            "assistant",
+            MessageStatus::Complete,
+            &call_message(vec![tool_call("call_b", "read_file")]),
+        ),
+        stored(
+            5,
+            "tool",
+            MessageStatus::Interrupted,
+            &result_message("call_b", "interrupted"),
+        ),
+    ];
+    let outcome = replay(&loaded(rows));
+    assert_eq!(outcome.history.len(), 5);
+    assert!(outcome.synthetic.is_empty());
+    assert_eq!(outcome.omitted, 0);
+
+    // An interrupted result whose call is not in the window is dropped.
+    let rows = vec![
+        stored(1, "user", MessageStatus::Complete, &ChatMessage::user("q")),
+        stored(
+            2,
+            "tool",
+            MessageStatus::Interrupted,
+            &result_message("call_gone", "interrupted"),
+        ),
+    ];
+    let outcome = replay(&loaded(rows));
+    assert_eq!(replayed_text(&outcome), vec!["q"]);
+}
+
+#[test]
+fn the_window_starts_at_a_user_row_and_keeps_an_oversized_turn_whole() {
+    let block = |size: usize, seq: i64, user: &str| {
+        vec![
+            stored(
+                seq,
+                "user",
+                MessageStatus::Complete,
+                &ChatMessage::user(user),
+            ),
+            stored(
+                seq + 1,
+                "assistant",
+                MessageStatus::Complete,
+                &ChatMessage::assistant("x".repeat(size)),
+            ),
+        ]
+    };
+    let mut rows = block(60_000, 1, "oldest");
+    rows.extend(block(30_000, 3, "middle"));
+    rows.extend(block(10_000, 5, "newest"));
+
+    let outcome = replay(&loaded(rows.clone()));
+    assert_eq!(
+        outcome.history.first().map(|message| message.role.clone()),
+        Some(genai::chat::ChatRole::User),
+        "the window starts at a user row"
+    );
+    assert_eq!(outcome.history.len(), 4, "the oldest turn was dropped");
+    assert_eq!(outcome.omitted, 2);
+    let total: usize = outcome
+        .history
+        .iter()
+        .map(|message| serde_json::to_string(message).unwrap().len())
+        .sum();
+    assert!(
+        total <= RESUME_BUDGET_BYTES + 4096,
+        "kept history stays inside the budget, was {total}"
+    );
+
+    // A single turn over the budget is kept whole, never truncated.
+    let oversized = block(120_000, 1, "huge");
+    let outcome = replay(&loaded(oversized));
+    assert_eq!(outcome.history.len(), 2);
+    assert_eq!(outcome.omitted, 0);
+    assert!(
+        outcome.history[1].content.texts().join("").len() == 120_000,
+        "a message is never truncated"
+    );
+}
+
+#[test]
+fn a_pending_row_is_never_rewritten_by_replay() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    store.record_user(id, "unanswered prompt").unwrap();
+
+    let outcome = replay(&store.load(id).unwrap());
+    assert_eq!(outcome.draft.as_deref(), Some("unanswered prompt"));
+    assert!(outcome.history.is_empty());
+
+    let status: String = store
+        .connection()
+        .query_row("SELECT status FROM messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(status, "complete", "replay never rewrites the stored row");
 }
