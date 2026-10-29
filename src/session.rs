@@ -41,6 +41,71 @@ impl MessageStatus {
             Self::Interrupted => "interrupted",
         }
     }
+
+    fn parse(text: &str) -> Self {
+        match text {
+            "partial" => Self::Partial,
+            "cancelled" => Self::Cancelled,
+            "interrupted" => Self::Interrupted,
+            _ => Self::Complete,
+        }
+    }
+}
+
+/// Turn state derived from the stored rows, never stored itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnState {
+    Idle,
+    Pending,
+    /// Pending with recovery evidence: an `interrupted` row written by a
+    /// recovery pass. A live writer is only ever `Pending`.
+    Interrupted,
+}
+
+impl TurnState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Pending => "pending",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// One row of `sessions list`.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: i64,
+    pub title: String,
+    pub updated_at: i64,
+    pub messages: usize,
+    pub state: TurnState,
+}
+
+/// One stored message, payload unparsed.
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub seq: i64,
+    pub role: String,
+    pub status: MessageStatus,
+    pub payload: String,
+    pub created_at: i64,
+}
+
+/// A session read back for replay, rendering or export.
+#[derive(Debug, Clone)]
+pub struct LoadedSession {
+    pub id: i64,
+    pub workspace: String,
+    pub title: Option<String>,
+    pub model: Option<String>,
+    pub payload_format: String,
+    /// `Some(reason)` when the rows cannot be appended to: another payload
+    /// format, or a payload that does not parse.
+    pub read_only: Option<String>,
+    pub messages: Vec<StoredMessage>,
+    pub total_tokens: i64,
+    pub prompt_tokens: i64,
 }
 
 const SCHEMA: &str = "
@@ -247,6 +312,113 @@ impl SessionStore {
         })
     }
 
+    /// Sessions of one workspace with at least one message, newest activity
+    /// first, each with its derived turn state.
+    pub fn list(&self, workspace: &str) -> Result<Vec<SessionSummary>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.title, s.updated_at, COUNT(m.id)
+             FROM sessions s JOIN messages m ON m.session_id = s.id
+             WHERE s.workspace = ?1
+             GROUP BY s.id
+             HAVING COUNT(m.id) > 0
+             ORDER BY s.updated_at DESC, s.id DESC",
+        )?;
+        let rows: Vec<(i64, Option<String>, i64, i64)> = statement
+            .query_map([workspace], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+
+        let mut summaries = Vec::with_capacity(rows.len());
+        for (id, title, updated_at, messages) in rows {
+            summaries.push(SessionSummary {
+                id,
+                title: title.unwrap_or_default(),
+                updated_at,
+                messages: messages as usize,
+                state: self.turn_state(id)?,
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// Read one session back, rows in `seq` order, marking it read-only when the
+    /// payload format or one payload cannot be replayed by this build.
+    pub fn load(&self, id: i64) -> Result<LoadedSession, SessionError> {
+        let header = self
+            .connection
+            .query_row(
+                "SELECT workspace, title, model, payload_format, total_tokens, prompt_tokens
+                 FROM sessions WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(SessionError::Unknown(id))?;
+
+        let messages = self.rows(id)?;
+        let mut read_only = (header.3 != PAYLOAD_FORMAT).then(|| {
+            format!(
+                "payload format {} does not match {}",
+                header.3, PAYLOAD_FORMAT
+            )
+        });
+        if read_only.is_none()
+            && let Some(unreadable) = messages
+                .iter()
+                .find(|message| serde_json::from_str::<ChatMessage>(&message.payload).is_err())
+        {
+            read_only = Some(format!(
+                "message #{} cannot be read as a chat message",
+                unreadable.seq
+            ));
+        }
+
+        Ok(LoadedSession {
+            id,
+            workspace: header.0,
+            title: header.1,
+            model: header.2,
+            payload_format: header.3,
+            read_only,
+            messages,
+            total_tokens: header.4,
+            prompt_tokens: header.5,
+        })
+    }
+
+    fn rows(&self, session: i64) -> Result<Vec<StoredMessage>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT seq, role, status, payload, created_at FROM messages
+             WHERE session_id = ?1 ORDER BY seq",
+        )?;
+        let rows = statement.query_map([session], |row| {
+            Ok(StoredMessage {
+                seq: row.get(0)?,
+                role: row.get(1)?,
+                status: MessageStatus::parse(&row.get::<_, String>(2)?),
+                payload: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn turn_state(&self, session: i64) -> Result<TurnState, SessionError> {
+        let rows = self.rows(session)?;
+        Ok(derive_turn_state(&rows))
+    }
+
     /// A session written by another payload format, or one that does not exist.
     fn ensure_writable(&self, session: i64) -> Result<(), SessionError> {
         let format: Option<String> = self
@@ -403,6 +575,64 @@ fn is_busy(error: &rusqlite::Error) -> bool {
                 rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             )
     )
+}
+
+/// State of the last turn: an unanswered user row or tool call is `pending`;
+/// recovery evidence outranks the per-status answer.
+fn derive_turn_state(rows: &[StoredMessage]) -> TurnState {
+    let Some(start) = rows.iter().rposition(|row| row.role == "user") else {
+        return TurnState::Idle;
+    };
+    let turn = &rows[start..];
+    if turn.len() == 1 {
+        return TurnState::Pending;
+    }
+    let Some(last_assistant) = turn.iter().rposition(|row| row.role == "assistant") else {
+        return TurnState::Idle;
+    };
+    if turn[last_assistant..]
+        .iter()
+        .any(|row| row.status == MessageStatus::Interrupted)
+    {
+        return TurnState::Interrupted;
+    }
+
+    let answered = call_ids(&turn[last_assistant].payload)
+        .iter()
+        .all(|call_id| {
+            turn[last_assistant + 1..].iter().any(|row| {
+                row.role == "tool" && response_call_id(&row.payload).as_deref() == Some(call_id)
+            })
+        });
+    if answered {
+        TurnState::Idle
+    } else {
+        TurnState::Pending
+    }
+}
+
+/// Tool-call ids of a payload; an unreadable payload has no calls.
+fn call_ids(payload: &str) -> Vec<String> {
+    serde_json::from_str::<ChatMessage>(payload)
+        .map(|message| {
+            message
+                .content
+                .tool_calls()
+                .iter()
+                .map(|call| call.call_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `call_id` a tool-result payload answers.
+fn response_call_id(payload: &str) -> Option<String> {
+    serde_json::from_str::<ChatMessage>(payload)
+        .ok()?
+        .content
+        .tool_responses()
+        .first()
+        .map(|response| response.call_id.clone())
 }
 
 fn create_owner_only(path: &Path, mode: u32) -> std::io::Result<()> {

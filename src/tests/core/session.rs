@@ -1,5 +1,6 @@
 use crate::session::{
-    MessageStatus, PAYLOAD_FORMAT, SCHEMA_VERSION, SessionError, SessionStore, WRITE_BUDGET,
+    MessageStatus, PAYLOAD_FORMAT, SCHEMA_VERSION, SessionError, SessionStore, TurnState,
+    WRITE_BUDGET,
 };
 use genai::chat::{ChatMessage, MessageContent, ToolCall, ToolResponse};
 
@@ -241,4 +242,138 @@ fn record_user_creates_exactly_one_row() {
     assert_eq!(status, "complete");
     let parsed: ChatMessage = serde_json::from_str(&payload).unwrap();
     assert_eq!(parsed.content.first_text(), Some("hello store"));
+}
+
+fn assistant_text(text: &str) -> ChatMessage {
+    ChatMessage::assistant(text)
+}
+
+/// Derived turn state of one session, read back through `list`.
+fn state_of(store: &SessionStore, workspace: &str, id: i64) -> TurnState {
+    store
+        .list(workspace)
+        .unwrap()
+        .into_iter()
+        .find(|summary| summary.id == id)
+        .unwrap_or_else(|| panic!("session {id} is not listed"))
+        .state
+}
+
+#[test]
+fn list_filters_by_workspace_and_hides_empty_sessions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+
+    let older = store.create("/ws/a", None, Some("older")).unwrap();
+    store.record_user(older, "q").unwrap();
+    store
+        .record_message(older, &assistant_text("a"), MessageStatus::Complete)
+        .unwrap();
+
+    let newer = store.create("/ws/a", None, Some("newer")).unwrap();
+    store.record_user(newer, "q").unwrap();
+    store
+        .record_message(newer, &assistant_text("a"), MessageStatus::Complete)
+        .unwrap();
+
+    let empty = store.create("/ws/a", None, Some("empty")).unwrap();
+    let other = store.create("/ws/b", None, Some("other")).unwrap();
+    store.record_user(other, "q").unwrap();
+    store
+        .record_message(other, &assistant_text("a"), MessageStatus::Complete)
+        .unwrap();
+
+    // Same-second timestamps cannot order activity; pin them.
+    store
+        .connection()
+        .execute(
+            "UPDATE sessions SET updated_at = 100 WHERE id = ?1",
+            [older],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE sessions SET updated_at = 200 WHERE id = ?1",
+            [newer],
+        )
+        .unwrap();
+
+    let listed = store.list("/ws/a").unwrap();
+    let ids: Vec<i64> = listed.iter().map(|summary| summary.id).collect();
+    assert_eq!(ids, vec![newer, older], "newest activity first");
+    assert!(
+        !ids.contains(&empty),
+        "a session with no messages is not listed"
+    );
+    assert_eq!(listed[0].messages, 2);
+    assert_eq!(listed[0].title, "newer");
+    assert_eq!(listed[0].state, TurnState::Idle);
+    assert!(!ids.contains(&other), "another workspace is filtered out");
+}
+
+#[test]
+fn derived_state_is_idle_pending_then_interrupted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let store = SessionStore::open_at(&path).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+
+    store.record_user(id, "first").unwrap();
+    store
+        .record_message(id, &assistant_text("answer"), MessageStatus::Complete)
+        .unwrap();
+    assert_eq!(state_of(&store, "/ws", id), TurnState::Idle);
+
+    store.record_user(id, "second").unwrap();
+    assert_eq!(state_of(&store, "/ws", id), TurnState::Pending);
+
+    store
+        .record_message(
+            id,
+            &call_message(vec![tool_call("call_a", "read_file")]),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+    assert_eq!(
+        state_of(&store, "/ws", id),
+        TurnState::Pending,
+        "an assistant tool call with no result is unanswered"
+    );
+
+    store
+        .record_message(
+            id,
+            &result_message("call_a", "interrupted"),
+            MessageStatus::Interrupted,
+        )
+        .unwrap();
+    assert_eq!(state_of(&store, "/ws", id), TurnState::Interrupted);
+
+    store.record_user(id, "third").unwrap();
+    store
+        .record_message(id, &assistant_text("done"), MessageStatus::Complete)
+        .unwrap();
+    assert_eq!(
+        state_of(&store, "/ws", id),
+        TurnState::Idle,
+        "a later completed turn returns the state to idle"
+    );
+}
+
+#[test]
+fn a_second_store_sees_pending_while_the_first_is_mid_turn() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let writer = SessionStore::open_at(&path).unwrap();
+    let id = writer.create("/ws", None, None).unwrap();
+    writer.record_user(id, "still working").unwrap();
+
+    let reader = SessionStore::open_at(&path).unwrap();
+    assert_eq!(
+        state_of(&reader, "/ws", id),
+        TurnState::Pending,
+        "a live writer is pending, never interrupted"
+    );
 }
