@@ -80,6 +80,8 @@ pub fn render(app: &App, frame: &mut Frame) {
     let (state, state_style) = match &app.status {
         AgentState::Idle => ("ready", dim),
         AgentState::Thinking => ("thinking", Style::default().fg(Color::Yellow)),
+        AgentState::Checking => ("checking", Style::default().fg(Color::Yellow)),
+        AgentState::Compacting => ("compacting", Style::default().fg(Color::Yellow)),
         AgentState::Streaming => ("streaming", Style::default().fg(Color::Yellow)),
         AgentState::ExecutingTool(tool) => (tool.as_str(), Style::default().fg(Color::Cyan)),
     };
@@ -376,6 +378,7 @@ impl Orb {
         match state {
             AgentState::Idle => Orb::Idle,
             AgentState::Thinking => Orb::Breathing,
+            AgentState::Checking | AgentState::Compacting => Orb::Working,
             AgentState::Streaming => Orb::Composing,
             AgentState::ExecutingTool(_) => Orb::Working,
         }

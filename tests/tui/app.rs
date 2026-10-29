@@ -255,34 +255,18 @@ fn multiline_input_is_left_to_the_textarea() {
     assert_eq!(typed(&app), "line one\nline two");
 }
 
-#[test]
-fn plan_command_parses_supported_forms() {
-    assert!(matches!(
-        parse_plan_command("/plan"),
-        Some(PlanCommand::Enter)
-    ));
-    assert!(matches!(
-        parse_plan_command("/plan on"),
-        Some(PlanCommand::Enter)
-    ));
-    assert!(matches!(
-        parse_plan_command("/plan off"),
-        Some(PlanCommand::Exit)
-    ));
-    assert!(matches!(
-        parse_plan_command("/plan nope"),
-        Some(PlanCommand::Invalid)
-    ));
-    assert_eq!(parse_plan_command("/model"), None);
-    assert_eq!(parse_plan_command("plan"), None);
+/// Run one slash command the way the event loop does.
+fn run_command(app: &mut App, input: &str) {
+    let command = crate::tui::commands::parse(input).expect("recognised slash command");
+    crate::tui::commands::execute(app, command);
 }
 
 #[test]
-fn apply_plan_command_enters_and_leaves_plan_mode() {
+fn plan_command_enters_and_leaves_plan_mode() {
     let mut app = test_app();
-    assert!(apply_plan_command(&mut app, "/plan"));
+    run_command(&mut app, "/plan");
     assert_eq!(app.mode, AgentMode::Plan);
-    assert!(apply_plan_command(&mut app, "/plan off"));
+    run_command(&mut app, "/plan off");
     assert_eq!(app.mode, AgentMode::Build);
 }
 
@@ -290,7 +274,7 @@ fn apply_plan_command_enters_and_leaves_plan_mode() {
 fn mode_change_is_rejected_while_busy_and_says_so() {
     let mut app = test_app();
     app.status = AgentState::Streaming;
-    assert!(apply_plan_command(&mut app, "/plan"));
+    run_command(&mut app, "/plan");
     assert_eq!(app.mode, AgentMode::Build);
     let notice = app.segments.iter().any(|segment| match segment {
         Segment::Text(text) => text.contains("Cannot switch mode"),
@@ -314,9 +298,10 @@ fn switching_modes_does_not_write_to_the_transcript() {
 #[test]
 fn second_plan_command_is_idempotent() {
     let mut app = test_app();
-    assert!(apply_plan_command(&mut app, "/plan"));
-    assert!(apply_plan_command(&mut app, "/plan"));
+    run_command(&mut app, "/plan");
+    run_command(&mut app, "/plan");
     assert_eq!(app.mode, AgentMode::Plan);
+    assert!(app.segments.is_empty(), "no notice for a no-op switch");
 }
 
 #[test]

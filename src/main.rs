@@ -45,7 +45,11 @@ enum Commands {
     },
 
     /// Check the installation
-    Doctor,
+    Doctor {
+        /// Skip the endpoint network check
+        #[arg(long)]
+        offline: bool,
+    },
 
     /// List or interactively select model and reasoning effort
     Model {
@@ -152,15 +156,9 @@ async fn main() -> anyhow::Result<()> {
             println!("\nFinal Response:\n{result}");
         }
         Some(Commands::Init) => {
-            let config_path = PathBuf::from(".seavx/config.toml");
-            if !config_path.exists() {
-                let config = agent::engine::AgentConfig {
-                    model: "openai/gpt-4o-mini".to_string(),
-                    base_url: Some(agent::engine::DEFAULT_BASE_URL.to_string()),
-                    api_key: Some(String::new()),
-                    ..agent::engine::AgentConfig::default()
-                };
-                config.write_to(&config_path)?;
+            let (config_path, created) = cli::config::init_workspace(std::path::Path::new("."))
+                .map_err(anyhow::Error::msg)?;
+            if created {
                 println!("Created default config at {}", config_path.display());
             } else {
                 println!("Config already exists at {}", config_path.display());
@@ -169,8 +167,18 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Setup { section }) => match section {
             SetupSection::Providers => cli::setup::providers().await?,
         },
-        Some(Commands::Doctor) => {
-            println!("SEAVX environment check");
+        Some(Commands::Doctor { offline }) => {
+            let report = cli::doctor::run(cli::doctor::DoctorOptions {
+                offline,
+                workspace_root: PathBuf::from("."),
+                home: home::dir(),
+            })
+            .await;
+            println!("{}", cli::doctor::render(&report));
+            let code = cli::doctor::exit_code(&report);
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Some(Commands::Model { model, effort }) => cli::model::run(model, effort).await?,
         Some(Commands::Memory) => cli::memory::run()?,
