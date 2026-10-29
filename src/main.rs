@@ -13,7 +13,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 #[derive(Parser, Debug)]
 #[command(name = "seavx", version, about = "A customizable AI coding agent")]
 struct Cli {
-    /// Enable file-based debug logging to .seavx/debug.log in current repository
+    /// Log at trace level to `.seavx/debug.log`; RUST_LOG overrides this
     #[arg(short, long, global = true)]
     debug: bool,
 
