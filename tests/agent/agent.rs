@@ -252,6 +252,22 @@ mod test_cases {
     }
 
     #[test]
+    fn exported_tools_keep_a_stable_order() {
+        let registry = ToolRegistry::with_default_tools();
+        let names: Vec<String> = registry
+            .to_genai_tools(AgentMode::Build)
+            .iter()
+            .map(|tool| tool.name.as_str().to_string())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            names, sorted,
+            "schema order must not follow HashMap iteration"
+        );
+    }
+
+    #[test]
     fn plan_mode_exports_only_read_only_tools() {
         assert_eq!(
             tool_names(AgentMode::Plan),
