@@ -235,9 +235,9 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/new` | Alias for `/clear`. |
 | `/help` | Show help and the command palette. |
 | `/init` | Create `.seavx/config.toml` with defaults. |
-| `/doctor [--offline]` | Check config, key, endpoint, cache, workspace, memory, and skills. |
+| `/doctor [--offline]` | Check config, key, endpoint, cache, workspace, memory, and skills. The session check opens the database read-only, never creates it, and warns when its schema version or payload format is not the one this build reads. |
 | `/memory [show\|project\|user\|skills\|path]` | Inspect persistent memory and installed skills. |
-| `/undo` | Restore files from the newest checkpoint and remove it; repeat to walk back. |
+| `/undo` | Restore files from the newest checkpoint and remove it; repeat to walk back. A file edited after the agent wrote it is left alone and named, so undo never overwrites newer work. |
 | `/sessions [number]` | List this workspace's sessions and resume one by its listed number. |
 | `/exit` | Quit the TUI. |
 
@@ -271,8 +271,8 @@ query or userinfo.
   - prefixes: `.env*`, `id_rsa*`, `id_ed25519*`, `id_ecdsa*`, `.netrc*`
   - names: `credentials`, `credentials.json`, `secrets.{json,yaml,yml,toml}`, `.npmrc`, `.pypirc`, `.htpasswd`
   - suffixes: `.pem`, `.key`, `.p12`, `.pfx`, `.kdbx`, `.jks`, `.keystore`, `.ppk`
-  - and `config.toml` inside `.seavx`, plus the checkpoint store and session database. `.seavx/MEMORY.md`, `USER.md`, specs and the debug log stay readable.
-- **Platform scope**: mode enforcement (the `0700`/`0600` policy on created files and directories, and the `0600` config/session files) and inode-based backup identity are **Unix-only**. On Windows the mode policy is a no-op and a backup is validated by length plus checksum instead of `(dev, ino)`. Nothing in this README should be read as platform-neutral about either.
+  - and `config.toml` and `SOUL.md` inside `.seavx`, plus the checkpoint store and session database. `SOUL.md` is refused because it is injected into the system prompt ahead of the security policy, so a tool that could rewrite it could rewrite its own instructions. `.seavx/MEMORY.md`, `USER.md`, specs and the debug log stay readable.
+- **Platform scope**: mode enforcement (the `0700`/`0600` policy on created files and directories, and the `0600` config/session files) and inode-based identity are **Unix-only**. On Windows the mode policy is a no-op, a backup is validated by length plus checksum, and a pre-open snapshot degrades to length, mode and modification time instead of `(dev, ino)` — weaker than an inode, and stated as such. Nothing in this README should be read as platform-neutral about either.
 - **Limits stated, not implied**: there is no encryption at rest — sessions, memory files and checkpoints are plain text on disk, protected by file modes only. Nothing rolls a crashed run back automatically: file writes are staged and checkpointed so `/undo` restores them, but recovery after a crash is a manual `/undo`, never a silent rewrite.
 - **Permission Matrix**: every tool call is decided by one matrix. Writes inside the workspace are ungated because the path policy confines them and checkpoints make them reversible; anything that can leave the workspace asks.
 
@@ -286,7 +286,8 @@ query or userinfo.
   - The **destructive floor** (`rm -rf`, `mkfs`, `dd of=/dev/…`, `shutdown`, `reboot`, fork bombs) is refused unconditionally; no key or config lifts it.
   - `permitted_actions = ["execute", "network"]` lifts those two kinds from ask to allow in `ask` mode only. `global-write` and `destructive` are not accepted there — naming one is a config error.
   - Answers: **once** (this call), **category** (appends to `permitted_actions`), **unrestricted** (`tool_permissions = "allow"`). Quitting while a question is pending counts as a denial; `seavx exec` always denies and says so in the tool result.
-  - Rule-of-thumb: a key command that cannot be proven read-only asks. Any `rg`/`grep` that walks a directory asks, and its output is filtered line by line afterwards (`[N lines withheld by policy]`).
+  - A tool that picks its own destination is judged by that destination, not by what it calls itself: `skill_write` and `save_memory` write under the global roots, so they ask like any other global write.
+  - Rule-of-thumb: a key command that cannot be proven read-only asks. Any `rg`/`grep` that walks a directory asks, and its output is filtered line by line afterwards (`[N lines withheld by policy]`). A read operand outside the workspace asks too (`cat ../x`, `cat /etc/passwd`, `ln -s`), because the shell follows the path and a name check is not containment. `cargo test` and `cargo build` ask: both run the workspace's own code and build scripts.
 - **Redaction**: tool output, tool errors, permission prompts and log lines are masked (`api_key=…`, `Bearer …`, `sk-`/`ghp_`/`xoxb-`/`ntn_`/`AKIA…`, private-key bodies). User prompts and assistant text stay verbatim; checkpoint backups are byte-for-byte.
 - **Not prevented** (stated, not implied): deliberate shell obfuscation (`eval`, base64, `curl | sh`, a path assembled inside a script), exfiltration by an allowed command, timing channels, and any OS-level containment. This is a gate, not a sandbox; closing that gap needs `openat2(RESOLVE_BENEATH)`, namespaces or seccomp.
 - **Unix-only**: file-mode policy and hard-link refusal are enforced on Unix; on Windows the mode policy is a no-op and backup identity degrades to length plus checksum.
@@ -294,14 +295,14 @@ query or userinfo.
   - `read_file`: Line pagination (offset/limit) & truncation guards.
   - `write_file`: Safe directory creation and atomic file writing.
   - `edit_file`: Precise search-and-replace. A snippet that occurs more than once is refused with the count and up to three samples; pass `replace_all: true` to change every occurrence.
-  - `apply_patch`: Strict unified diff over one or more files, applied in memory first and committed as one unit. Exact context only — no fuzz, no 3-way merge.
-  - `search_files`: Fast in-process grep & filename globbing (ignores `.git`, `target`, `node_modules`).
-  - `run_command`: Bounded execution with 30s timeout.
+  - `apply_patch`: Strict unified diff over one or more files, applied in memory first and committed as one unit. Exact context only — no fuzz, no 3-way merge. A create patch (`--- /dev/null`) is refused when the target already exists: splicing new lines in front of the user's content is not a create.
+  - `search_files`: Fast in-process grep & filename globbing (ignores `.git`, `target`, `node_modules`). The walk never follows a symlink, and a file over 2 MB is skipped rather than read whole.
+  - `run_command`: Bounded execution with a 30 s timeout. Output is drained against a fixed two-second window, so a child the shell left behind (`sleep 30 &`) cannot hold the turn open; a timeout reports an unconfirmed cleanup with its pid.
   - `save_memory`: Singularity-gated persistence with confidence scoring.
   - `skill_view`: On-demand progressive disclosure skill loader.
   - `skill_write`: Create or fully rewrite a skill.
   - `skill_patch`: Exact string replacement inside an existing skill.
-- **Batched edits**: one `apply_patch` call writes all its files or none. Each file is capped at 16 MB, a batch at 64 files and 128 MB of staged bytes; the checkpoint store keeps the newest 200 batches and never evicts a live one. Batch atomicity holds while the process lives; a crash is reported at the next start (`batch interrupted: …`) and undone with `/undo`. Nothing is rolled back automatically.
+- **Batched edits**: one `apply_patch` call writes all its files or none. Each file is capped at 16 MB, a batch at 64 files and 128 MB of staged bytes; the checkpoint store keeps the newest 200 batches and never evicts a live one. Batch atomicity holds while the process lives; a crash is reported at the next start (`batch interrupted: …`) and undone with `/undo`. Nothing is rolled back automatically. A journal that cannot be appended after a rename is a commit failure, not a staging one: the files already renamed are put back and the error says which. A checkpoint whose manifest can no longer be read is reported (`batch checkpoint … is unreadable`) instead of being skipped.
 - **Autonomous Self-Improvement**: Post-task workflow evaluator with ≥ 75% confidence singularity gate, persisting reusable workflows to `.seavx/skills/`.
 
 ---

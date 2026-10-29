@@ -42,6 +42,41 @@ per landed change; no entry describes behaviour that is not in the code.
   the `run_shell` import in `src/tests/core/cancel.rs`, are `#[cfg(unix)]`, so
   `cargo check --all-targets` compiles on Windows. Test code only; no runtime
   behaviour changed.
+- A shell read operand outside the workspace (`cat ../x`, `cat /etc/passwd`,
+  `ln -s`, a `mv` source) is no longer classified as a plain read: the shell
+  follows the path, so the command asks instead of being allowed. A
+  substitution inside double quotes is lexed like one outside them.
+- `cargo test` and `cargo build` ask; only `cargo fmt` is a write. `git` with an
+  argument naming a protected path (`git show HEAD:.env`) asks.
+- `/undo` records the bytes the agent wrote and refuses to restore over a file
+  that changed afterwards, naming it. A checkpoint manifest that cannot be read
+  is reported at startup instead of being skipped.
+- A journal that cannot be appended after a batch rename rolls the renamed files
+  back and reports a commit failure with the reason; it used to report a staging
+  failure while both files stayed written.
+- `run_command` drains output against a fixed two-second window, so a background
+  child cannot hold the turn open, and keeps what arrived instead of discarding
+  it. A timeout reports an unconfirmed cleanup with its pid.
+- `apply_patch` refuses a create patch whose target already exists, instead of
+  splicing the new lines in front of the existing content. `search_files` does
+  not follow symlinks and skips files over 2 MB.
+- `.seavx/SOUL.md` is a protected file: it is injected into the system prompt
+  ahead of the security policy, so a tool may not rewrite it.
+- Redaction covers a quoted key (`{"token": "…"}`) and a bare `Bearer …` value.
+  A read of a file over the 16 MB limit is refused before it is read.
+- A tool that picks its own destination is classified by that destination, so
+  `skill_write` and `save_memory` ask as global writes instead of being allowed.
+- The replay-rejection retry no longer panics on a history with a single turn
+  boundary; a body with no user row is kept whole.
+- One turn at a time: a second prompt while a turn runs is refused with a notice
+  and the running turn keeps its cancel token. A cancelled turn no longer prints
+  `Error: the turn was cancelled` on top of its own status.
+- A generated title is stored against the session that asked for it and never
+  renames the session the user already started. `/undo` and startup recovery use
+  the canonical workspace root instead of the current directory.
+- `seavx exec` prints a streamed answer once, not twice.
+- `doctor`'s session check no longer creates the store it inspects, and warns
+  when the schema version or payload format is not the one this build reads.
 
 ### tests
 
