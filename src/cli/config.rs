@@ -496,6 +496,8 @@ pub(crate) enum Fault {
     ThirdStateAfterRemove,
     /// The rename into place fails.
     Rename,
+    /// A second writer lands between the rename and the verification.
+    ThirdStateAfterRename,
     /// Removing the `.bak` after a verified write fails.
     BackupCleanup,
 }
@@ -611,10 +613,24 @@ fn replace_config_with(path: &Path, contents: &[u8], fault: Option<Fault>) -> Re
         return abort(format!("failed to replace {}", path.display()));
     }
 
-    // (7) Verify the new bytes, then drop the backup.
+    if fault == Some(Fault::ThirdStateAfterRename)
+        && let Err(error) = std::fs::write(path, b"third = 3\n")
+    {
+        return abort(format!("failed to write {}: {error}", path.display()));
+    }
+
+    // (7) Verify the new bytes, then drop the backup. A mismatch means another
+    // writer landed after the rename, so their file is kept: restoring our old
+    // bytes here would delete work this code never saw.
     if std::fs::read(path).ok().as_deref() != Some(contents) {
-        restore_previous(path, captured.as_deref());
-        return abort(format!("failed to verify {}", path.display()));
+        let kept = backup
+            .as_ref()
+            .map(|backup| backup.path.display().to_string())
+            .unwrap_or_else(|| "none".to_string());
+        return Err(format!(
+            "config recovery conflict: {}; backup kept at {kept}",
+            path.display()
+        ));
     }
     if fault != Some(Fault::BackupCleanup)
         && let Some(backup) = &backup
@@ -655,8 +671,14 @@ fn write_backup(path: &Path, previous: &[u8], next: &[u8]) -> Result<Backup, Str
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "config.toml".to_string());
-    let nanos = crate::util::epoch_millis();
-    let backup_path = path.with_file_name(format!("{name}{BAK_MARKER}{nanos}-{}", previous.len()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = crate::util::epoch_millis();
+    let counter = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The trailing length is what recovery checks the bytes against.
+    let backup_path = path.with_file_name(format!(
+        "{name}{BAK_MARKER}{stamp}-{counter}-{}",
+        previous.len()
+    ));
 
     let mut file = create_exclusive(&backup_path)?;
     file.write_all(previous)
@@ -701,6 +723,7 @@ pub fn recover_config(path: &Path) -> Result<(), String> {
     let current = std::fs::read(path).ok();
 
     let discard = || {
+        prune_backups(path, Some(&backup_path));
         let _ = std::fs::remove_file(&backup_path);
         let _ = std::fs::remove_file(&record);
     };
@@ -759,11 +782,20 @@ fn backup_length(backup: &Path) -> Option<u64> {
     length.parse().ok()
 }
 
-fn newest_backup(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_string_lossy().to_string();
+fn all_backups(path: &Path) -> Vec<PathBuf> {
+    let Some(name) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+    else {
+        return Vec::new();
+    };
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
     let prefix = format!("{name}{BAK_MARKER}");
-    let mut backups: Vec<PathBuf> = std::fs::read_dir(path.parent()?)
-        .ok()?
+    let mut backups: Vec<PathBuf> = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|entry| entry.path())
         .filter(|candidate| {
@@ -778,7 +810,23 @@ fn newest_backup(path: &Path) -> Option<PathBuf> {
         })
         .collect();
     backups.sort();
-    backups.pop()
+    backups
+}
+
+fn newest_backup(path: &Path) -> Option<PathBuf> {
+    all_backups(path).pop()
+}
+
+/// A resolved replace leaves nothing behind: an older backup can only be a
+/// leftover from an earlier crash, and its record goes with it.
+fn prune_backups(path: &Path, keep: Option<&Path>) {
+    for backup in all_backups(path) {
+        if Some(backup.as_path()) == keep {
+            continue;
+        }
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.new", backup.display())));
+    }
 }
 
 /// Create `.seavx/config.toml` when missing. Returns `(path, created)`.

@@ -134,8 +134,12 @@ fn config_file(dir: &Path) -> PathBuf {
 /// Plant the pair a crashed replace leaves behind: `.bak-<nanos>-<len>` plus the
 /// `.new` record naming the bytes that replace was writing.
 fn plant_backup(path: &Path, previous: &[u8], next: &[u8]) -> PathBuf {
+    plant_backup_at(path, 1000, previous, next)
+}
+
+fn plant_backup_at(path: &Path, stamp: u64, previous: &[u8], next: &[u8]) -> PathBuf {
     let name = path.file_name().unwrap().to_string_lossy().to_string();
-    let backup = path.with_file_name(format!("{name}.bak-1000-{}", previous.len()));
+    let backup = path.with_file_name(format!("{name}.bak-{stamp}-0-{}", previous.len()));
     fs::write(&backup, previous).unwrap();
     let record = format!("{}\t{}\n", next.len(), crate::checkpoint::fnv1a64(next));
     fs::write(PathBuf::from(format!("{}.new", backup.display())), record).unwrap();
@@ -430,5 +434,74 @@ fn config_writer_faults_leave_old_or_new() {
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains(".bak-")),
         "the backup survives a failed cleanup"
+    );
+}
+
+fn backup_names(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains(".bak-") && !name.ends_with(".new"))
+        .collect()
+}
+
+#[test]
+fn config_writer_keeps_a_concurrent_third_state_after_rename() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"old\"\n").unwrap();
+
+    let error = replace_config_with(
+        &path,
+        b"model = \"new\"\n",
+        Some(Fault::ThirdStateAfterRename),
+    )
+    .unwrap_err();
+
+    assert!(error.contains("config recovery conflict"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "third = 3\n",
+        "a write that landed after the rename is never overwritten"
+    );
+    assert_eq!(
+        backup_names(path.parent().unwrap()).len(),
+        1,
+        "the previous bytes stay available"
+    );
+}
+
+#[test]
+fn config_recovery_prunes_older_backups() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"new\"\n").unwrap();
+    let older = plant_backup_at(&path, 1000, b"model = \"older\"\n", b"model = \"new\"\n");
+    let newer = plant_backup_at(&path, 2000, b"model = \"old\"\n", b"model = \"new\"\n");
+
+    recover_config(&path).unwrap();
+
+    assert!(!newer.exists(), "the resolved backup is dropped");
+    assert!(
+        !older.exists(),
+        "an older leftover from an earlier crash is pruned too"
+    );
+}
+
+#[test]
+fn config_backup_names_do_not_collide_within_one_millisecond() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"old\"\n").unwrap();
+
+    for _ in 0..50 {
+        write_backup(&path, b"model = \"old\"\n", b"model = \"new\"\n").unwrap();
+    }
+
+    assert_eq!(
+        backup_names(path.parent().unwrap()).len(),
+        50,
+        "every write keeps its own backup, even in the same millisecond"
     );
 }
