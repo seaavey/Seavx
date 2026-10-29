@@ -52,6 +52,24 @@ or toggle with `Ctrl+Tab` (`Shift+Tab` on terminals that do not report Ctrl+Tab)
 
 ---
 
+## ⌨️ Prompt Input & History
+
+While you type, the prompt box completes from what you already wrote:
+
+- `/` opens the command menu, `@` searches the workspace. `↑`/`↓` moves the
+  selection, `Tab` or `Enter` takes it.
+- `↑`/`↓` on a single-line prompt recalls earlier prompts that start with the
+  typed prefix; going forward past the newest entry restores your draft.
+- The newest match also grows back as a dimmed tail. `Tab`, `→` or `Enter`
+  accepts it, and typing replaces it.
+- `Esc` closes the ghost suggestion, then an open menu; with nothing open it
+  exits. `Ctrl+C` twice also exits.
+
+Prompts are kept per workspace in `.seavx/svx_history` (gitignored, newest 500),
+so recall survives restarts and picks up prompts written by another session.
+
+---
+
 ## ⚙️ Configuration
 
 Configure a provider once per machine (base URL, API key, model, reasoning effort):
