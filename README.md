@@ -249,6 +249,18 @@ permitted_actions = ["execute"]   # execute, network — only these are liftable
 
 `/config` never writes `api_key`; use `seavx setup providers` to change keys. Config writes preserve comments and unknown keys and are atomic.
 
+The palette, `/help` and this table are generated from one registry in
+`src/tui/commands.rs`, so a command cannot be suggested without being
+parseable — and a test fails when this table and the registry disagree.
+
+`seavx doctor` (and `/doctor`) reports one line per check: `binary`, `config`,
+`config-recovery`, `secret`, `context`, `permissions`, `stream`, `endpoint`,
+`cache`, `workspace`, `session`, `memory`, `skills`. The storage check prints the
+session database path, its schema version, payload format and writability
+without writing to it; a pending `.bak` conflict is named instead of logged; and
+the endpoint probe is skipped with `--offline`. No check prints an API key, a URL
+query or userinfo.
+
 ---
 
 ## 🛡️ Built-in Capabilities & Security

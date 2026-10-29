@@ -536,3 +536,26 @@ fn resuming_a_read_only_session_is_refused_with_the_reason() {
     // Nothing was opened: the message names the session, the transcript stays out.
     assert!(!error.contains("User:"), "{error}");
 }
+
+#[test]
+fn the_readme_command_table_matches_the_registry() {
+    let readme = include_str!("../../../README.md");
+    let mut names: Vec<&str> = Vec::new();
+    for line in readme.lines() {
+        let Some(cell) = line.strip_prefix("| `") else {
+            continue;
+        };
+        let Some(name) = cell.split([' ', '`']).next() else {
+            continue;
+        };
+        if name.starts_with('/') && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+
+    let registered: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
+    assert_eq!(
+        names, registered,
+        "the README command table and the registry drifted; the palette is generated from the registry"
+    );
+}
