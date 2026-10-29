@@ -123,14 +123,41 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/undo` | Restore files from the newest checkpoint and remove it; repeat to walk back. |
 | `/exit` | Quit the TUI. |
 
+Permission keys, written by `/config set` and by the permission prompt itself:
+```toml
+tool_permissions = "ask"          # deny | ask | allow
+permitted_actions = ["execute"]   # execute, network — only these are liftable
+```
+
 `/config` never writes `api_key`; use `seavx setup providers` to change keys. Config writes preserve comments and unknown keys and are atomic.
 
 ---
 
 ## 🛡️ Built-in Capabilities & Security
 
-- **Safe Workspace Jail**: Canonical path verification preventing path traversal outside workspace.
-- **Credential Protection**: Hardened blacklist against sensitive patterns (`.env*`, SSH keys, `.git` metadata).
+- **Safe Workspace Jail**: Canonical path verification, plus a pre-open identity snapshot compared against the opened descriptor — a swapped symlink or an in-place edit between validation and open is refused.
+- **Credential Protection**: Names and locations are refused before a read or a write:
+  - directories: `.git`, `.ssh`, `.gnupg`, `.aws`
+  - prefixes: `.env*`, `id_rsa*`, `id_ed25519*`, `id_ecdsa*`, `.netrc*`
+  - names: `credentials`, `credentials.json`, `secrets.{json,yaml,yml,toml}`, `.npmrc`, `.pypirc`, `.htpasswd`
+  - suffixes: `.pem`, `.key`, `.p12`, `.pfx`, `.kdbx`, `.jks`, `.keystore`, `.ppk`
+  - and `config.toml` inside `.seavx`, plus the checkpoint store and session database. `.seavx/MEMORY.md`, `USER.md`, specs and the debug log stay readable.
+- **Permission Matrix**: every tool call is decided by one matrix. Writes inside the workspace are ungated because the path policy confines them and checkpoints make them reversible; anything that can leave the workspace asks.
+
+  | `tool_permissions` | read | write (in workspace) | global write | allowlisted command | other command | network | destructive |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `deny` | allow | deny | deny | allow | deny | deny | deny |
+  | `ask` (default) | allow | allow | **ask** | allow | ask | ask | deny |
+  | `allow` | allow | allow | **ask** | allow | allow | allow | deny |
+
+  - **Global writes ask in every mode**, `allow` included: memory files (`~/.seavx/MEMORY.md`, `~/.seavx/USER.md`) and skills under `~/.seavx/skills` or `~/.agents/skills`. They are checkpointed before the write, so `/undo` restores them. The shell reaches the same floor: a `cp`/`mv`/`tee`/`dd`/redirection destination inside those roots asks, and one inside the checkpoint store is refused.
+  - The **destructive floor** (`rm -rf`, `mkfs`, `dd of=/dev/…`, `shutdown`, `reboot`, fork bombs) is refused unconditionally; no key or config lifts it.
+  - `permitted_actions = ["execute", "network"]` lifts those two kinds from ask to allow in `ask` mode only. `global-write` and `destructive` are not accepted there — naming one is a config error.
+  - Answers: **once** (this call), **category** (appends to `permitted_actions`), **unrestricted** (`tool_permissions = "allow"`). Quitting while a question is pending counts as a denial; `seavx exec` always denies and says so in the tool result.
+  - Rule-of-thumb: a key command that cannot be proven read-only asks. Any `rg`/`grep` that walks a directory asks, and its output is filtered line by line afterwards (`[N lines withheld by policy]`).
+- **Redaction**: tool output, tool errors, permission prompts and log lines are masked (`api_key=…`, `Bearer …`, `sk-`/`ghp_`/`xoxb-`/`ntn_`/`AKIA…`, private-key bodies). User prompts and assistant text stay verbatim; checkpoint backups are byte-for-byte.
+- **Not prevented** (stated, not implied): deliberate shell obfuscation (`eval`, base64, `curl | sh`, a path assembled inside a script), exfiltration by an allowed command, timing channels, and any OS-level containment. This is a gate, not a sandbox; closing that gap needs `openat2(RESOLVE_BENEATH)`, namespaces or seccomp.
+- **Unix-only**: file-mode policy and hard-link refusal are enforced on Unix; on Windows the mode policy is a no-op and backup identity degrades to length plus checksum.
 - **Coding Tools**:
   - `read_file`: Line pagination (offset/limit) & truncation guards.
   - `write_file`: Safe directory creation and atomic file writing.
