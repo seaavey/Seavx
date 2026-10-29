@@ -23,6 +23,11 @@ pub const WRITABLE_KEYS: [&str; 5] = [
 pub const API_KEY_HINT: &str = "API keys are managed by `seavx setup providers`, not `/config`.";
 
 const DEFAULT_MODEL: &str = "openai/gpt-4o-mini";
+
+/// Accepted values for `tool_permissions`, most restrictive first.
+pub const PERMISSION_MODES: [&str; 3] = ["deny", "ask", "allow"];
+/// Action kinds `permitted_actions` may lift from `ask` to `allow`.
+pub const LIFTABLE_ACTIONS: [&str; 2] = ["execute", "network"];
 const DEFAULT_MAX_TURNS: i64 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +38,8 @@ pub enum ConfigKey {
     ReasoningEffort,
     MaxTurns,
     SystemPrompt,
+    ToolPermissions,
+    PermittedActions,
 }
 
 impl ConfigKey {
@@ -44,6 +51,8 @@ impl ConfigKey {
             "effort" | "reasoning_effort" => Some(Self::ReasoningEffort),
             "max_turns" => Some(Self::MaxTurns),
             "system_prompt" => Some(Self::SystemPrompt),
+            "tool_permissions" | "permissions" => Some(Self::ToolPermissions),
+            "permitted_actions" => Some(Self::PermittedActions),
             _ => None,
         }
     }
@@ -56,6 +65,8 @@ impl ConfigKey {
             Self::ReasoningEffort => "reasoning_effort",
             Self::MaxTurns => "max_turns",
             Self::SystemPrompt => "system_prompt",
+            Self::ToolPermissions => "tool_permissions",
+            Self::PermittedActions => "permitted_actions",
         }
     }
 
@@ -245,6 +256,14 @@ pub fn render_value(config: &AgentConfig, report: &ConfigReport, key: ConfigKey)
             .system_prompt
             .clone()
             .unwrap_or_else(|| "default".to_string()),
+        ConfigKey::ToolPermissions => config.tool_permissions.clone(),
+        ConfigKey::PermittedActions => {
+            if config.permitted_actions.is_empty() {
+                "none".to_string()
+            } else {
+                config.permitted_actions.join(" ")
+            }
+        }
     };
 
     format!(
@@ -273,6 +292,33 @@ fn display_path(path: &Path) -> String {
 fn canonical_value(key: ConfigKey, raw: &str) -> Result<String, String> {
     match key {
         ConfigKey::ApiKey => Err(API_KEY_HINT.to_string()),
+        ConfigKey::ToolPermissions => {
+            let value = raw.trim().to_ascii_lowercase();
+            if PERMISSION_MODES.contains(&value.as_str()) {
+                Ok(value)
+            } else {
+                Err(format!(
+                    "tool_permissions must be one of {}",
+                    PERMISSION_MODES.join(", ")
+                ))
+            }
+        }
+        ConfigKey::PermittedActions => {
+            let mut kinds: Vec<String> = Vec::new();
+            for token in raw.split([',', ' ', '\t']).filter(|part| !part.is_empty()) {
+                let kind = token.trim().to_ascii_lowercase();
+                if !LIFTABLE_ACTIONS.contains(&kind.as_str()) {
+                    return Err(format!(
+                        "permitted_actions accepts {}; `{kind}` is not liftable",
+                        LIFTABLE_ACTIONS.join(", ")
+                    ));
+                }
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+            Ok(kinds.join(" "))
+        }
         ConfigKey::Model => {
             let value = raw.trim();
             if value.is_empty() {
@@ -353,6 +399,13 @@ pub fn set_value(path: &Path, key: ConfigKey, raw: &str) -> Result<String, Strin
                 .parse()
                 .map_err(|_| "max_turns must be an integer".to_string())?;
             document[key.name()] = toml_edit::value(turns);
+        } else if key == ConfigKey::PermittedActions {
+            // A list is an array on disk, not a space-joined string.
+            let mut array = toml_edit::Array::new();
+            for kind in value.split_whitespace() {
+                array.push(kind);
+            }
+            document[key.name()] = toml_edit::value(array);
         } else {
             document[key.name()] = toml_edit::value(value.clone());
         }

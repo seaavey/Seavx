@@ -177,6 +177,8 @@ fn config_writer_preserves_comments_and_unknown_keys() {
         max_turns: 11,
         base_url: None,
         api_key: None,
+        tool_permissions: "ask".to_string(),
+        permitted_actions: Vec::new(),
         reasoning_effort: None,
         system_prompt: None,
     };
@@ -519,6 +521,8 @@ fn agent_config(model: &str) -> AgentConfig {
         api_key: None,
         reasoning_effort: Some("high".to_string()),
         system_prompt: None,
+        tool_permissions: "ask".to_string(),
+        permitted_actions: Vec::new(),
     }
 }
 
@@ -672,4 +676,73 @@ fn config_recovery_handles_backup_without_new_record() {
 
     assert_eq!(fs::read_to_string(&path).unwrap(), "model = \"old\"\n");
     assert!(!backup.exists());
+}
+
+// ---- Phase 1: permission keys ----------------------------------------------
+
+#[test]
+fn permissions_keys_default_to_ask_and_an_empty_list() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"m\"\nmax_turns = 10\n").unwrap();
+
+    let (config, report) = AgentConfig::load_with_report_home(temp.path(), None, |_| None);
+    assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
+    assert_eq!(config.tool_permissions, "ask");
+    assert!(config.permitted_actions.is_empty());
+}
+
+#[test]
+fn permissions_values_are_validated_before_write() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(&path, "model = \"m\"\nmax_turns = 10\n").unwrap();
+    let before = fs::read(&path).unwrap();
+
+    let error = set_value(&path, ConfigKey::ToolPermissions, "sometimes").unwrap_err();
+    assert!(error.contains("tool_permissions"), "{error}");
+    assert!(error.contains("deny") && error.contains("allow"), "{error}");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "a rejected value wrote bytes"
+    );
+
+    set_value(&path, ConfigKey::PermittedActions, "execute,network").unwrap();
+    let text = stash_written_config(&path);
+    assert!(
+        text.contains("permitted_actions = [\"execute\", \"network\"]"),
+        "{text}"
+    );
+
+    let error = set_value(&path, ConfigKey::PermittedActions, "global-write").unwrap_err();
+    assert!(error.contains("permitted_actions"), "{error}");
+    assert!(
+        !stash_written_config(&path).contains("global-write"),
+        "a rejected kind reached the file"
+    );
+
+    set_value(&path, ConfigKey::ToolPermissions, "allow").unwrap();
+    let (config, report) = AgentConfig::load_with_report_home(temp.path(), None, |_| None);
+    assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
+    assert_eq!(config.tool_permissions, "allow");
+    assert_eq!(config.permitted_actions, vec!["execute", "network"]);
+}
+
+#[test]
+fn permissions_keys_survive_an_unrelated_write() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(
+        &path,
+        "# keep\nmodel = \"old\"\nmax_turns = 10\ntool_permissions = \"allow\"\npermitted_actions = [\"execute\"]\n",
+    )
+    .unwrap();
+
+    set_value(&path, ConfigKey::Model, "new-model").unwrap();
+
+    let text = stash_written_config(&path);
+    assert!(text.contains("tool_permissions = \"allow\""), "{text}");
+    assert!(text.contains("permitted_actions = [\"execute\"]"), "{text}");
+    assert!(text.contains("# keep"), "{text}");
 }

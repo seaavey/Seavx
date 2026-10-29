@@ -52,13 +52,15 @@ pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
 
 /// Config keys that can appear in a config file, in display order.
-pub const CONFIG_KEYS: [&str; 6] = [
+pub const CONFIG_KEYS: [&str; 8] = [
     "model",
     "base_url",
     "api_key",
     "reasoning_effort",
     "max_turns",
     "system_prompt",
+    "tool_permissions",
+    "permitted_actions",
 ];
 
 /// Environment overrides that win over the file, paired with the key they set.
@@ -106,6 +108,17 @@ pub struct AgentConfig {
     pub api_key: Option<String>,
     pub reasoning_effort: Option<String>,
     pub system_prompt: Option<String>,
+    /// `deny` | `ask` | `allow`, kept raw so an invalid value is reported with
+    /// the file that holds it instead of being coerced to a silent default.
+    #[serde(default = "default_tool_permissions")]
+    pub tool_permissions: String,
+    /// Action kinds lifted from `ask` to `allow`; never `global-write`.
+    #[serde(default)]
+    pub permitted_actions: Vec<String>,
+}
+
+fn default_tool_permissions() -> String {
+    "ask".to_string()
 }
 
 impl Default for AgentConfig {
@@ -131,6 +144,8 @@ impl AgentConfig {
             api_key,
             reasoning_effort,
             system_prompt: None,
+            tool_permissions: default_tool_permissions(),
+            permitted_actions: Vec::new(),
         }
     }
 }
