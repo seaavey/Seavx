@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use crate::agent::security::{self, PathSnapshot, WorkspaceSecurity};
 use crate::atomic_file::{MAX_ATOMIC_BYTES, ModePolicy, StagedFile, stage};
 use crate::checkpoint::{
-    BatchState, CheckpointInput, CheckpointTarget, EntryState, append_renamed, create_batch,
-    set_state,
+    BatchState, CheckpointInput, CheckpointTarget, EntryState, append_renamed, append_written,
+    create_batch, set_state,
 };
 
 pub(crate) const MAX_BATCH_FILES: usize = 64;
@@ -43,6 +43,8 @@ pub(crate) enum BatchError {
         checkpoint: PathBuf,
         partial: bool,
         skipped: Vec<PathBuf>,
+        /// What went wrong at the commit step: a rename or the journal.
+        reason: String,
     },
 }
 
@@ -66,10 +68,11 @@ impl std::fmt::Display for BatchError {
                 checkpoint,
                 partial,
                 skipped,
+                reason,
             } => {
                 write!(
                     f,
-                    "batch commit failed at {}: {} file(s) restored",
+                    "batch commit failed at {} ({reason}): {} file(s) restored",
                     failed.display(),
                     restored.len()
                 )?;
@@ -308,13 +311,35 @@ fn run(
                 checkpoint,
                 partial,
                 skipped,
+                reason: format!("rename: {error}"),
             });
         }
 
-        let relative = relative_path(security.root(), &edit.path);
-        append_renamed(&checkpoint, &relative)
-            .map_err(|error| BatchError::Stage(format!("journal: {error}")))?;
+        // The rename already happened, so this file is now the agent's. The
+        // journal is the only record of that: a journal failure has to put the
+        // batch back and say so, never report a clean staging failure.
         written.push(edit.path.clone());
+        let relative = relative_path(security.root(), &edit.path);
+        let journal = append_renamed(&checkpoint, &relative)
+            .and_then(|()| append_written(&checkpoint, &relative, &edit.content));
+        if let Err(error) = journal {
+            tracing::warn!(%error, path = %edit.path.display(), "batch journal failed");
+            let (restored, skipped, partial) = rollback(&targets, &edits, &written);
+            let state = if partial {
+                BatchState::Partial
+            } else {
+                BatchState::RolledBack
+            };
+            let _ = set_state(&checkpoint, state);
+            return Err(BatchError::Commit {
+                failed: edit.path.clone(),
+                restored,
+                checkpoint,
+                partial,
+                skipped,
+                reason: format!("journal: {error}"),
+            });
+        }
         fire(Hook::Renamed(index));
 
         if die_after == Some(index) {
