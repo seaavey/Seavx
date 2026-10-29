@@ -469,3 +469,83 @@ fn undo_reports_the_path_that_failed_and_keeps_the_checkpoint() {
 
     fs::set_permissions(&blocked_dir, fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+// ---- Phase 2 task 4: manifest v2 ------------------------------------------
+
+#[test]
+fn batch_manifest_round_trips_state_and_journal() {
+    use crate::checkpoint::{BatchState, append_renamed, create_batch, read_manifest, set_state};
+
+    let ws = workspace_with(&[("a.txt", "one\n"), ("b.txt", "two\n")]);
+    let entries = [
+        modified_input(ws.path(), "a.txt"),
+        modified_input(ws.path(), "b.txt"),
+    ];
+    let directory = create_batch(ws.path(), &entries).unwrap();
+    assert!(
+        manifest_of(&directory).starts_with("state\tstaged\n"),
+        "{}",
+        manifest_of(&directory)
+    );
+
+    set_state(&directory, BatchState::Committing).unwrap();
+    append_renamed(&directory, Path::new("a.txt")).unwrap();
+    append_renamed(&directory, Path::new("b.txt")).unwrap();
+
+    let manifest = read_manifest(&directory, ws.path(), None).unwrap();
+    assert_eq!(manifest.state, BatchState::Committing);
+    assert_eq!(manifest.renamed, vec!["a.txt", "b.txt"]);
+    assert_eq!(manifest.entries.len(), 2);
+    assert_eq!(
+        CheckpointStore::validate_with_home(&directory, ws.path(), None)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn an_unknown_manifest_line_rejects_the_checkpoint() {
+    use crate::checkpoint::{append_renamed, create_batch, read_manifest};
+    use std::io::Write;
+
+    let ws = workspace_with(&[("a.txt", "one\n")]);
+    let entries = [modified_input(ws.path(), "a.txt")];
+    let directory = create_batch(ws.path(), &entries).unwrap();
+    append_renamed(&directory, Path::new("a.txt")).unwrap();
+
+    let mut manifest = fs::OpenOptions::new()
+        .append(true)
+        .open(directory.join(MANIFEST))
+        .unwrap();
+    writeln!(manifest, "bogus\tline").unwrap();
+    drop(manifest);
+
+    assert!(read_manifest(&directory, ws.path(), None).is_err());
+    assert!(CheckpointStore::validate_with_home(&directory, ws.path(), None).is_err());
+}
+
+#[test]
+fn a_single_tool_manifest_without_a_state_line_is_committed() {
+    use crate::checkpoint::{BatchState, read_manifest};
+
+    let ws = workspace_with(&[("a.txt", "one\n")]);
+    let directory =
+        CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "a.txt")]).unwrap();
+
+    assert!(!manifest_of(&directory).starts_with("state\t"));
+    let manifest = read_manifest(&directory, ws.path(), None).unwrap();
+    assert_eq!(manifest.state, BatchState::Committed);
+    assert!(manifest.renamed.is_empty());
+}
+
+#[test]
+fn a_journal_line_for_an_unknown_target_is_rejected() {
+    use crate::checkpoint::{append_renamed, create_batch, read_manifest};
+
+    let ws = workspace_with(&[("a.txt", "one\n")]);
+    let directory = create_batch(ws.path(), &[modified_input(ws.path(), "a.txt")]).unwrap();
+    append_renamed(&directory, Path::new("elsewhere.txt")).unwrap();
+
+    assert!(read_manifest(&directory, ws.path(), None).is_err());
+}

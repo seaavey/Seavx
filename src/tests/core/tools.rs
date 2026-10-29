@@ -428,3 +428,70 @@ async fn an_empty_old_string_and_a_noop_edit_are_handled() {
         "one line\n"
     );
 }
+
+#[tokio::test]
+async fn apply_patch_writes_multiple_files_and_creates_new_ones() {
+    let (_temp, root, security) = prepare().await;
+    std::fs::write(root.join("a.txt"), "a\nb\n").unwrap();
+    std::fs::write(root.join("b.txt"), "x\n").unwrap();
+
+    let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n\
+--- a/b.txt\n+++ b/b.txt\n@@ -1,1 +1,1 @@\n-x\n+Y\n\
+--- /dev/null\n+++ b/c.txt\n@@ -0,0 +1,1 @@\n+created\n";
+
+    let result = ToolRegistry::with_default_tools()
+        .get("apply_patch")
+        .unwrap()
+        .execute(json!({ "patch": diff }), &security)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "a\nB\n"
+    );
+    assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "Y\n");
+    assert_eq!(
+        std::fs::read_to_string(root.join("c.txt")).unwrap(),
+        "created\n"
+    );
+    assert!(result.contains("+1 -1 a.txt"), "{result}");
+    assert!(result.contains("+1 -1 b.txt"), "{result}");
+    assert_eq!(
+        std::fs::read_dir(root.join(".seavx/checkpoints"))
+            .unwrap()
+            .flatten()
+            .count(),
+        1,
+        "one checkpoint for the whole batch"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_writes_nothing_when_any_file_fails() {
+    let (_temp, root, security) = prepare().await;
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    std::fs::write(root.join("b.txt"), "x\n").unwrap();
+
+    let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-a\n+A\n\
+--- a/b.txt\n+++ b/b.txt\n@@ -1,1 +1,1 @@\n-missing\n+Z\n";
+
+    let error = ToolRegistry::with_default_tools()
+        .get("apply_patch")
+        .unwrap()
+        .execute(json!({ "patch": diff }), &security)
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("b.txt"), "{error}");
+    assert!(error.contains("@@ -1,1 +1,1 @@"), "{error}");
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "x\n");
+    assert!(
+        std::fs::read_dir(root.join(".seavx/checkpoints"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0)
+            == 0,
+        "nothing may be checkpointed or written"
+    );
+}

@@ -21,15 +21,68 @@ pub(crate) enum ModePolicy {
 }
 
 pub(crate) fn write_atomic(path: &Path, content: &[u8], policy: ModePolicy) -> std::io::Result<()> {
-    write_atomic_with_temp(path, content, policy, &unique_temp_path(path))
+    stage(path, content, policy)?.commit(path)
 }
 
-fn write_atomic_with_temp(
+/// A temp file that is written, synced and mode-correct but not renamed yet. A
+/// batch stages every target first and only then renames them, so one protocol
+/// serves single writes and batches alike.
+pub(crate) struct StagedFile {
+    temp: PathBuf,
+    created: Option<(u64, u64)>,
+    committed: bool,
+}
+
+impl StagedFile {
+    /// Rename the staged bytes into place. The error path unlinks only the temp
+    /// this operation created.
+    pub(crate) fn commit(mut self, target: &Path) -> std::io::Result<()> {
+        self.committed = true;
+        let created = self.created;
+        std::fs::rename(&self.temp, target).inspect_err(|_| remove_created(&self.temp, created))
+    }
+
+    /// Drop the staged bytes without touching the target.
+    pub(crate) fn discard(mut self) {
+        self.committed = true;
+        remove_created(&self.temp, self.created);
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            remove_created(&self.temp, self.created);
+        }
+    }
+}
+
+/// Test seam: stage at a caller-chosen temp name, then rename, so a planted file
+/// or symlink at that name can be tried. Production uses [`write_atomic`].
+#[cfg(test)]
+pub(crate) fn write_atomic_with_temp(
     path: &Path,
     content: &[u8],
     policy: ModePolicy,
     temp_path: &Path,
 ) -> std::io::Result<()> {
+    stage_with_temp(path, content, policy, temp_path)?.commit(path)
+}
+
+pub(crate) fn stage(
+    path: &Path,
+    content: &[u8],
+    policy: ModePolicy,
+) -> std::io::Result<StagedFile> {
+    stage_with_temp(path, content, policy, &unique_temp_path(path))
+}
+
+fn stage_with_temp(
+    path: &Path,
+    content: &[u8],
+    policy: ModePolicy,
+    temp_path: &Path,
+) -> std::io::Result<StagedFile> {
     let existing = std::fs::symlink_metadata(path)
         .ok()
         .filter(std::fs::Metadata::is_file);
@@ -60,7 +113,11 @@ fn write_atomic_with_temp(
 
     // shortcut: no directory fsync, so a power cut after the rename may lose
     // this write. Upgrade when a write must survive power loss.
-    std::fs::rename(temp_path, path).inspect_err(|_| remove_created(temp_path, created))
+    Ok(StagedFile {
+        temp: temp_path.to_path_buf(),
+        created,
+        committed: false,
+    })
 }
 
 /// Staging file: exclusive, same directory, `0o600` until the content is complete.

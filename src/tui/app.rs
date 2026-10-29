@@ -1070,6 +1070,14 @@ pub async fn start_tui(initial_prompt: Option<String>) -> anyhow::Result<()> {
         run_agent_worker(prompt, tx.clone(), true, AgentMode::Build, None).await;
     }
 
+    // A batch the last process never finished is reported once, loudly, and
+    // only undone when the user asks for it.
+    for batch in
+        crate::checkpoint::recover_pending(&std::path::PathBuf::from(".")).unwrap_or_default()
+    {
+        app.push_notice(batch.render());
+    }
+
     while !app.should_quit {
         // Ghost suggestions must fit inside the prompt box, so track resize.
         app.terminal_width = terminal

@@ -834,6 +834,72 @@ impl AgentTool for SkillViewTool {
     }
 }
 
+// 8b. apply_patch
+#[derive(Deserialize, JsonSchema)]
+struct ApplyPatchArgs {
+    /// A unified diff. Every hunk must match exactly; nothing is written unless
+    /// every file applies.
+    patch: String,
+}
+
+pub struct ApplyPatchTool;
+
+#[async_trait]
+impl AgentTool for ApplyPatchTool {
+    fn name(&self) -> &'static str {
+        "apply_patch"
+    }
+
+    fn description(&self) -> &'static str {
+        "Apply a unified diff to one or more files as a single all-or-nothing, undoable change"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        schema::<ApplyPatchArgs>()
+    }
+
+    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+        let parsed = parse_args::<ApplyPatchArgs>(args)?;
+        let files = crate::agent::patch::parse(&parsed.patch)
+            .map_err(|error| format!("Patch refused: {error}"))?;
+
+        // Every file applies in memory first, so a later failure writes nothing.
+        let mut edits = Vec::new();
+        let mut summary = Vec::new();
+        let mut hunks = 0usize;
+        for file in &files {
+            let requested = file.path.to_string_lossy();
+            let path = security.validate_path(&requested)?;
+            let current = match crate::agent::security::read_verified(&path).await {
+                Ok(text) => text,
+                Err(_) if file.create => String::new(),
+                Err(error) => return Err(format!("{requested}: {error}")),
+            };
+            let (updated, stats) = crate::agent::patch::apply_to(&current, file)?;
+            hunks += stats.hunks;
+            summary.push(format!(
+                "+{} -{} {}",
+                stats.added,
+                stats.removed,
+                file.path.display()
+            ));
+            edits.push(crate::agent::batch::FileEdit {
+                path,
+                content: updated.into_bytes(),
+            });
+        }
+
+        let report = crate::agent::batch::commit(security, edits)
+            .map_err(|error| format!("Patch not applied: {error}"))?;
+        Ok(format!(
+            "Applied {hunks} hunk(s) in {} file(s):\n{}\ncheckpoint: {}",
+            report.written.len(),
+            summary.join("\n"),
+            report.checkpoint.display()
+        ))
+    }
+}
+
 // 9. skill_write
 #[derive(Deserialize, JsonSchema)]
 struct SkillWriteArgs {
@@ -962,6 +1028,7 @@ impl ToolRegistry {
         registry.register(Arc::new(RunCommandTool));
         registry.register(Arc::new(SearchFilesTool));
         registry.register(Arc::new(SaveMemoryTool));
+        registry.register(Arc::new(ApplyPatchTool));
         registry.register(Arc::new(SkillViewTool));
         registry.register(Arc::new(SkillWriteTool));
         registry.register(Arc::new(SkillPatchTool));

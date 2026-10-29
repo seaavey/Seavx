@@ -326,11 +326,12 @@ mod test_cases {
     #[test]
     fn build_mode_exports_every_tool() {
         let names = tool_names(AgentMode::Build);
-        assert_eq!(names.len(), 10, "{names:?}");
+        assert_eq!(names.len(), 11, "{names:?}");
         for expected in [
             "read_file",
             "write_file",
             "edit_file",
+            "apply_patch",
             "list_directory",
             "run_command",
             "search_files",

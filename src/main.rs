@@ -142,8 +142,11 @@ async fn main() -> anyhow::Result<()> {
 
             let security = agent::security::WorkspaceSecurity::new(".");
             let config = agent::engine::AgentConfig::load(security.root());
-            let runtime = agent::engine::AgentRuntime::new(config, security);
+            for batch in crate::checkpoint::recover_pending(security.root()).unwrap_or_default() {
+                eprintln!("{}", batch.render());
+            }
 
+            let runtime = agent::engine::AgentRuntime::new(config, security);
             println!("Executing task: {task}\n");
             let result = runtime
                 .execute_task(

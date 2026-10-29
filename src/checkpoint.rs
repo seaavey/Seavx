@@ -58,8 +58,56 @@ pub(crate) struct CheckpointInput {
 #[derive(Debug)]
 pub(crate) struct RestoreEntry {
     pub target: PathBuf,
+    /// The path exactly as the manifest records it, so a `renamed` journal line
+    /// can be matched to its entry without re-resolving it.
+    pub relpath: String,
     pub state: EntryState,
     pub backup: Option<PathBuf>,
+}
+
+/// Lifecycle of one batch: written before the first rename, updated after each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchState {
+    Staged,
+    Committing,
+    Committed,
+    RolledBack,
+    Partial,
+}
+
+impl BatchState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            BatchState::Staged => "staged",
+            BatchState::Committing => "committing",
+            BatchState::Committed => "committed",
+            BatchState::RolledBack => "rolled_back",
+            BatchState::Partial => "partial",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "staged" => Some(BatchState::Staged),
+            "committing" => Some(BatchState::Committing),
+            "committed" => Some(BatchState::Committed),
+            "rolled_back" => Some(BatchState::RolledBack),
+            "partial" => Some(BatchState::Partial),
+            _ => None,
+        }
+    }
+
+    /// A live batch may still differ from its backups, so it is never pruned.
+    pub(crate) fn is_live(self) -> bool {
+        matches!(self, BatchState::Committing | BatchState::Partial)
+    }
+}
+
+/// One parsed manifest: its state, its entries and the rename journal.
+pub(crate) struct Manifest {
+    pub(crate) state: BatchState,
+    pub(crate) entries: Vec<RestoreEntry>,
+    pub(crate) renamed: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -114,8 +162,13 @@ impl CheckpointStore {
         workspace: &Path,
         entries: &[CheckpointInput],
     ) -> Result<PathBuf, CheckpointError> {
+        let incoming: u64 = entries
+            .iter()
+            .filter_map(|entry| entry.original.as_ref().map(|bytes| bytes.len() as u64))
+            .sum();
+        prune(workspace, incoming)?;
         let directory = allocate_directory(&workspace.join(".seavx/checkpoints"))?;
-        match write_checkpoint(&directory, workspace, entries) {
+        match write_checkpoint(&directory, workspace, entries, None) {
             Ok(()) => Ok(directory),
             Err(error) => {
                 // A half-written checkpoint must never be offered to undo.
@@ -164,29 +217,255 @@ impl CheckpointStore {
         workspace: &Path,
         home: Option<&Path>,
     ) -> Result<Vec<RestoreEntry>, CheckpointError> {
-        let manifest = std::fs::read_to_string(checkpoint.join(MANIFEST))
-            .map_err(|error| reject(format!("unreadable manifest: {error}")))?;
-        let allowlist = global_allowlist(home);
-
-        let mut entries = Vec::new();
-        for line in manifest.lines().filter(|line| !line.trim().is_empty()) {
-            let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() != 7 {
-                return Err(reject(format!("malformed manifest line: {line}")));
-            }
-            let state = EntryState::parse(fields[2])
-                .ok_or_else(|| reject(format!("unknown entry state: {}", fields[2])))?;
-            let target = resolve_target(fields[0], fields[6], workspace, &allowlist)?;
-            let backup = validate_backup(checkpoint, &fields, state)?;
-            entries.push(RestoreEntry {
-                target,
-                state,
-                backup,
-            });
-        }
-
-        Ok(entries)
+        Ok(read_manifest(checkpoint, workspace, home)?.entries)
     }
+}
+
+/// A batch the last process never finished: every target may differ, and the
+/// journal says which renames it happened to confirm.
+pub(crate) struct InterruptedBatch {
+    pub checkpoint: PathBuf,
+    pub entries: Vec<(PathBuf, bool)>,
+}
+
+impl InterruptedBatch {
+    /// The notice a human reads: every manifest target, confirmed or not.
+    pub(crate) fn render(&self) -> String {
+        let mut text = format!(
+            "batch interrupted: {} file(s) may differ; checkpoint {}",
+            self.entries.len(),
+            self.checkpoint.display()
+        );
+        for (path, confirmed) in &self.entries {
+            let mark = if *confirmed {
+                "confirmed"
+            } else {
+                "unconfirmed"
+            };
+            text.push_str(&format!("\n  {mark}: {}", path.display()));
+        }
+        text.push_str("\nrun /undo to restore");
+        text
+    }
+}
+
+/// Rewrite every `committing` batch to `partial` and report it. Nothing is
+/// written to a user file here: recovery is loud and undoable, never automatic.
+pub(crate) fn recover_pending(workspace: &Path) -> Result<Vec<InterruptedBatch>, CheckpointError> {
+    let home = crate::home::dir();
+    let root = workspace.join(".seavx/checkpoints");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Ok(Vec::new());
+    };
+
+    let mut directories: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    directories.sort();
+
+    let mut interrupted = Vec::new();
+    for directory in directories {
+        let Ok(manifest) = read_manifest(&directory, workspace, home.as_deref()) else {
+            continue;
+        };
+        if manifest.state != BatchState::Committing {
+            continue;
+        }
+        let _ = set_state(&directory, BatchState::Partial);
+        let entries = manifest
+            .entries
+            .iter()
+            .map(|entry| {
+                let confirmed = manifest.renamed.iter().any(|path| path == &entry.relpath);
+                (entry.target.clone(), confirmed)
+            })
+            .collect();
+        interrupted.push(InterruptedBatch {
+            checkpoint: directory,
+            entries,
+        });
+    }
+    Ok(interrupted)
+}
+
+/// Keep the newest 200 checkpoint directories and the store under 1 GB. A
+/// `committing` or `partial` directory is never evicted: it is the only copy of
+/// bytes a crash may still need.
+pub(crate) fn prune(workspace: &Path, incoming_bytes: u64) -> Result<(), CheckpointError> {
+    const MAX_DIRECTORIES: usize = 200;
+    const MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+    let root = workspace.join(".seavx/checkpoints");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Ok(());
+    };
+    let mut directories: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    // Names start with epoch milliseconds, so lexical order is age order.
+    directories.sort();
+
+    let mut kept: Vec<PathBuf> = Vec::new();
+    let mut evictable: Vec<PathBuf> = Vec::new();
+    let mut total: u64 = 0;
+    for directory in directories {
+        total += directory_size(&directory);
+        if state_of(&directory).is_some_and(BatchState::is_live) {
+            kept.push(directory);
+        } else {
+            evictable.push(directory);
+        }
+    }
+
+    let mut remaining = kept.len() + evictable.len();
+    for directory in evictable.clone() {
+        if remaining <= MAX_DIRECTORIES && total + incoming_bytes <= MAX_BYTES {
+            break;
+        }
+        let size = directory_size(&directory);
+        std::fs::remove_dir_all(&directory)
+            .map_err(|error| reject(format!("{}: {error}", directory.display())))?;
+        total = total.saturating_sub(size);
+        remaining -= 1;
+    }
+
+    if kept.len() > MAX_DIRECTORIES || total + incoming_bytes > MAX_BYTES {
+        return Err(reject(format!(
+            "checkpoint storage needs {incoming_bytes} bytes but only {} of {MAX_BYTES} are free after keeping {} live checkpoint(s)",
+            MAX_BYTES.saturating_sub(total),
+            kept.len()
+        )));
+    }
+    Ok(())
+}
+
+fn state_of(directory: &Path) -> Option<BatchState> {
+    let text = std::fs::read_to_string(directory.join(MANIFEST)).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("state\t"))
+        .and_then(BatchState::parse)
+        .or(Some(BatchState::Committed))
+}
+
+fn directory_size(directory: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| if meta.is_dir() { 0 } else { meta.len() })
+        .sum()
+}
+
+/// Allocate a checkpoint directory for a whole batch, state `staged`.
+pub(crate) fn create_batch(
+    workspace: &Path,
+    entries: &[CheckpointInput],
+) -> Result<PathBuf, CheckpointError> {
+    let incoming: u64 = entries
+        .iter()
+        .filter_map(|entry| entry.original.as_ref().map(|bytes| bytes.len() as u64))
+        .sum();
+    prune(workspace, incoming)?;
+    let directory = allocate_directory(&workspace.join(".seavx/checkpoints"))?;
+    match write_checkpoint(&directory, workspace, entries, Some(BatchState::Staged)) {
+        Ok(()) => Ok(directory),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&directory);
+            Err(error)
+        }
+    }
+}
+
+/// Rewrite the manifest's state line, keeping every entry and journal line.
+pub(crate) fn set_state(directory: &Path, state: BatchState) -> Result<(), CheckpointError> {
+    let path = directory.join(MANIFEST);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| reject(format!("unreadable manifest: {error}")))?;
+    let body: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.starts_with("state\t"))
+        .collect();
+    let mut next = format!("state\t{}\n", state.as_str());
+    for line in body {
+        next.push_str(line);
+        next.push('\n');
+    }
+    write_atomic(&path, next.as_bytes(), ModePolicy::Force(0o600))
+        .map_err(|error| reject(format!("manifest: {error}")))
+}
+
+/// Append one confirmed rename. Append-only and synced: the journal is a lower
+/// bound on what changed, never an upper one.
+pub(crate) fn append_renamed(directory: &Path, relative: &Path) -> Result<(), CheckpointError> {
+    use std::io::Write;
+    let path = directory.join(MANIFEST);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|error| reject(format!("journal: {error}")))?;
+    writeln!(file, "renamed\t{}", relative.display())
+        .map_err(|error| reject(format!("journal: {error}")))?;
+    file.sync_all()
+        .map_err(|error| reject(format!("journal: {error}")))
+}
+
+/// Parse a manifest, including its state line and journal.
+pub(crate) fn read_manifest(
+    checkpoint: &Path,
+    workspace: &Path,
+    home: Option<&Path>,
+) -> Result<Manifest, CheckpointError> {
+    let text = std::fs::read_to_string(checkpoint.join(MANIFEST))
+        .map_err(|error| reject(format!("unreadable manifest: {error}")))?;
+    let allowlist = global_allowlist(home);
+
+    let mut state = BatchState::Committed;
+    let mut entries: Vec<RestoreEntry> = Vec::new();
+    let mut renamed: Vec<String> = Vec::new();
+
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        match fields.as_slice() {
+            ["state", value] => {
+                state = BatchState::parse(value)
+                    .ok_or_else(|| reject(format!("unknown batch state: {value}")))?;
+            }
+            ["renamed", path] => renamed.push((*path).to_string()),
+            _ if fields.len() == 7 => {
+                let entry_state = EntryState::parse(fields[2])
+                    .ok_or_else(|| reject(format!("unknown entry state: {}", fields[2])))?;
+                let target = resolve_target(fields[0], fields[6], workspace, &allowlist)?;
+                let backup = validate_backup(checkpoint, &fields, entry_state)?;
+                entries.push(RestoreEntry {
+                    target,
+                    relpath: fields[0].to_string(),
+                    state: entry_state,
+                    backup,
+                });
+            }
+            _ => return Err(reject(format!("malformed manifest line: {line}"))),
+        }
+    }
+
+    for path in &renamed {
+        if !entries.iter().any(|entry| &entry.relpath == path) {
+            return Err(reject(format!(
+                "journal names a target the manifest does not record: {path}"
+            )));
+        }
+    }
+
+    Ok(Manifest {
+        state,
+        entries,
+        renamed,
+    })
 }
 
 fn restore(checkpoint: &Path, entries: Vec<RestoreEntry>) -> Result<Vec<PathBuf>, CheckpointError> {
@@ -276,8 +555,12 @@ fn write_checkpoint(
     directory: &Path,
     workspace: &Path,
     entries: &[CheckpointInput],
+    state: Option<BatchState>,
 ) -> Result<(), CheckpointError> {
     let mut lines = Vec::new();
+    if let Some(state) = state {
+        lines.push(format!("state\t{}", state.as_str()));
+    }
 
     for (index, entry) in entries.iter().enumerate() {
         let (path_field, scope) = describe_target(workspace, &entry.target)?;

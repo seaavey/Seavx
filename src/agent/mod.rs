@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod engine;
 pub mod models;
 pub mod patch;
