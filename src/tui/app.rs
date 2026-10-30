@@ -23,6 +23,7 @@ mod modal;
 mod references;
 mod store;
 mod transcript;
+mod worker;
 
 pub(crate) use input::new_input;
 use references::AtCache;
@@ -38,6 +39,11 @@ pub(in crate::tui::app) use modal::edit_query;
 #[cfg(test)]
 pub(in crate::tui::app) use modal::resolve_model_target;
 pub use modal::visible_models;
+// The worker stays reachable as `crate::tui::app::run_agent_worker` for both
+// submit paths and for callers outside the module.
+#[cfg(test)]
+use worker::DoneGuard;
+pub use worker::run_agent_worker;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
@@ -532,184 +538,11 @@ fn apply_command_effect(
     }
 }
 
-/// Ends the turn however the worker exits, panic included, so the UI never
-/// stays stuck on `thinking`.
-struct DoneGuard(mpsc::UnboundedSender<Action>);
-
-impl Drop for DoneGuard {
-    fn drop(&mut self) {
-        let _ = self.0.send(Action::AgentDone);
-    }
-}
-
 /// Geometry of the `@` reference popup. Shared so drawing and mouse clicks agree.
 pub struct AtPopupLayout {
     pub area: Rect,
     pub window_start: usize,
     pub max_visible: usize,
-}
-
-pub async fn run_agent_worker(
-    request: TurnRequest,
-    tx: mpsc::UnboundedSender<Action>,
-    is_first_turn: bool,
-    mode: AgentMode,
-    session_context: Option<String>,
-) {
-    tokio::spawn(async move {
-        let _done = DoneGuard(tx.clone());
-        let security = crate::agent::security::WorkspaceSecurity::new(".");
-        let config = crate::agent::engine::AgentConfig::load(security.root());
-        let runtime = crate::agent::engine::AgentRuntime::new(config.clone(), security);
-
-        let TurnRequest {
-            prompt,
-            session_id,
-            mut store,
-            cancel,
-        } = request;
-        let mut session_id = session_id;
-
-        // The user row and the history for this request, off the UI thread.
-        let mut history = Vec::new();
-        if let Some(handle) = store.clone() {
-            let prepared = {
-                let guard = lock_store(&handle);
-                crate::session::prepare_turn(
-                    &guard,
-                    &crate::session::workspace_key(),
-                    &config.model,
-                    session_id,
-                    &prompt,
-                )
-            };
-            match prepared {
-                Ok((id, replayed)) => {
-                    session_id = Some(id);
-                    history = replayed;
-                    let _ = tx.send(Action::SessionStarted(id));
-                }
-                Err(error) => {
-                    let _ = tx.send(Action::SessionFailed(format!(
-                        "Session history disabled: {error}"
-                    )));
-                    store = None;
-                }
-            }
-        }
-
-        // Generate quick concise title only on the first turn of the session
-        if is_first_turn {
-            let title_tx = tx.clone();
-            let title_session = session_id;
-            let title_prompt = prompt.clone();
-            let client_clone = runtime.client().clone();
-            let model_name = config.model.clone();
-            let title_options = runtime.chat_options();
-            tokio::spawn(async move {
-                let req = genai::chat::ChatRequest::from_user(format!(
-                    "Generate a very short 3-5 word concise title for this task without punctuation or quotes:\n{}",
-                    title_prompt
-                ));
-                if let Ok(res) = client_clone
-                    .exec_chat(&model_name, req, Some(&title_options))
-                    .await
-                    && let Some(text) = res.into_first_text()
-                {
-                    let clean = crate::util::unquote(text.trim()).to_string();
-                    if !clean.is_empty() {
-                        let _ = title_tx.send(Action::AgentTitle {
-                            title: clean,
-                            session: title_session,
-                        });
-                    }
-                }
-            });
-        }
-
-        let tx_clone = tx.clone();
-        let row_store = store.clone();
-        let row_tx = tx.clone();
-        // Set by the first streamed token: the answer is already on screen, so
-        // the turn must not append it a second time.
-        let streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let streamed_evt = streamed.clone();
-        let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
-        let result = runtime
-            .execute_task(
-                &task,
-                mode,
-                history,
-                &TuiConfirmer::new(tx.clone()),
-                &cancel,
-                move |evt| {
-                    if let Some(rest) = evt.strip_prefix("USAGE:") {
-                        let parts: Vec<&str> = rest.split(':').collect();
-                        if parts.len() == 2 {
-                            let total = parts[0].parse::<i32>().unwrap_or(0);
-                            let prompt = parts[1].parse::<i32>().unwrap_or(0);
-                            let _ = tx_clone.send(Action::AgentUsage {
-                                total_tokens: total,
-                                prompt_tokens: prompt,
-                            });
-                        }
-                    } else if let Some(token) = evt.strip_prefix("TOKEN:") {
-                        let first = !streamed_evt.swap(true, std::sync::atomic::Ordering::Relaxed);
-                        let frame = if first {
-                            format!("\n\n{token}")
-                        } else {
-                            token.to_string()
-                        };
-                        let _ = tx_clone.send(Action::AgentToken(frame));
-                    } else if evt.starts_with("Tool: ") {
-                        let tool_label = evt.strip_prefix("Tool: ").unwrap_or(evt);
-                        let _ = tx_clone.send(Action::AgentToolStart(tool_label.to_string()));
-                    } else if let Some(thoughts) = evt.strip_prefix("THINKING:") {
-                        let _ = tx_clone.send(Action::AgentThinking(thoughts.to_string()));
-                    } else if let Some(note) = evt.strip_prefix("System: ") {
-                        let _ = tx_clone.send(Action::AgentToken(format!("\n  {note}\n")));
-                    }
-                },
-                // The single persistence channel: every appended message, once.
-                move |message, status| {
-                    let (Some(handle), Some(id)) = (&row_store, session_id) else {
-                        return;
-                    };
-                    let guard = lock_store(handle);
-                    if let Err(error) = guard.record_message(id, message, status) {
-                        let _ = row_tx.send(Action::SessionFailed(format!(
-                            "Session history disabled: {error}"
-                        )));
-                    }
-                },
-            )
-            .await;
-
-        let _ = tx.send(Action::TurnFinished {
-            status: result.status,
-            cleanup: result.cleanup,
-            pid: result.pid,
-        });
-
-        match result.result {
-            Ok(answer) => {
-                if streamed.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = tx.send(Action::AgentToken("\n".to_string()));
-                } else {
-                    let clean_answer = answer.trim();
-                    if !clean_answer.is_empty() {
-                        let _ = tx.send(Action::AgentToken(format!("\n\n{clean_answer}\n")));
-                    }
-                }
-            }
-            // A cancelled turn already said so through its status; the error it
-            // carries is the same news, and printing both reads as a failure.
-            Err(_) if result.status == crate::agent::cancel::TurnStatus::Cancelled => {}
-            Err(e) => {
-                let _ = tx.send(Action::AgentToken(format!("\n\nError: {e}\n")));
-            }
-        }
-    });
 }
 
 pub async fn start_tui(
