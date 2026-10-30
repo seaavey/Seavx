@@ -99,7 +99,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/memory",
-        usage: "/memory [show|project|user|skills|path]",
+        usage: "/memory [show|project|user|path]",
         summary: "Inspect persistent memory",
         id: CommandId::Memory,
     },
@@ -282,9 +282,6 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             },
             ["user"] => SlashCommand::Memory {
                 view: MemoryView::User,
-            },
-            ["skills"] => SlashCommand::Memory {
-                view: MemoryView::Skills,
             },
             ["path"] => SlashCommand::Memory {
                 view: MemoryView::Path,
