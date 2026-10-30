@@ -147,6 +147,8 @@ pub struct App<'a> {
     /// 1-based number of the last submitted turn; the worker tags every stored
     /// event with the turn it belongs to.
     pub turn_id: u64,
+    /// The goal that holds this workspace, as `/status` shows it.
+    pub goal: Option<String>,
     /// One notice text when the store failed and the run continued unpersisted.
     pub persistence_error: Option<String>,
     /// Set when the loaded session cannot be appended to.
@@ -277,6 +279,7 @@ impl<'a> App<'a> {
             store: None,
             session_id: None,
             turn_id: 0,
+            goal: None,
             persistence_error: None,
             read_only: None,
         }

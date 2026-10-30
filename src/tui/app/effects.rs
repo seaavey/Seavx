@@ -25,6 +25,150 @@ pub(super) fn spawn_session_resume(app: &mut App, tx: &mpsc::UnboundedSender<Act
     });
 }
 
+/// Apply one `/goal` operation. Every refusal names what to do next; nothing
+/// here switches a goal behind the user's back.
+fn run_goal(workspace: &str, action: crate::tui::commands::GoalAction) -> Result<String, String> {
+    use crate::tui::commands::GoalAction;
+    let store = crate::session::SessionStore::open().map_err(|error| error.to_string())?;
+
+    // `id` defaults to the one goal that holds the turn, then to the newest.
+    let resolve = |id: Option<i64>| -> Result<i64, String> {
+        if let Some(id) = id {
+            return Ok(id);
+        }
+        store
+            .goals(workspace)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|goal| matches!(goal.state.as_str(), "active" | "blocked" | "paused"))
+            .map(|goal| goal.id)
+            .ok_or_else(|| "no active goal; start one with /goal <objective>".to_string())
+    };
+
+    match action {
+        GoalAction::New(objective) => {
+            let id = store
+                .create_goal(workspace, None, &objective)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "Goal {id} drafted: {objective}\nUse /goal edit to add criteria and tasks, then /goal approve."
+            ))
+        }
+        GoalAction::Edit => {
+            let goal = store
+                .goal(workspace, resolve(None)?)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "Goal {}: {}\nEdit is not interactive yet; the draft holds {} criteria and {} tasks.",
+                goal.id,
+                goal.objective,
+                goal.criteria.len(),
+                goal.tasks.len()
+            ))
+        }
+        GoalAction::Approve => {
+            let id = resolve(None)?;
+            store
+                .set_goal_state(workspace, id, crate::session::GoalState::Active)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id} approved and active."))
+        }
+        GoalAction::Show(id) => {
+            let goal = store
+                .goal(workspace, resolve(id)?)
+                .map_err(|error| error.to_string())?;
+            Ok(render_goal(&goal))
+        }
+        GoalAction::Pause(id) => {
+            let id = resolve(id)?;
+            store
+                .set_goal_state(workspace, id, crate::session::GoalState::Paused)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id} paused."))
+        }
+        GoalAction::Resume(id) => {
+            let id = resolve(id)?;
+            store
+                .set_goal_state(workspace, id, crate::session::GoalState::Active)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id} resumed."))
+        }
+        GoalAction::Cancel(id) => {
+            let id = resolve(id)?;
+            store
+                .set_goal_state(workspace, id, crate::session::GoalState::Cancelled)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id} cancelled."))
+        }
+    }
+}
+
+/// The one line `/status` shows: the goal that holds this workspace, if any.
+fn live_goal_line(workspace: &str) -> Option<String> {
+    let store = crate::session::SessionStore::open().ok()?;
+    let goals = store.goals(workspace).ok()?;
+    let goal = goals
+        .into_iter()
+        .find(|goal| matches!(goal.state.as_str(), "active" | "blocked" | "paused"))?;
+    Some(format!("{} {}", goal.id, goal.state.as_str()))
+}
+
+fn read_tasks(workspace: &str) -> Result<String, String> {
+    let store = crate::session::SessionStore::open().map_err(|error| error.to_string())?;
+    let goals = store.goals(workspace).map_err(|error| error.to_string())?;
+    let Some(goal) = goals
+        .into_iter()
+        .find(|goal| matches!(goal.state.as_str(), "active" | "blocked" | "paused"))
+    else {
+        return Ok("No active goal.".to_string());
+    };
+    if goal.tasks.is_empty() {
+        return Ok(format!("Goal {} has no tasks.", goal.id));
+    }
+    let mut out = format!("Goal {} tasks:\n", goal.id);
+    for task in &goal.tasks {
+        out.push_str(&format!(
+            "  {}. [{}] {}\n",
+            task.position + 1,
+            task.state.as_str(),
+            task.title
+        ));
+    }
+    Ok(out)
+}
+
+fn render_goal(goal: &crate::session::Goal) -> String {
+    let mut out = format!(
+        "Goal {} [{}] {}\n",
+        goal.id,
+        goal.state.as_str(),
+        goal.objective
+    );
+    for criterion in &goal.criteria {
+        out.push_str(&format!(
+            "  criterion {}: [{}] {}\n",
+            criterion.position + 1,
+            criterion.state.as_str(),
+            criterion.text
+        ));
+        if !criterion.evidence.is_empty() {
+            out.push_str(&format!("    evidence: {}\n", criterion.evidence));
+        }
+        if let Some(reason) = &criterion.waiver_reason {
+            out.push_str(&format!("    waived: {reason}\n"));
+        }
+    }
+    for task in &goal.tasks {
+        out.push_str(&format!(
+            "  task {}: [{}] {}\n",
+            task.position + 1,
+            task.state.as_str(),
+            task.title
+        ));
+    }
+    out
+}
+
 /// Apply the event-loop effects a command asked for.
 pub(super) fn apply_command_effect(
     app: &mut App,
@@ -53,6 +197,24 @@ pub(super) fn apply_command_effect(
             });
         }
         CommandEffect::RunSessions { number } => spawn_session_resume(app, tx, number),
+        CommandEffect::RunGoal { action } => {
+            let tx = tx.clone();
+            let workspace = crate::session::workspace_key();
+            tokio::task::spawn_blocking(move || {
+                let result = run_goal(&workspace, action);
+                let goal = live_goal_line(&workspace);
+                let _ = tx.send(Action::GoalDone { result, goal });
+            });
+        }
+        CommandEffect::RunTasks => {
+            let tx = tx.clone();
+            let workspace = crate::session::workspace_key();
+            tokio::task::spawn_blocking(move || {
+                let result = read_tasks(&workspace);
+                let goal = live_goal_line(&workspace);
+                let _ = tx.send(Action::GoalDone { result, goal });
+            });
+        }
         CommandEffect::RunReview { target } => {
             // Git work never runs on the event loop; the resolved input comes
             // back as an action, and only then is a turn submitted.

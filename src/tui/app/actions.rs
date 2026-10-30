@@ -66,6 +66,13 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             app.persistence_error = Some(message.clone());
             app.push_notice(message);
         }
+        Action::GoalDone { result, goal } => {
+            app.goal = goal;
+            match result {
+                Ok(text) => app.push_notice(text),
+                Err(error) => app.push_notice(error),
+            }
+        }
         Action::ReviewResolved(result) => {
             app.status = AgentState::Idle;
             match result {

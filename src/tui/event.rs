@@ -8,6 +8,12 @@ pub enum Action {
     Key(KeyEvent),
     Mouse(MouseEvent),
     AgentToken(String),
+    /// One `/goal` or `/tasks` operation finished: its report, and the goal
+    /// line `/status` should show from now on.
+    GoalDone {
+        result: Result<String, String>,
+        goal: Option<String>,
+    },
     /// `/review` finished resolving a Git target off the UI thread.
     ReviewResolved(Result<crate::agent::git_review::ReviewInput, String>),
     AgentThinking(String),

@@ -12,6 +12,18 @@ use crate::cli::skills;
 use crate::tui::app::App;
 use crate::tui::event::AgentState;
 
+/// What `/goal` was asked to do. `id` defaults to the workspace's live goal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalAction {
+    New(String),
+    Edit,
+    Approve,
+    Show(Option<i64>),
+    Pause(Option<i64>),
+    Resume(Option<i64>),
+    Cancel(Option<i64>),
+}
+
 /// One command's identity, independent of how it is spelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandId {
@@ -31,6 +43,8 @@ pub enum CommandId {
     Undo,
     Sessions,
     Resume,
+    Goal,
+    Tasks,
     Status,
     Exit,
 }
@@ -143,6 +157,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         id: CommandId::Resume,
     },
     CommandSpec {
+        name: "/goal",
+        usage: "/goal <objective> | edit | approve | show | pause | resume | cancel [id]",
+        summary: "Draft, approve and track a durable goal",
+        id: CommandId::Goal,
+    },
+    CommandSpec {
+        name: "/tasks",
+        usage: "/tasks",
+        summary: "Show the current goal's ordered tasks",
+        id: CommandId::Tasks,
+    },
+    CommandSpec {
         name: "/status",
         usage: "/status",
         summary: "Show what the agent is doing right now",
@@ -183,6 +209,12 @@ pub enum SlashCommand {
     Review {
         target: crate::agent::git_review::ReviewTarget,
     },
+    /// Create, edit, approve, inspect or move a goal.
+    Goal {
+        action: crate::tui::commands::GoalAction,
+    },
+    /// Inspect the current goal's tasks.
+    Tasks,
     Help,
     Exit,
     Init,
@@ -256,6 +288,12 @@ pub enum CommandEffect {
     RunReview {
         target: crate::agent::git_review::ReviewTarget,
     },
+    /// One goal operation, run against the store off the UI thread.
+    RunGoal {
+        action: GoalAction,
+    },
+    /// Read the current goal's tasks.
+    RunTasks,
     OpenSessionPicker,
 }
 
@@ -315,6 +353,40 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         },
         // The whole remainder is the question. A bare `/ask` still parses: it
         // answers with its usage instead of reading as a typo.
+        CommandId::Tasks => no_args(&args, trimmed, SlashCommand::Tasks),
+        CommandId::Goal => match args.as_slice() {
+            // A bare `/goal` shows the current one, so the registry stays
+            // parseable without arguments like every other command.
+            [] => SlashCommand::Goal {
+                action: GoalAction::Show(None),
+            },
+            ["edit"] => SlashCommand::Goal {
+                action: GoalAction::Edit,
+            },
+            ["approve"] => SlashCommand::Goal {
+                action: GoalAction::Approve,
+            },
+            [verb @ ("show" | "pause" | "resume" | "cancel"), rest @ ..] => {
+                let id = match rest {
+                    [] => None,
+                    [number] => match number.parse::<i64>() {
+                        Ok(id) if id > 0 => Some(id),
+                        _ => return Some(SlashCommand::Unknown(trimmed.to_string())),
+                    },
+                    _ => return Some(SlashCommand::Unknown(trimmed.to_string())),
+                };
+                let action = match *verb {
+                    "show" => GoalAction::Show(id),
+                    "pause" => GoalAction::Pause(id),
+                    "resume" => GoalAction::Resume(id),
+                    _ => GoalAction::Cancel(id),
+                };
+                SlashCommand::Goal { action }
+            }
+            objective => SlashCommand::Goal {
+                action: GoalAction::New(objective.join(" ")),
+            },
+        },
         CommandId::Ask => SlashCommand::Ask {
             question: args.join(" "),
         },
@@ -473,6 +545,9 @@ pub fn status_text(app: &App) -> String {
         (None, _) => "none".to_string(),
     };
     lines.push(format!("session: {session}"));
+    if let Some(goal) = &app.goal {
+        lines.push(format!("goal: {goal}"));
+    }
     if let Some(error) = &app.persistence_error {
         lines.push(format!("persistence: degraded ({error})"));
     }
@@ -569,6 +644,8 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },
         SlashCommand::Undo => CommandEffect::RunUndo,
         SlashCommand::Review { target } => CommandEffect::RunReview { target },
+        SlashCommand::Goal { action } => CommandEffect::RunGoal { action },
+        SlashCommand::Tasks => CommandEffect::RunTasks,
         SlashCommand::Ask { question } => {
             if question.trim().is_empty() {
                 app.push_notice("Usage: /ask <question>".to_string());

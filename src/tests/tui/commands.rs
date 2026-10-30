@@ -89,6 +89,13 @@ fn every_registry_entry_parses_to_a_handled_command() {
                 target: crate::agent::git_review::ReviewTarget::WorkingTree,
             },
         ),
+        (
+            "/goal",
+            SlashCommand::Goal {
+                action: GoalAction::Show(None),
+            },
+        ),
+        ("/tasks", SlashCommand::Tasks),
         ("/clear", SlashCommand::Clear),
         ("/new", SlashCommand::Clear),
         ("/help", SlashCommand::Help),
@@ -148,6 +155,8 @@ fn every_handled_command_appears_in_the_registry() {
         "/plan",
         "/ask",
         "/review",
+        "/goal",
+        "/tasks",
         "/clear",
         "/new",
         "/help",
@@ -247,6 +256,8 @@ fn the_palette_is_the_table() {
             "/undo",
             "/sessions",
             "/resume",
+            "/goal",
+            "/tasks",
             "/status",
             "/exit"
         ]
@@ -904,4 +915,69 @@ fn review_asks_for_a_resolution_without_touching_the_standing_mode() {
         }
     );
     assert_eq!(app.mode, crate::agent::engine::AgentMode::Build);
+}
+
+#[test]
+fn goal_parses_every_documented_form() {
+    assert_eq!(
+        parse("/goal ship the release"),
+        Some(SlashCommand::Goal {
+            action: GoalAction::New("ship the release".to_string())
+        })
+    );
+    for (input, action) in [
+        ("/goal", GoalAction::Show(None)),
+        ("/goal show", GoalAction::Show(None)),
+        ("/goal show 3", GoalAction::Show(Some(3))),
+        ("/goal edit", GoalAction::Edit),
+        ("/goal approve", GoalAction::Approve),
+        ("/goal pause", GoalAction::Pause(None)),
+        ("/goal resume 2", GoalAction::Resume(Some(2))),
+        ("/goal cancel", GoalAction::Cancel(None)),
+    ] {
+        assert_eq!(parse(input), Some(SlashCommand::Goal { action }), "{input}");
+    }
+    for bad in ["/goal show zero", "/goal pause 1 2"] {
+        assert!(
+            matches!(parse(bad), Some(SlashCommand::Unknown(_))),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn goal_and_tasks_dispatch_without_touching_any_state() {
+    let mut app = crate::tui::app::test_app();
+    assert_eq!(
+        execute(&mut app, SlashCommand::Tasks),
+        CommandEffect::RunTasks
+    );
+    assert_eq!(
+        execute(
+            &mut app,
+            SlashCommand::Goal {
+                action: GoalAction::Approve
+            }
+        ),
+        CommandEffect::RunGoal {
+            action: GoalAction::Approve
+        }
+    );
+    assert_eq!(app.mode, crate::agent::engine::AgentMode::Build);
+}
+
+#[test]
+fn status_shows_the_goal_line_only_when_one_is_held() {
+    let mut app = crate::tui::app::test_app();
+    assert!(
+        !status_text(&app).contains("goal:"),
+        "{}",
+        status_text(&app)
+    );
+    app.goal = Some("7 active".to_string());
+    assert!(
+        status_text(&app).contains("goal: 7 active"),
+        "{}",
+        status_text(&app)
+    );
 }
