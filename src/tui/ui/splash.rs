@@ -1,11 +1,11 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
     text::Line,
     widgets::Paragraph,
 };
 
+use super::theme;
 use crate::tui::app::App;
 
 /// Splash art for an empty session; 44 columns so it fits standard terminals.
@@ -19,7 +19,7 @@ pub(crate) const SPLASH: [&str; 5] = [
 
 /// Centered SEAVX splash, degrading to a single centered word on narrow panes.
 pub(super) fn render(_app: &App, area: Rect, frame: &mut Frame) {
-    let style = Style::default().fg(Color::DarkGray);
+    let style = theme::dim();
     let art_width = SPLASH[0].chars().count() as u16;
     if area.width < art_width || area.height < SPLASH.len() as u16 {
         frame.render_widget(

@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use super::splash;
+use super::theme;
 use crate::tui::app::{App, Segment};
 use crate::tui::markdown;
 
@@ -65,12 +66,7 @@ fn build_transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled("○", Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        " thinking",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
+                    Span::styled(" thinking", theme::dim().add_modifier(Modifier::ITALIC)),
                 ]));
                 // Four columns, not six bytes: `│` is three bytes wide.
                 let prefix = "  │ ";
@@ -92,7 +88,7 @@ fn build_transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                         } else {
                             lines.push(Line::from(Span::styled(
                                 format!("{prefix}{current}"),
-                                Style::default().fg(Color::DarkGray),
+                                theme::dim(),
                             )));
                             current.clear();
                             current.push_str(word);
@@ -102,7 +98,7 @@ fn build_transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     if !current.is_empty() || raw_line.trim().is_empty() {
                         lines.push(Line::from(Span::styled(
                             format!("{prefix}{current}"),
-                            Style::default().fg(Color::DarkGray),
+                            theme::dim(),
                         )));
                     }
                 }

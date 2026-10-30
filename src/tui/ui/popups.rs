@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem},
 };
 
+use super::theme;
 use crate::tui::app::App;
 
 pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
@@ -37,7 +38,7 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
                 let line = Line::from(vec![
                     Span::styled(format!("{prefix}{cmd:<12}"), cmd_style),
                     Span::raw(" "),
-                    Span::styled(*desc, Style::default().fg(Color::DarkGray)),
+                    Span::styled(*desc, theme::dim()),
                 ]);
                 ListItem::new(line)
             })
@@ -45,7 +46,7 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
 
         let menu_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(theme::dim());
 
         frame.render_widget(List::new(items).block(menu_block), menu_area);
     }
@@ -106,7 +107,7 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
         let menu_block = Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(theme::dim());
 
         frame.render_widget(List::new(items).block(menu_block), menu_area);
     }

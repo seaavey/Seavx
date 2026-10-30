@@ -18,7 +18,7 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )
         };
-        let hint = |text: &'static str| Span::styled(text, Style::default().fg(Color::DarkGray));
+        let hint = |text: &'static str| Span::styled(text, theme::dim());
 
         let body = vec![
             Line::from(vec![
