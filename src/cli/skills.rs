@@ -207,6 +207,44 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove the winning copy of a skill.
+///
+/// A symlinked skill directory is refused: the shared roots are full of links on
+/// some machines, and `remove_dir_all` would delete the target, not the link.
+pub fn remove(workspace: &Path, name: &str) -> Result<PathBuf, String> {
+    remove_with_home(workspace, crate::home::dir().as_deref(), name)
+}
+
+/// Testable core: `home` is injected so tests never read the real one.
+pub fn remove_with_home(
+    workspace: &Path,
+    home: Option<&Path>,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let path = SkillManager::with_home(workspace, home)
+        .list_skills()
+        .into_iter()
+        .find(|skill| skill.name == name)
+        .map(|skill| skill.path)
+        .ok_or_else(|| format!("No skill named {name}."))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{} has no directory.", path.display()))?
+        .to_path_buf();
+
+    let kind = std::fs::symlink_metadata(&dir)
+        .map_err(|error| format!("Cannot inspect {}: {error}", dir.display()))?;
+    if kind.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symlink; remove it where it points instead.",
+            dir.display()
+        ));
+    }
+    std::fs::remove_dir_all(&dir)
+        .map_err(|error| format!("Cannot remove {}: {error}", dir.display()))?;
+    Ok(dir)
+}
+
 #[cfg(test)]
 #[path = "../tests/cli/skills.rs"]
 mod tests;

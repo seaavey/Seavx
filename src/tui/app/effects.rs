@@ -91,6 +91,15 @@ pub(super) fn apply_command_effect(
                 let _ = tx.send(Action::SkillsInstalled(result));
             });
         }
+        CommandEffect::SkillsRemove { name } => {
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            let root = app.root.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = crate::cli::skills::remove(&root, &name);
+                let _ = tx.send(Action::SkillsRemoved(result));
+            });
+        }
         CommandEffect::RunCompact { instructions } => {
             let transcript = crate::tui::compact::transcript_from_segments(&app.segments);
             if crate::tui::compact::is_too_short(&transcript) {

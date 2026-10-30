@@ -195,6 +195,7 @@ pub enum SkillsAction {
 pub enum CommandEffect {
     Handled,
     SkillsAdd { dir: std::path::PathBuf },
+    SkillsRemove { name: String },
     Quit,
     OpenModelPicker,
     RunDoctor { offline: bool },
@@ -445,11 +446,16 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
                 }
                 // The copy runs off the UI thread; the notice comes back as an action.
                 SkillsAction::Add(dir) => CommandEffect::SkillsAdd { dir },
-                SkillsAction::Remove { name, confirmed } => {
-                    app.push_notice(format!(
-                        "Removing {name} is not available yet{}.",
-                        if confirmed { "" } else { "; --yes is required" }
-                    ));
+                // The grammar already refuses a removal without `--yes`.
+                SkillsAction::Remove {
+                    name,
+                    confirmed: true,
+                } => CommandEffect::SkillsRemove { name },
+                SkillsAction::Remove {
+                    name,
+                    confirmed: false,
+                } => {
+                    app.push_notice(format!("Removing {name}: --yes is required."));
                     CommandEffect::Handled
                 }
             }

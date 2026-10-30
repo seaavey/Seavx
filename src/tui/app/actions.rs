@@ -122,6 +122,13 @@ pub(super) fn apply(app: &mut App, action: Action, _tx: &mpsc::UnboundedSender<A
                 Err(error) => app.push_notice(format!("Install failed: {error}")),
             }
         }
+        Action::SkillsRemoved(result) => {
+            app.status = AgentState::Idle;
+            match result {
+                Ok(path) => app.push_notice(format!("Removed skill at {}", path.display())),
+                Err(error) => app.push_notice(format!("Remove failed: {error}")),
+            }
+        }
         Action::CompactDone { result } => {
             app.status = AgentState::Idle;
             match result {

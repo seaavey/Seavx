@@ -239,3 +239,45 @@ fn install_refuses_a_source_that_contains_a_symlink() {
         "a refused install leaves nothing behind"
     );
 }
+
+#[test]
+fn remove_deletes_the_winning_copy_only() {
+    let (_temp, workspace, home) = fixture();
+    write_skill(&workspace.join(".seavx/skills"), "demo", "Mine.");
+    write_skill(&home.join(".agents/skills"), "demo", "The shadowed copy.");
+
+    let removed = remove_with_home(&workspace, Some(&home), "demo").unwrap();
+
+    assert_eq!(removed, workspace.join(".seavx/skills/demo"));
+    assert!(!removed.exists(), "the workspace copy is gone");
+    assert!(
+        home.join(".agents/skills/demo/SKILL.md").exists(),
+        "the shadowed copy is untouched"
+    );
+}
+
+#[test]
+fn remove_refuses_a_symlinked_skill_directory() {
+    let (_temp, workspace, home) = fixture();
+    let real = workspace.join("elsewhere/real-skill");
+    write_skill(&workspace.join("elsewhere"), "real-skill", "The real one.");
+    let link = home.join(".agents/skills/real-skill");
+    std::fs::create_dir_all(home.join(".agents/skills")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    #[cfg(unix)]
+    {
+        let error = remove_with_home(&workspace, Some(&home), "real-skill").unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(real.join("SKILL.md").exists(), "the target survives");
+        assert!(link.symlink_metadata().is_ok(), "the link survives too");
+    }
+}
+
+#[test]
+fn remove_of_an_unknown_name_is_an_error() {
+    let (_temp, workspace, home) = fixture();
+    let error = remove_with_home(&workspace, Some(&home), "nope").unwrap_err();
+    assert!(error.contains("No skill named nope"), "{error}");
+}
