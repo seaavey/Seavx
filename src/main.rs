@@ -143,6 +143,9 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     let args = Cli::parse();
+    if args.debug {
+        util::set_debug_flag();
+    }
     // Only the agent commands own a workspace log; a diagnostic or an update
     // must not create `.seavx` in whatever directory it was started from.
     let writes_log = matches!(
@@ -151,6 +154,15 @@ async fn main() -> anyhow::Result<()> {
             | Some(Commands::Exec { .. })
             | Some(Commands::Resume { .. })
     );
+    // A TUI run owns its workspace, so it records the debug state it resolved
+    // in `.env` for the next run. `exec` keeps its promise and writes nothing.
+    let owns_workspace = matches!(
+        &args.command,
+        None | Some(Commands::Run { .. }) | Some(Commands::Resume { .. })
+    );
+    if owns_workspace {
+        let _ = util::persist_debug_flag(std::path::Path::new("."), util::is_debug());
+    }
     init_tracing(args.debug, writes_log)?;
 
     match args.command {

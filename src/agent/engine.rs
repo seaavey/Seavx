@@ -868,6 +868,7 @@ impl AgentRuntime {
             // First attempt: a stream when the config allows it, one plain
             // request otherwise. Both share the turn's single retry.
             let mut got_delta = false;
+            let mut streamed_thinking = false;
             let mut received = String::new();
             let attempt = async {
                 if self.config.stream {
@@ -880,6 +881,7 @@ impl AgentRuntime {
                                 event_sink(&format!("TOKEN:{token}"));
                             }
                             StreamDelta::Thinking(thoughts) => {
+                                streamed_thinking = true;
                                 event_sink(&format!("THINKING:{thoughts}"));
                             }
                         }
@@ -963,8 +965,10 @@ impl AgentRuntime {
                 event_sink(&format!("USAGE:{total}:{prompt}"));
             }
 
-            // Surface the model's reasoning so the TUI can render it as a gray block
-            if let Some(ref thoughts) = response.reasoning_content {
+            // Surface the model's reasoning so the TUI can render it as a gray
+            // block. The captured text repeats what the deltas already sent, so
+            // a streamed turn is skipped: re-sending it drew the block twice.
+            if !streamed_thinking && let Some(ref thoughts) = response.reasoning_content {
                 let trimmed = thoughts.trim();
                 if !trimmed.is_empty() {
                     event_sink(&format!("THINKING:{trimmed}"));

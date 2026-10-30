@@ -38,11 +38,18 @@ struct FakeInner {
     streams: Mutex<VecDeque<StreamScript>>,
     sends: Mutex<VecDeque<Result<String, String>>>,
     calls: Mutex<Vec<&'static str>>,
+    reasoning: Mutex<Option<String>>,
 }
 
 impl FakeBackend {
     fn stream_then(&self, script: StreamScript) {
         self.inner.streams.lock().unwrap().push_back(script);
+    }
+
+    /// Reasoning the provider hands back whole once the stream ends, on top of
+    /// whatever the deltas already carried.
+    fn reasoning_on_end(&self, text: &str) {
+        *self.inner.reasoning.lock().unwrap() = Some(text.to_string());
     }
 
     fn answer(&self, text: &str) {
@@ -110,7 +117,10 @@ impl ChatBackend for FakeBackend {
                 Err(message) => return Err(std::io::Error::other(message).into()),
             }
         }
-        Ok(response(&text))
+        Ok(ChatResponse {
+            reasoning_content: self.inner.reasoning.lock().unwrap().clone(),
+            ..response(&text)
+        })
     }
 }
 
@@ -125,6 +135,10 @@ fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path, stream: bool
 
 fn token(text: &str) -> Result<StreamDelta, String> {
     Ok(StreamDelta::Token(text.to_string()))
+}
+
+fn thinking(text: &str) -> Result<StreamDelta, String> {
+    Ok(StreamDelta::Thinking(text.to_string()))
 }
 
 #[tokio::test]
@@ -186,6 +200,42 @@ async fn a_stream_that_fails_after_one_chunk_is_not_retried() {
     let (partial, status) = reported.last().expect("a partial row is reported");
     assert_eq!(*status, MessageStatus::Partial);
     assert_eq!(partial.content.texts().join(""), "half an ans");
+}
+
+#[tokio::test]
+async fn streamed_reasoning_is_not_repeated_by_the_captured_copy() {
+    let workspace = tempfile::tempdir().unwrap();
+    let fake = FakeBackend::default();
+    // The provider replays the whole reasoning once the stream ends.
+    fake.reasoning_on_end("weighing it");
+    fake.stream_then(vec![thinking("weighing "), thinking("it"), token("hi")]);
+    let runtime = runtime_with(&fake, workspace.path(), true);
+
+    let mut events = Vec::new();
+    let answer = runtime
+        .execute_task(
+            "do it",
+            AgentMode::Build,
+            Vec::new(),
+            &DenyingConfirmer,
+            &crate::agent::cancel::CancelToken::new(),
+            |event| events.push(event.to_string()),
+            |_, _| {},
+        )
+        .await
+        .result
+        .unwrap();
+
+    assert_eq!(answer, "hi");
+    let thinking_events: Vec<&String> = events
+        .iter()
+        .filter(|event| event.starts_with("THINKING:"))
+        .collect();
+    assert_eq!(
+        thinking_events,
+        ["THINKING:weighing ", "THINKING:it"],
+        "the deltas are the reasoning; the captured copy would draw it twice: {events:?}"
+    );
 }
 
 #[tokio::test]

@@ -29,6 +29,16 @@ fn options(temp: &std::path::Path) -> DoctorOptions {
     }
 }
 
+/// The store lives at `home/.seavx/sessions.db` unless debug mode is on. These
+/// tests are about the store checks, not about debug mode, so they point `home`
+/// at the workspace and keep the path deterministic either way.
+fn options_with_home(workspace: &std::path::Path) -> DoctorOptions {
+    DoctorOptions {
+        home: Some(workspace.to_path_buf()),
+        ..options(workspace)
+    }
+}
+
 #[tokio::test]
 async fn offline_skips_the_endpoint_probe() {
     let temp = tempdir().unwrap();
@@ -230,7 +240,7 @@ async fn doctor_reports_storage_permissions_and_streaming_without_secrets() {
     )
     .unwrap();
 
-    // A session database next to the config, as debug mode keeps it.
+    // A session database next to the config, at the path `home` resolves to.
     let store =
         crate::session::SessionStore::open_at(&workspace.join(".seavx/sessions.db")).unwrap();
     crate::session::prepare_turn(&store, "ws", "m", None, "hello").unwrap();
@@ -240,7 +250,7 @@ async fn doctor_reports_storage_permissions_and_streaming_without_secrets() {
         calls: AtomicUsize::new(0),
         result: ProbeResult::Ok { models: 1 },
     };
-    let report = run_with_probe(options(&workspace), &probe).await;
+    let report = run_with_probe(options_with_home(&workspace), &probe).await;
 
     let session = check(&report, "session");
     assert_eq!(session.status, CheckStatus::Ok, "{}", session.detail);
@@ -366,7 +376,7 @@ async fn doctor_warns_when_the_schema_is_not_the_one_this_build_reads() {
         calls: AtomicUsize::new(0),
         result: ProbeResult::Ok { models: 1 },
     };
-    let report = run_with_probe(options(&workspace), &probe).await;
+    let report = run_with_probe(options_with_home(&workspace), &probe).await;
     let session = check(&report, "session");
 
     assert_eq!(session.status, CheckStatus::Warn, "{}", session.detail);
@@ -390,7 +400,7 @@ async fn doctor_does_not_create_the_session_store_it_inspects() {
         calls: AtomicUsize::new(0),
         result: ProbeResult::Ok { models: 1 },
     };
-    let report = run_with_probe(options(&workspace), &probe).await;
+    let report = run_with_probe(options_with_home(&workspace), &probe).await;
     let session = check(&report, "session");
 
     assert!(
