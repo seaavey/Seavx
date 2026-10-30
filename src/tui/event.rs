@@ -61,6 +61,14 @@ pub enum Action {
     SessionResume(Result<crate::session::LoadedSession, String>),
     /// A tool call needs an answer. The worker blocks on `reply`; dropping it
     /// (quit, panic) resolves as a denial.
+    /// A clarification, already persisted; the reply resolves it once.
+    QuestionAsked {
+        id: i64,
+        question: String,
+        kind: crate::session::QuestionKind,
+        options: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<(crate::session::QuestionState, String)>,
+    },
     PermissionAsk {
         request: crate::agent::permissions::PermissionRequest,
         reply: tokio::sync::oneshot::Sender<crate::agent::permissions::Answer>,

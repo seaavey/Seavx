@@ -137,6 +137,8 @@ pub struct App<'a> {
     pub last_ctrl_c: Option<std::time::Instant>,
     /// The question the worker is blocked on, until the user answers it.
     pub pending_permission: Option<PendingPermission>,
+    /// A clarification on screen; it owns the next key like a permission does.
+    pub pending_question: Option<PendingQuestion>,
     /// The checkout the skill picker copied from; held so a candidate's source
     /// outlives the pick, and dropped when the picker is cancelled.
     pub pending_skills: Option<crate::cli::skills::Fetched>,
@@ -181,6 +183,132 @@ pub enum EnterAction {
 pub struct PendingPermission {
     pub request: crate::agent::permissions::PermissionRequest,
     pub reply: tokio::sync::oneshot::Sender<crate::agent::permissions::Answer>,
+}
+
+/// A clarification on screen. `reply` is `None` when the question was restored
+/// from the store: no turn is waiting on it.
+pub struct PendingQuestion {
+    pub id: i64,
+    pub question: String,
+    pub kind: crate::session::QuestionKind,
+    pub options: Vec<String>,
+    pub selected: usize,
+    pub chosen: std::collections::BTreeSet<usize>,
+    pub text: String,
+    pub reply: Option<tokio::sync::oneshot::Sender<(crate::session::QuestionState, String)>>,
+}
+
+impl PendingQuestion {
+    /// The answer this view currently stands for.
+    pub fn outcome(&self) -> (crate::session::QuestionState, String) {
+        use crate::session::{QuestionKind, QuestionState};
+        match self.kind {
+            QuestionKind::Text => (QuestionState::Answered, self.text.clone()),
+            QuestionKind::Single => match self.options.get(self.selected) {
+                Some(option) => (QuestionState::Answered, option.clone()),
+                None => (QuestionState::Skipped, String::new()),
+            },
+            QuestionKind::Multi => {
+                let picked: Vec<String> = self
+                    .chosen
+                    .iter()
+                    .filter_map(|index| self.options.get(*index).cloned())
+                    .collect();
+                if picked.is_empty() {
+                    (QuestionState::Skipped, String::new())
+                } else {
+                    (QuestionState::Answered, picked.join(", "))
+                }
+            }
+        }
+    }
+}
+
+/// Asks the human through the event loop; the worker waits on the oneshot.
+pub struct TuiQuestioner {
+    tx: mpsc::UnboundedSender<Action>,
+    store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
+    session: Option<i64>,
+    turn: u64,
+}
+
+impl TuiQuestioner {
+    pub fn new(
+        tx: mpsc::UnboundedSender<Action>,
+        store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
+        session: Option<i64>,
+        turn: u64,
+    ) -> Self {
+        Self {
+            tx,
+            store,
+            session,
+            turn,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::agent::questions::Questioner for TuiQuestioner {
+    async fn ask(
+        &self,
+        request: crate::agent::questions::QuestionRequest,
+    ) -> crate::agent::questions::QuestionAnswer {
+        use crate::agent::questions::QuestionAnswer;
+        use crate::session::QuestionState;
+
+        // Persist before anyone sees it: a crash after this point leaves a
+        // question the next start can restore.
+        let Some(store) = self.store.as_ref() else {
+            return QuestionAnswer::Unavailable;
+        };
+        let created = {
+            let guard = store::lock_store(store);
+            guard.ask_question(
+                &crate::session::workspace_key(),
+                self.session,
+                self.turn,
+                &request.call_id,
+                &request.question,
+                request.kind,
+                &request.options,
+            )
+        };
+        let Ok(id) = created else {
+            // Nothing durable was written, so showing it would create a question
+            // the next start cannot restore.
+            return QuestionAnswer::Unavailable;
+        };
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let sent = self.tx.send(Action::QuestionAsked {
+            id,
+            question: request.question.clone(),
+            kind: request.kind,
+            options: request.options.clone(),
+            reply,
+        });
+        if sent.is_err() {
+            return QuestionAnswer::Unavailable;
+        }
+
+        let (state, text) = match answer.await {
+            Ok(outcome) => outcome,
+            // The UI went away with the question on screen: cancel, do not guess.
+            Err(_) => (QuestionState::Cancelled, String::new()),
+        };
+        {
+            let guard = store::lock_store(store);
+            let _ = guard.resolve_question(&crate::session::workspace_key(), id, state, &text);
+        }
+
+        match state {
+            QuestionState::Answered => QuestionAnswer::Answered(text),
+            QuestionState::Skipped => QuestionAnswer::Skipped,
+            QuestionState::Cancelled => QuestionAnswer::Cancelled,
+            QuestionState::Pending => QuestionAnswer::Unavailable,
+        }
+    }
 }
 
 /// Answers asks through the event loop: the UI thread renders the question, the
@@ -275,6 +403,7 @@ impl<'a> App<'a> {
             toast: None,
             last_ctrl_c: None,
             pending_permission: None,
+            pending_question: None,
             pending_skills: None,
             store: None,
             session_id: None,

@@ -1,8 +1,8 @@
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
 use super::store::lock_store;
-use super::{App, TuiConfirmer, TurnRequest};
+use super::{App, PendingQuestion, TuiConfirmer, TurnRequest};
 use crate::agent::engine::AgentMode;
 use crate::agent::events::AgentEvent;
 use crate::tui::event::{Action, AgentState};
@@ -60,6 +60,117 @@ impl App<'_> {
         let pending = self.pending_permission.take()?;
         let _ = pending.reply.send(answer);
         Some(answer)
+    }
+
+    /// Feed one key to the clarification on screen. Returns the notice to show,
+    /// or `None` when the key did nothing (the question stays up).
+    pub(crate) fn answer_question(&mut self, key: &KeyEvent) -> Option<String> {
+        use crate::session::{QuestionKind, QuestionState};
+        use KeyCode::*;
+
+        let mut pending = self.pending_question.take()?;
+        let submit = |app: &mut App<'_>, pending: PendingQuestion, state, text: String| {
+            if let Some(reply) = pending.reply {
+                let _ = reply.send((state, text.clone()));
+            } else {
+                // Restored from the store: no turn is waiting, so the answer is
+                // written down and appended as the one result for that call.
+                app.resolve_restored_question(pending.id, state, &text);
+            }
+            app.revision += 1;
+            match state {
+                QuestionState::Answered => format!("Answered: {text}"),
+                QuestionState::Skipped => "Question skipped.".to_string(),
+                _ => "Question cancelled.".to_string(),
+            }
+        };
+
+        match key.code {
+            Esc => Some(submit(
+                self,
+                pending,
+                QuestionState::Cancelled,
+                String::new(),
+            )),
+            Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(submit(self, pending, QuestionState::Skipped, String::new()))
+            }
+            Enter => {
+                let (state, text) = pending.outcome();
+                Some(submit(self, pending, state, text))
+            }
+            Up => {
+                pending.selected = pending.selected.saturating_sub(1);
+                self.pending_question = Some(pending);
+                None
+            }
+            Down => {
+                if pending.selected + 1 < pending.options.len() {
+                    pending.selected += 1;
+                }
+                self.pending_question = Some(pending);
+                None
+            }
+            Char(' ') if pending.kind == QuestionKind::Multi => {
+                if !pending.chosen.remove(&pending.selected) {
+                    pending.chosen.insert(pending.selected);
+                }
+                self.pending_question = Some(pending);
+                None
+            }
+            Backspace if pending.kind == QuestionKind::Text => {
+                pending.text.pop();
+                self.pending_question = Some(pending);
+                None
+            }
+            Char(c) if pending.kind == QuestionKind::Text => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    pending.text.push(c);
+                }
+                self.pending_question = Some(pending);
+                None
+            }
+            _ => {
+                self.pending_question = Some(pending);
+                None
+            }
+        }
+    }
+
+    /// Answer a question restored from disk: resolve it once and append exactly
+    /// one tool result, so a later replay does not invent an interruption.
+    #[allow(clippy::needless_pass_by_value)]
+    fn resolve_restored_question(
+        &mut self,
+        id: i64,
+        state: crate::session::QuestionState,
+        text: &str,
+    ) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let workspace = crate::session::workspace_key();
+        let call = {
+            let guard = lock_store(store);
+            let Ok(_) = guard.resolve_question(&workspace, id, state, text) else {
+                return;
+            };
+            guard.question(&workspace, id).ok().map(|q| q.tool_call_id)
+        };
+        let (Some(call), Some(session)) = (call, self.session_id) else {
+            return;
+        };
+        use crate::session::QuestionState;
+        let result = match state {
+            QuestionState::Answered => format!("The user answered: {text}"),
+            QuestionState::Skipped => "The user skipped the question.".to_string(),
+            _ => "The user cancelled the question.".to_string(),
+        };
+        let message = genai::chat::ChatMessage::from(genai::chat::ToolResponse::new(call, result));
+        let guard = lock_store(store);
+        let _ = guard.record_message(session, &message, crate::session::MessageStatus::Complete);
     }
 }
 
@@ -151,6 +262,12 @@ pub async fn run_agent_worker(
         // the turn must not append it a second time.
         let streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let streamed_evt = streamed.clone();
+        let runtime = runtime.with_questioner(std::sync::Arc::new(super::TuiQuestioner::new(
+            tx.clone(),
+            store.clone(),
+            session_id,
+            turn_id,
+        )));
         let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
         let result = runtime
             .execute_task(

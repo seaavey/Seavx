@@ -35,6 +35,15 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
         return;
     }
 
+    // A clarification owns the next key: arrows move, Enter answers, Ctrl+S
+    // skips, Esc cancels. Nothing else runs until it is resolved.
+    if app.pending_question.is_some() {
+        if let Some(notice) = app.answer_question(&key) {
+            app.push_notice(notice);
+        }
+        return;
+    }
+
     // A pending question owns the next key: y/a/u answer it, n/Esc
     // denies. Nothing else runs until it is resolved.
     if app.pending_permission.is_some() {

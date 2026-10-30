@@ -1,4 +1,4 @@
-use super::{App, TurnRequest, new_input};
+use super::{App, PendingQuestion, TurnRequest, new_input};
 use crate::tui::event::AgentState;
 
 impl App<'_> {
@@ -63,6 +63,39 @@ impl App<'_> {
         }
         self.scroll = self.line_count();
         self.auto_scroll = true;
+
+        // An open question comes back with the session. It is not an
+        // interruption: answering it appends the one result for its call.
+        self.pending_question = None;
+        if !session.pending_calls.is_empty()
+            && let Some(handle) = self.store.clone()
+        {
+            let workspace = crate::session::workspace_key();
+            let open = {
+                let guard = lock_store(&handle);
+                guard
+                    .open_questions(&workspace)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|question| question.session_id == Some(session.id))
+            };
+            if let Some(question) = open {
+                self.pending_question = Some(PendingQuestion {
+                    id: question.id,
+                    question: question.question.clone(),
+                    kind: question.kind,
+                    options: question.options.clone(),
+                    selected: 0,
+                    chosen: std::collections::BTreeSet::new(),
+                    text: String::new(),
+                    reply: None,
+                });
+                self.push_notice(format!(
+                    "Restored question {}: {}",
+                    question.id, question.question
+                ));
+            }
+        }
     }
 
     /// `/clear` and `/new`: a fresh session id, transcript and compaction

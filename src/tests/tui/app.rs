@@ -1331,3 +1331,216 @@ fn a_failed_tool_event_names_its_failure() {
     assert!(text.contains("failed"), "{text}");
     assert!(text.contains("permission_denied"), "{text}");
 }
+
+fn clone_question(source: &crate::tui::app::PendingQuestion) -> crate::tui::app::PendingQuestion {
+    crate::tui::app::PendingQuestion {
+        id: source.id,
+        question: source.question.clone(),
+        kind: source.kind,
+        options: source.options.clone(),
+        selected: source.selected,
+        chosen: source.chosen.clone(),
+        text: source.text.clone(),
+        reply: None,
+    }
+}
+
+#[test]
+fn a_question_view_maps_each_kind_to_one_outcome() {
+    use crate::session::{QuestionKind, QuestionState};
+    use crate::tui::app::PendingQuestion;
+
+    let text = PendingQuestion {
+        id: 1,
+        question: "name?".to_string(),
+        kind: QuestionKind::Text,
+        options: Vec::new(),
+        selected: 0,
+        chosen: Default::default(),
+        text: "widget".to_string(),
+        reply: None,
+    };
+    assert_eq!(
+        text.outcome(),
+        (QuestionState::Answered, "widget".to_string())
+    );
+
+    let single = PendingQuestion {
+        selected: 1,
+        kind: QuestionKind::Single,
+        options: vec!["a".to_string(), "b".to_string()],
+        text: String::new(),
+        ..clone_question(&text)
+    };
+    assert_eq!(single.outcome(), (QuestionState::Answered, "b".to_string()));
+
+    let multi = PendingQuestion {
+        kind: QuestionKind::Multi,
+        chosen: [0, 2].into_iter().collect(),
+        options: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        ..clone_question(&text)
+    };
+    assert_eq!(
+        multi.outcome(),
+        (QuestionState::Answered, "a, c".to_string())
+    );
+
+    // Nothing picked is a skip, never an empty answer.
+    let empty = PendingQuestion {
+        kind: QuestionKind::Multi,
+        chosen: Default::default(),
+        ..clone_question(&text)
+    };
+    assert_eq!(empty.outcome(), (QuestionState::Skipped, String::new()));
+}
+
+#[test]
+fn typing_into_a_text_question_keeps_the_prompt_on_screen_until_enter() {
+    use crate::tui::app::PendingQuestion;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app();
+    let (reply, mut answered) = tokio::sync::oneshot::channel();
+    app.pending_question = Some(PendingQuestion {
+        id: 4,
+        question: "which file?".to_string(),
+        kind: crate::session::QuestionKind::Text,
+        options: Vec::new(),
+        selected: 0,
+        chosen: Default::default(),
+        text: String::new(),
+        reply: Some(reply),
+    });
+
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert!(app.answer_question(&key(KeyCode::Char('a'))).is_none());
+    assert!(app.answer_question(&key(KeyCode::Char('b'))).is_none());
+    assert_eq!(app.pending_question.as_ref().unwrap().text, "ab");
+    assert!(answered.try_recv().is_err(), "nothing sent before Enter");
+
+    let notice = app.answer_question(&key(KeyCode::Enter)).unwrap();
+    assert_eq!(notice, "Answered: ab");
+    assert!(app.pending_question.is_none());
+    assert_eq!(
+        answered.try_recv().unwrap(),
+        (crate::session::QuestionState::Answered, "ab".to_string())
+    );
+}
+
+#[test]
+fn escaping_a_question_cancels_it_instead_of_answering() {
+    use crate::tui::app::PendingQuestion;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app();
+    let (reply, mut answered) = tokio::sync::oneshot::channel();
+    app.pending_question = Some(PendingQuestion {
+        id: 5,
+        question: "which file?".to_string(),
+        kind: crate::session::QuestionKind::Single,
+        options: vec!["a.rs".to_string()],
+        selected: 0,
+        chosen: Default::default(),
+        text: String::new(),
+        reply: Some(reply),
+    });
+
+    app.answer_question(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        answered.try_recv().unwrap(),
+        (crate::session::QuestionState::Cancelled, String::new()),
+        "cancel carries no answer"
+    );
+}
+
+#[test]
+fn answering_a_restored_question_appends_exactly_one_result() {
+    use crate::session::{
+        LoadedSession, MessageStatus, PAYLOAD_FORMAT, QuestionKind, SessionStore, StoredMessage,
+        workspace_key,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(
+        SessionStore::open_at(&dir.path().join("sessions.db")).unwrap(),
+    ));
+    let session = {
+        let guard = store.lock().unwrap();
+        let session = guard
+            .create(&workspace_key(), None, Some("asking"))
+            .unwrap();
+        let call = genai::chat::ChatMessage::assistant(
+            genai::chat::MessageContent::from_tool_calls(vec![
+                serde_json::from_value(serde_json::json!({
+                    "call_id": "call_ask",
+                    "fn_name": "ask_user",
+                    "fn_arguments": { "question": "Which file?" },
+                }))
+                .unwrap(),
+            ]),
+        );
+        guard
+            .record_message(session, &call, MessageStatus::Complete)
+            .unwrap();
+        guard
+            .ask_question(
+                &workspace_key(),
+                Some(session),
+                1,
+                "call_ask",
+                "Which file?",
+                QuestionKind::Text,
+                &[],
+            )
+            .unwrap();
+        session
+    };
+
+    let mut app = test_app();
+    app.store = Some(store.clone());
+    let loaded = LoadedSession {
+        id: session,
+        slug: format!("svx-{session:08}"),
+        workspace: workspace_key(),
+        title: None,
+        model: None,
+        payload_format: PAYLOAD_FORMAT.to_string(),
+        read_only: None,
+        messages: Vec::<StoredMessage>::new(),
+        total_tokens: 0,
+        prompt_tokens: 0,
+        pending_calls: vec!["call_ask".to_string()],
+    };
+    app.load_session(loaded);
+    assert!(
+        app.pending_question.is_some(),
+        "the open question comes back with the session"
+    );
+
+    for c in "main.rs".chars() {
+        app.answer_question(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let notice = app
+        .answer_question(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(notice, "Answered: main.rs");
+    assert!(app.pending_question.is_none());
+
+    let guard = store.lock().unwrap();
+    let question = guard.question(&workspace_key(), 1).unwrap();
+    assert_eq!(question.state, crate::session::QuestionState::Answered);
+    assert_eq!(question.answer, "main.rs");
+    let loaded = guard.load(session).unwrap();
+    assert!(
+        loaded.pending_calls.is_empty(),
+        "the question is no longer open"
+    );
+    let results: Vec<String> = crate::session::replay(&loaded)
+        .history
+        .iter()
+        .flat_map(|message| message.content.tool_responses())
+        .map(|response| response.call_id.clone())
+        .collect();
+    assert_eq!(results, vec!["call_ask".to_string()], "exactly one result");
+}

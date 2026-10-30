@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
 use super::store::lock_store;
-use super::{App, ModalSelection, PendingPermission};
+use super::{App, ModalSelection, PendingPermission, PendingQuestion};
 use crate::agent::events::ToolStatus;
 use crate::tui::event::{Action, AgentState};
 
@@ -206,6 +206,25 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                 request.tool, request.effect
             ));
             app.pending_permission = Some(PendingPermission { request, reply });
+        }
+        Action::QuestionAsked {
+            id,
+            question,
+            kind,
+            options,
+            reply,
+        } => {
+            app.pending_question = Some(PendingQuestion {
+                id,
+                question,
+                kind,
+                options,
+                selected: 0,
+                chosen: std::collections::BTreeSet::new(),
+                text: String::new(),
+                reply: Some(reply),
+            });
+            app.revision += 1;
         }
         Action::ModelsRefreshed(result) => app.models_refreshed(result),
         Action::DoctorDone(report) => {
