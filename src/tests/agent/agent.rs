@@ -331,6 +331,47 @@ mod test_cases {
     }
 
     #[test]
+    fn ask_mode_exports_only_workspace_file_tools() {
+        assert_eq!(
+            tool_names(AgentMode::Ask),
+            vec![
+                "list_directory".to_string(),
+                "read_file".to_string(),
+                "search_files".to_string()
+            ],
+            "Ask is narrower than Plan: every citation must be workspace-validated"
+        );
+    }
+
+    #[test]
+    fn ask_mode_rejects_every_non_file_tool_at_dispatch() {
+        let registry = ToolRegistry::with_default_tools();
+        for name in [
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "run_command",
+            "save_memory",
+            "skill_view",
+            "skill_write",
+            "skill_patch",
+        ] {
+            let err = registry
+                .get_for_mode(name, AgentMode::Ask)
+                .err()
+                .unwrap_or_else(|| panic!("{name} should be blocked in Ask Mode"));
+            assert!(err.contains("disabled in Ask Mode"), "{err}");
+        }
+
+        for name in ["read_file", "list_directory", "search_files"] {
+            assert!(
+                registry.get_for_mode(name, AgentMode::Ask).is_ok(),
+                "{name} must stay reachable"
+            );
+        }
+    }
+
+    #[test]
     fn plan_mode_exports_only_read_only_tools() {
         assert_eq!(
             tool_names(AgentMode::Plan),

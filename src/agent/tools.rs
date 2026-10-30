@@ -437,6 +437,10 @@ struct RunCommandArgs {
     command: String,
 }
 
+/// The whole Ask tool set: workspace-bounded readers only. Shared by export and
+/// dispatch so the two cannot drift.
+pub const ASK_TOOLS: &[&str] = &["read_file", "list_directory", "search_files"];
+
 pub struct RunCommandTool;
 
 #[async_trait]
@@ -1322,7 +1326,14 @@ impl ToolRegistry {
         let mut tools: Vec<Arc<dyn AgentTool>> = self
             .tools
             .values()
-            .filter(|tool| mode == AgentMode::Build || tool.is_read_only())
+            .filter(|tool| match mode {
+                AgentMode::Build => true,
+                AgentMode::Plan => tool.is_read_only(),
+                // Narrower than Plan on purpose: `skill_view` reads skill roots
+                // outside the workspace, and every Ask citation must be
+                // workspace-validated.
+                AgentMode::Ask => ASK_TOOLS.contains(&tool.name()),
+            })
             .cloned()
             .collect();
         // HashMap order varies per run; a stable list keeps the request prefix
@@ -1343,8 +1354,17 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| format!("Tool '{name}' not found."))?;
 
-        if mode == AgentMode::Plan && !tool.is_read_only() {
-            return Err(format!("Tool '{name}' is disabled in Plan Mode."));
+        match mode {
+            AgentMode::Build => {}
+            AgentMode::Plan if !tool.is_read_only() => {
+                return Err(format!("Tool '{name}' is disabled in Plan Mode."));
+            }
+            // Enforced at dispatch as well as at export: a model that names a
+            // tool it was never offered is refused, not run.
+            AgentMode::Ask if !ASK_TOOLS.contains(&name) => {
+                return Err(format!("Tool '{name}' is disabled in Ask Mode."));
+            }
+            AgentMode::Plan | AgentMode::Ask => {}
         }
 
         Ok(tool)

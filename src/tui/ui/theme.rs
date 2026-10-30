@@ -13,5 +13,6 @@ pub(super) fn mode_tag(mode: AgentMode) -> (&'static str, Style) {
     match mode {
         AgentMode::Build => ("[build]", dim()),
         AgentMode::Plan => ("[plan]", Style::default().fg(Color::Yellow)),
+        AgentMode::Ask => ("[ask]", Style::default().fg(Color::Cyan)),
     }
 }

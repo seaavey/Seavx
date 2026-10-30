@@ -6,7 +6,7 @@ use crate::agent::events::{
 use crate::agent::permissions::{
     self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
 };
-use crate::agent::prompt::{PLAN_POLICY, load_system_prompt};
+use crate::agent::prompt::{ASK_POLICY, PLAN_POLICY, load_system_prompt};
 use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
 use crate::session::MessageStatus;
@@ -31,6 +31,9 @@ pub enum AgentMode {
     #[default]
     Build,
     Plan,
+    /// One-shot codebase Q&A. Ephemeral: never persisted in the config and never
+    /// the user's standing selection.
+    Ask,
 }
 
 impl AgentMode {
@@ -38,6 +41,7 @@ impl AgentMode {
         match self {
             Self::Build => "build",
             Self::Plan => "plan",
+            Self::Ask => "ask",
         }
     }
 }
@@ -49,9 +53,14 @@ pub(crate) fn should_auto_distill(mode: AgentMode, step_count: usize) -> bool {
 
 /// Append the read-only planning policy after the base prompt has been resolved.
 pub(crate) fn with_mode_policy(mut prompt: String, mode: AgentMode) -> String {
-    if mode == AgentMode::Plan {
+    let policy = match mode {
+        AgentMode::Build => None,
+        AgentMode::Plan => Some(PLAN_POLICY),
+        AgentMode::Ask => Some(ASK_POLICY),
+    };
+    if let Some(policy) = policy {
         prompt.push_str("\n\n");
-        prompt.push_str(PLAN_POLICY);
+        prompt.push_str(policy);
     }
     prompt
 }
@@ -1624,6 +1633,24 @@ mod mode_policy_tests {
     fn build_mode_leaves_the_prompt_unchanged() {
         let prompt = "base prompt".to_string();
         assert_eq!(with_mode_policy(prompt.clone(), AgentMode::Build), prompt);
+    }
+
+    #[test]
+    fn ask_mode_appends_the_ask_policy() {
+        let prompt = with_mode_policy("base prompt".to_string(), AgentMode::Ask);
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("# ASK MODE ACTIVE"), "{prompt}");
+        for part in ["Verified", "Inference", "Unknown"] {
+            assert!(prompt.contains(part), "{part} must be named: {prompt}");
+        }
+        assert!(
+            prompt.contains("path:line"),
+            "citations carry a path and a line: {prompt}"
+        );
+        assert!(
+            !prompt.contains("# PLAN MODE ACTIVE"),
+            "Ask is not Plan: {prompt}"
+        );
     }
 
     #[test]

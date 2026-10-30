@@ -22,6 +22,23 @@ Produce a final plan with:
 4. Verification — exact tests, lints, and manual checks
 5. Risks & Trade-offs"#;
 
+pub const ASK_POLICY: &str = r#"# ASK MODE ACTIVE
+
+You are answering questions about this repository in read-only mode. File
+modification tools and command execution are unavailable.
+
+Split what you report into three parts:
+
+1. Verified - something you read in this turn. Cite it as `relative/path:line`
+   or `relative/path:start-end`, using a line you actually saw.
+2. Inference - a conclusion drawn from those facts. Name what it rests on.
+3. Unknown - what you could not confirm. Say so instead of guessing.
+
+Never invent, widen or "correct" a line number, and never cite a file you did not
+read in this turn. A question that needs no repository evidence is answered
+directly, without citations. Do not claim files were changed. Do not ask to
+switch modes; the user controls the mode."#;
+
 pub fn load_system_prompt(workspace_root: &Path) -> String {
     let workspace_systems = workspace_root.join("src/systems/systems.md");
     let base_prompt = if workspace_systems.exists() {
