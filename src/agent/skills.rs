@@ -14,6 +14,11 @@ pub struct SkillManager {
 
 impl SkillManager {
     pub fn new(workspace_root: &Path) -> Self {
+        Self::with_home(workspace_root, crate::home::dir().as_deref())
+    }
+
+    /// Testable core: `home` is injected so tests never read the real one.
+    pub fn with_home(workspace_root: &Path, home: Option<&Path>) -> Self {
         let mut roots = vec![
             // The hidden project dir stays first: `save_skill` writes here.
             workspace_root.join(".seavx/skills"),
@@ -22,18 +27,41 @@ impl SkillManager {
             // outranks the user's own skills rather than being shadowed by them.
             workspace_root.join("skills"),
         ];
-        if let Some(home) = crate::home::dir() {
+        if let Some(home) = home {
             roots.push(home.join(".seavx/skills"));
             roots.push(home.join(".agents/skills"));
         }
         Self { roots }
     }
 
+    /// Precedence order: the first root owns the copy `list_skills` returns.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// Every root with the skills it holds. A name may repeat across roots;
+    /// [`Self::list_skills`] hides that, `/skills list` shows it.
+    pub fn skills_by_root(&self) -> Vec<(&Path, Vec<SkillMetadata>)> {
+        self.roots
+            .iter()
+            .map(|root| {
+                let mut list = Vec::new();
+                scan_dir(root, &mut list, 0);
+                (root.as_path(), list)
+            })
+            .collect()
+    }
+
     /// List all available skills; earlier roots shadow later ones with the same name
     pub fn list_skills(&self) -> Vec<SkillMetadata> {
-        let mut list = Vec::new();
-        for root in &self.roots {
-            scan_dir(root, &mut list, 0);
+        let mut list: Vec<SkillMetadata> = Vec::new();
+        for (_, skills) in self.skills_by_root() {
+            for skill in skills {
+                if list.iter().any(|existing| existing.name == skill.name) {
+                    continue;
+                }
+                list.push(skill);
+            }
         }
         list
     }

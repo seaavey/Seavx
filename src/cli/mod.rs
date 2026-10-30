@@ -5,5 +5,6 @@ pub mod model;
 pub mod prompt;
 pub mod sessions;
 pub mod setup;
+pub mod skills;
 pub mod uninstall;
 pub mod update;

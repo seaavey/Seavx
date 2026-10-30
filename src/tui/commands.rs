@@ -8,6 +8,7 @@
 use crate::agent::engine::{AgentConfig, AgentMode};
 use crate::cli::config::{self, ConfigAction, ConfigKey};
 use crate::cli::memory::{self, MemoryView};
+use crate::cli::skills;
 use crate::tui::app::App;
 use crate::tui::event::AgentState;
 
@@ -24,6 +25,7 @@ pub enum CommandId {
     Init,
     Doctor,
     Memory,
+    Skills,
     Undo,
     Sessions,
     Resume,
@@ -102,6 +104,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         id: CommandId::Memory,
     },
     CommandSpec {
+        name: "/skills",
+        usage: "/skills [list|show <name>|add <dir>|remove <name> --yes|path]",
+        summary: "List, inspect, install or remove skills",
+        id: CommandId::Skills,
+    },
+    CommandSpec {
         name: "/undo",
         usage: "/undo",
         summary: "Restore the files changed by the last agent call",
@@ -161,6 +169,9 @@ pub enum SlashCommand {
     Memory {
         view: MemoryView,
     },
+    Skills {
+        action: SkillsAction,
+    },
     /// Restore files from the newest checkpoint.
     Undo,
     /// Open the session picker, or resume one by its listed number.
@@ -168,6 +179,16 @@ pub enum SlashCommand {
         index: Option<u32>,
     },
     Unknown(String),
+}
+
+/// `/skills` subcommands. `add` and `remove` are the two that touch the disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillsAction {
+    List,
+    Show(String),
+    Add(std::path::PathBuf),
+    Remove { name: String, confirmed: bool },
+    Path,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +286,28 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             },
             ["path"] => SlashCommand::Memory {
                 view: MemoryView::Path,
+            },
+            _ => SlashCommand::Unknown(trimmed.to_string()),
+        },
+        CommandId::Skills => match args.as_slice() {
+            [] | ["list"] => SlashCommand::Skills {
+                action: SkillsAction::List,
+            },
+            ["show", name] => SlashCommand::Skills {
+                action: SkillsAction::Show((*name).to_string()),
+            },
+            ["add", dir] => SlashCommand::Skills {
+                action: SkillsAction::Add(std::path::PathBuf::from(dir)),
+            },
+            // Destructive: the flag is part of the grammar, not a later check.
+            ["remove", name, "--yes"] => SlashCommand::Skills {
+                action: SkillsAction::Remove {
+                    name: (*name).to_string(),
+                    confirmed: true,
+                },
+            },
+            ["path"] => SlashCommand::Skills {
+                action: SkillsAction::Path,
             },
             _ => SlashCommand::Unknown(trimmed.to_string()),
         },
@@ -380,6 +423,34 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         }
         SlashCommand::Config { action } => {
             execute_config(app, action);
+            CommandEffect::Handled
+        }
+        SlashCommand::Skills { action } => {
+            let workspace = std::path::Path::new(".");
+            match action {
+                SkillsAction::List => {
+                    app.push_notice(skills::render_list(&skills::list_report(workspace)));
+                }
+                SkillsAction::Path => app.push_notice(skills::render_paths(workspace)),
+                SkillsAction::Show(name) => {
+                    let report = skills::list_report(workspace);
+                    match report.skills.iter().find(|row| row.name == name) {
+                        Some(row) => {
+                            app.push_notice(format!("{}: {}", row.name, row.path.display()))
+                        }
+                        None => app.push_notice(format!("No skill named {name}.")),
+                    }
+                }
+                // Disk writes land in their own commits; say so instead of a no-op.
+                SkillsAction::Add(dir) => app.push_notice(format!(
+                    "Installing {} is not available yet.",
+                    dir.display()
+                )),
+                SkillsAction::Remove { name, confirmed } => app.push_notice(format!(
+                    "Removing {name} is not available yet{}.",
+                    if confirmed { "" } else { "; --yes is required" }
+                )),
+            }
             CommandEffect::Handled
         }
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
