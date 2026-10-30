@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 use super::store::lock_store;
 use super::{App, TuiConfirmer, TurnRequest};
 use crate::agent::engine::AgentMode;
+use crate::agent::events::AgentEvent;
 use crate::tui::event::{Action, AgentState};
 
 /// Ends the turn however the worker exits, panic included, so the UI never
@@ -155,32 +156,35 @@ pub async fn run_agent_worker(
                 history,
                 &TuiConfirmer::new(tx.clone()),
                 &cancel,
-                move |evt| {
-                    if let Some(rest) = evt.strip_prefix("USAGE:") {
-                        let parts: Vec<&str> = rest.split(':').collect();
-                        if parts.len() == 2 {
-                            let total = parts[0].parse::<i32>().unwrap_or(0);
-                            let prompt = parts[1].parse::<i32>().unwrap_or(0);
-                            let _ = tx_clone.send(Action::AgentUsage {
-                                total_tokens: total,
-                                prompt_tokens: prompt,
-                            });
+                move |event| {
+                    let action = match event {
+                        AgentEvent::Token(token) => {
+                            let first =
+                                !streamed_evt.swap(true, std::sync::atomic::Ordering::Relaxed);
+                            Some(Action::AgentToken(if first {
+                                format!("\n\n{token}")
+                            } else {
+                                token
+                            }))
                         }
-                    } else if let Some(token) = evt.strip_prefix("TOKEN:") {
-                        let first = !streamed_evt.swap(true, std::sync::atomic::Ordering::Relaxed);
-                        let frame = if first {
-                            format!("\n\n{token}")
-                        } else {
-                            token.to_string()
-                        };
-                        let _ = tx_clone.send(Action::AgentToken(frame));
-                    } else if evt.starts_with("Tool: ") {
-                        let tool_label = evt.strip_prefix("Tool: ").unwrap_or(evt);
-                        let _ = tx_clone.send(Action::AgentToolStart(tool_label.to_string()));
-                    } else if let Some(thoughts) = evt.strip_prefix("THINKING:") {
-                        let _ = tx_clone.send(Action::AgentThinking(thoughts.to_string()));
-                    } else if let Some(note) = evt.strip_prefix("System: ") {
-                        let _ = tx_clone.send(Action::AgentToken(format!("\n  {note}\n")));
+                        AgentEvent::Thinking(thoughts) => Some(Action::AgentThinking(thoughts)),
+                        AgentEvent::Usage {
+                            total_tokens,
+                            prompt_tokens,
+                        } => Some(Action::AgentUsage {
+                            total_tokens,
+                            prompt_tokens,
+                        }),
+                        AgentEvent::Tool(tool) => Some(Action::AgentTool(tool)),
+                        AgentEvent::Notice(note) => {
+                            Some(Action::AgentToken(format!("\n  {note}\n")))
+                        }
+                        // The turn's terminal status is sent from the outcome
+                        // right after this call returns, once, with its cleanup.
+                        AgentEvent::Turn { .. } => None,
+                    };
+                    if let Some(action) = action {
+                        let _ = tx_clone.send(action);
                     }
                 },
                 // The single persistence channel: every appended message, once.

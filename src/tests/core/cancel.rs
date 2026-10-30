@@ -149,7 +149,7 @@ async fn cancelling_mid_stream_keeps_what_arrived() {
 
     let turn = tokio::spawn(async move {
         let mut rows = Vec::new();
-        let mut events = Vec::new();
+        let mut events: Vec<crate::agent::events::AgentEvent> = Vec::new();
         let outcome = runtime
             .execute_task(
                 "do it",
@@ -157,7 +157,7 @@ async fn cancelling_mid_stream_keeps_what_arrived() {
                 Vec::new(),
                 &DenyingConfirmer,
                 &clone,
-                |event| events.push(event.to_string()),
+                |event| events.push(event),
                 |message, status| rows.push((message.content.texts().join(""), status)),
             )
             .await;
@@ -185,7 +185,9 @@ async fn cancelling_mid_stream_keeps_what_arrived() {
         "a cancelled stream is never resumed"
     );
     assert!(
-        events.iter().any(|event| event == "TOKEN:three"),
+        events
+            .iter()
+            .any(|event| matches!(event, crate::agent::events::AgentEvent::Token(token) if token == "three")),
         "the deltas reached the sink: {events:?}"
     );
 }

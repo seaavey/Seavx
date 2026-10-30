@@ -2,6 +2,7 @@ use tokio::sync::mpsc;
 
 use super::store::lock_store;
 use super::{App, ModalSelection, PendingPermission};
+use crate::agent::events::ToolStatus;
 use crate::tui::event::{Action, AgentState};
 
 /// Apply one result the loop did not route to a key or mouse handler.
@@ -65,10 +66,29 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             app.persistence_error = Some(message.clone());
             app.push_notice(message);
         }
-        Action::AgentToolStart(tool) => {
-            app.status = AgentState::ExecutingTool(tool.clone());
-            // Clean compact Hermes-style tool call indicator without brackets
-            app.push_text(&format!("\n⚡ {tool}\n\n"));
+        Action::AgentTool(tool) => {
+            let label = format!("{}({})", tool.name, tool.summary);
+            match tool.status {
+                ToolStatus::Queued => {
+                    app.status = AgentState::ExecutingTool(label.clone());
+                    // Clean compact Hermes-style tool call indicator without brackets
+                    app.push_text(&format!("\n⚡ {label}\n\n"));
+                }
+                ToolStatus::Running => app.status = AgentState::ExecutingTool(label),
+                // The outcome line: the status word is the ledger's, so a denied
+                // or cancelled call can never read as completed here.
+                ToolStatus::Completed | ToolStatus::Failed | ToolStatus::Cancelled => {
+                    let elapsed = tool
+                        .elapsed
+                        .map(|elapsed| format!(" {:.1}s", elapsed.as_secs_f32()))
+                        .unwrap_or_default();
+                    let failure = tool
+                        .failure
+                        .map(|failure| format!(" · {}", failure.as_str()))
+                        .unwrap_or_default();
+                    app.push_text(&format!("  └ {}{elapsed}{failure}\n", tool.status.as_str()));
+                }
+            }
             if app.auto_scroll {
                 let lines = app.line_count();
                 app.scroll = lines;

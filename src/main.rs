@@ -205,13 +205,21 @@ async fn main() -> anyhow::Result<()> {
                     Vec::new(),
                     &agent::permissions::DenyingConfirmer,
                     &agent::cancel::CancelToken::new(),
-                    |evt| {
-                        // Reasoning blocks are a TUI concern; headless runs skip them.
-                        if let Some(token) = evt.strip_prefix("TOKEN:") {
-                            streamed = true;
-                            print!("{token}");
-                        } else if !evt.starts_with("THINKING:") {
-                            println!("{evt}");
+                    |event| {
+                        // Reasoning blocks are a TUI concern; headless runs skip
+                        // them, and the turn's status has nothing to print.
+                        match event {
+                            agent::events::AgentEvent::Token(token) => {
+                                streamed = true;
+                                print!("{token}");
+                            }
+                            agent::events::AgentEvent::Tool(tool) => {
+                                println!("Tool: {}({})", tool.name, tool.summary);
+                            }
+                            agent::events::AgentEvent::Notice(note) => println!("{note}"),
+                            agent::events::AgentEvent::Thinking(_)
+                            | agent::events::AgentEvent::Usage { .. }
+                            | agent::events::AgentEvent::Turn { .. } => {}
                         }
                     },
                     // `seavx exec` stays session-free: no row is ever written.

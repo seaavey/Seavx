@@ -1,5 +1,8 @@
 use crate::agent::backend::{BackendError, ChatBackend, GenaiBackend, StreamDelta};
 use crate::agent::cancel::{CancelToken, Cleanup, TurnState, TurnStatus};
+use crate::agent::events::{
+    AgentEvent, FailureKind, SUMMARY_LIMIT, ToolEvent, ToolStatus, bounded,
+};
 use crate::agent::permissions::{
     self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
 };
@@ -774,13 +777,20 @@ impl AgentRuntime {
         history: Vec<ChatMessage>,
         confirm: &dyn Confirmer,
         cancel: &CancelToken,
-        event_sink: impl FnMut(&str) + Send,
+        mut event_sink: impl FnMut(AgentEvent) + Send,
         on_message: impl FnMut(&ChatMessage, MessageStatus),
     ) -> TurnOutcome {
         let mut turn = TurnState::new();
         let result = match self
             .run_turn(
-                task, mode, history, confirm, cancel, &mut turn, event_sink, on_message,
+                task,
+                mode,
+                history,
+                confirm,
+                cancel,
+                &mut turn,
+                &mut event_sink,
+                on_message,
             )
             .await
         {
@@ -800,9 +810,27 @@ impl AgentRuntime {
             }
         };
 
+        let cleanup = turn.cleanup();
+        let status = turn.status();
+        // The provider is the only turn-level failure there is: a tool failure
+        // is reported on its own call, not here.
+        let failure = match status {
+            TurnStatus::Failed => Some(FailureKind::Provider),
+            TurnStatus::Cancelled if cleanup == Some(Cleanup::Unconfirmed) => {
+                Some(FailureKind::CleanupUnconfirmed)
+            }
+            _ => None,
+        };
+        event_sink(AgentEvent::Turn {
+            status,
+            failure,
+            cleanup,
+            pid: turn.pid(),
+        });
+
         TurnOutcome {
-            status: turn.status(),
-            cleanup: turn.cleanup(),
+            status,
+            cleanup,
             pid: turn.pid(),
             result,
         }
@@ -818,7 +846,7 @@ impl AgentRuntime {
         confirm: &dyn Confirmer,
         cancel: &CancelToken,
         turn_state: &mut TurnState,
-        mut event_sink: impl FnMut(&str) + Send,
+        event_sink: &mut (impl FnMut(AgentEvent) + Send),
         mut on_message: impl FnMut(&ChatMessage, MessageStatus),
     ) -> Result<String, TurnError> {
         if cancel.is_cancelled() {
@@ -834,7 +862,7 @@ impl AgentRuntime {
         };
         let retry_history = history.clone();
         let mut chat_req = self
-            .prepare_request(history, task, mode, &*summarizer, &mut event_sink)
+            .prepare_request(history, task, mode, &*summarizer, event_sink)
             .await;
         let mut retry = RetryBudget::default();
 
@@ -878,11 +906,11 @@ impl AgentRuntime {
                         match delta {
                             StreamDelta::Token(token) => {
                                 received.push_str(&token);
-                                event_sink(&format!("TOKEN:{token}"));
+                                event_sink(AgentEvent::Token(token));
                             }
                             StreamDelta::Thinking(thoughts) => {
                                 streamed_thinking = true;
-                                event_sink(&format!("THINKING:{thoughts}"));
+                                event_sink(AgentEvent::Thinking(thoughts));
                             }
                         }
                     };
@@ -962,7 +990,10 @@ impl AgentRuntime {
             // Track real usage tokens from provider response
             if let Some(total) = response.usage.total_tokens {
                 let prompt = response.usage.prompt_tokens.unwrap_or(0);
-                event_sink(&format!("USAGE:{total}:{prompt}"));
+                event_sink(AgentEvent::Usage {
+                    total_tokens: total,
+                    prompt_tokens: prompt,
+                });
             }
 
             // Surface the model's reasoning so the TUI can render it as a gray
@@ -971,7 +1002,7 @@ impl AgentRuntime {
             if !streamed_thinking && let Some(ref thoughts) = response.reasoning_content {
                 let trimmed = thoughts.trim();
                 if !trimmed.is_empty() {
-                    event_sink(&format!("THINKING:{trimmed}"));
+                    event_sink(AgentEvent::Thinking(trimmed.to_string()));
                 }
             }
 
@@ -1002,7 +1033,7 @@ impl AgentRuntime {
                 // Auto-Skill Evaluation: a completed task that ran at least two tools is a
                 // candidate workflow (a single call is not), regardless of how many turns it took.
                 if should_auto_distill(mode, steps.len()) {
-                    self.auto_distill_skill(task, &steps, &mut event_sink).await;
+                    self.auto_distill_skill(task, &steps, event_sink).await;
                 }
 
                 return Ok(return_text);
@@ -1062,11 +1093,38 @@ impl AgentRuntime {
                 };
 
                 let args_summary = security::redact(&args_summary);
-                event_sink(&format!("Tool: {tool_name}({args_summary})"));
-                Self::log_tool_call(tool_name, &args_summary, &call.call_id);
+                let call_id = call.call_id.clone();
+                let summary = bounded(&args_summary, SUMMARY_LIMIT);
+                let started_at = crate::util::epoch_secs() as i64;
+                let started = std::time::Instant::now();
+                let mut lifecycle =
+                    |status: ToolStatus,
+                     failure: Option<FailureKind>,
+                     elapsed: Option<std::time::Duration>| {
+                        event_sink(AgentEvent::Tool(ToolEvent {
+                            call_id: call_id.clone(),
+                            name: tool_name.clone(),
+                            summary: summary.clone(),
+                            status,
+                            failure,
+                            started_at,
+                            elapsed,
+                        }));
+                    };
+                lifecycle(ToolStatus::Queued, None, None);
+                Self::log_tool_call(tool_name, &args_summary, &call_id);
                 steps.push(format!("{tool_name}({args_summary})"));
 
-                let (result_str, is_err) = match self.registry.get_for_mode(tool_name, mode) {
+                // How the call ended. Kept apart from the result string because
+                // a denial and a failed command must not be the same event.
+                enum ToolEnd {
+                    Done,
+                    Failed(FailureKind),
+                    Cancelled,
+                }
+
+                lifecycle(ToolStatus::Running, None, None);
+                let (result_str, end) = match self.registry.get_for_mode(tool_name, mode) {
                     Ok(tool) => {
                         let args = call.fn_arguments.clone();
                         let destination = tool.destination(&args, &self.security);
@@ -1081,14 +1139,38 @@ impl AgentRuntime {
                             .unwrap_or_else(|| args_summary.clone());
                         match self.gate(confirm, kind, tool_name, &detail).await {
                             Ok(()) => match tool.execute(args, &self.security, cancel).await {
-                                Ok(res) => (res, false),
-                                Err(err) => (format!("Error executing {tool_name}: {err}"), true),
+                                // A tool that returns after the cancel landed did
+                                // not complete: it was cut short, whatever the
+                                // command itself printed.
+                                Ok(res) => {
+                                    let end = if cancel.is_cancelled() {
+                                        ToolEnd::Cancelled
+                                    } else {
+                                        ToolEnd::Done
+                                    };
+                                    (res, end)
+                                }
+                                Err(err) => {
+                                    let message = format!("Error executing {tool_name}: {err}");
+                                    let end = if cancel.is_cancelled() {
+                                        ToolEnd::Cancelled
+                                    } else {
+                                        ToolEnd::Failed(FailureKind::for_tool_error(&message))
+                                    };
+                                    (message, end)
+                                }
                             },
-                            Err(denied) => (denied, true),
+                            Err(denied) => (denied, ToolEnd::Failed(FailureKind::PermissionDenied)),
                         }
                     }
-                    Err(err) => (format!("Error executing {tool_name}: {err}"), true),
+                    // The tool exists but this mode does not export it: a
+                    // dispatch bug, not a tool that failed.
+                    Err(err) => (
+                        format!("Error executing {tool_name}: {err}"),
+                        ToolEnd::Failed(FailureKind::Internal),
+                    ),
                 };
+                let is_err = !matches!(end, ToolEnd::Done);
 
                 let result_str = security::redact(&result_str);
                 // A cancelled command reports what the OS said; the turn carries it.
@@ -1110,15 +1192,17 @@ impl AgentRuntime {
                     last_failure = None;
                 }
 
-                // Emit preview snippet of tool output (first 3 lines or 150 chars)
-                let preview = result_str.lines().take(3).collect::<Vec<_>>().join("\n");
-                let truncated_preview = if result_str.lines().count() > 3 {
-                    format!("{preview}\n  ... (truncated)")
-                } else {
-                    preview
-                };
-
-                event_sink(&format!("Output:\n{truncated_preview}"));
+                match end {
+                    ToolEnd::Done => {
+                        lifecycle(ToolStatus::Completed, None, Some(started.elapsed()))
+                    }
+                    ToolEnd::Failed(failure) => {
+                        lifecycle(ToolStatus::Failed, Some(failure), Some(started.elapsed()));
+                    }
+                    ToolEnd::Cancelled => {
+                        lifecycle(ToolStatus::Cancelled, None, Some(started.elapsed()));
+                    }
+                }
 
                 let tool_message =
                     ChatMessage::from(ToolResponse::new(call.call_id.clone(), result_str));
@@ -1169,7 +1253,7 @@ impl AgentRuntime {
         task: &str,
         mode: AgentMode,
         summarizer: &dyn crate::tui::compact::Summarizer,
-        event_sink: &mut impl FnMut(&str),
+        event_sink: &mut impl FnMut(AgentEvent),
     ) -> ChatRequest {
         use crate::agent::budget::{
             compact, estimate_tokens, keep_recent_budget, request_budget, window_start,
@@ -1196,10 +1280,10 @@ impl AgentRuntime {
                     );
                     let after = estimate_tokens(&candidate);
                     if after <= budget {
-                        event_sink(&format!(
-                            "System: context compacted ({} → {after} tokens est.)",
+                        event_sink(AgentEvent::Notice(format!(
+                            "context compacted ({} → {after} tokens est.)",
                             compaction.before
-                        ));
+                        )));
                         return candidate;
                     }
                 }
@@ -1207,9 +1291,9 @@ impl AgentRuntime {
                     // A bad summary is worse than none: drop the older turns.
                     let split = window_start(&history, keep);
                     if split > 0 {
-                        event_sink(&format!(
-                            "System: compaction failed ({error}); older turns dropped"
-                        ));
+                        event_sink(AgentEvent::Notice(format!(
+                            "compaction failed ({error}); older turns dropped"
+                        )));
                         return self.chat_request(None, &history[split..], task, mode);
                     }
                     break;
@@ -1223,12 +1307,14 @@ impl AgentRuntime {
         let request = self.chat_request(None, &history[split..], task, mode);
         let estimate = estimate_tokens(&request);
         if estimate > budget {
-            event_sink(&format!(
-                "System: {estimate} tokens exceeds the {budget} budget for {}; sending the newest turn anyway",
+            event_sink(AgentEvent::Notice(format!(
+                "{estimate} tokens exceeds the {budget} budget for {}; sending the newest turn anyway",
                 self.config.model
-            ));
+            )));
         } else {
-            event_sink("System: compaction did not fit the budget; older turns dropped");
+            event_sink(AgentEvent::Notice(
+                "compaction did not fit the budget; older turns dropped".to_string(),
+            ));
         }
         request
     }
@@ -1436,9 +1522,11 @@ impl AgentRuntime {
         &self,
         task: &str,
         steps: &[String],
-        event_sink: &mut (impl FnMut(&str) + Send),
+        event_sink: &mut (impl FnMut(AgentEvent) + Send),
     ) {
-        event_sink("System: evaluating workflow for automatic skill synthesis...");
+        event_sink(AgentEvent::Notice(
+            "evaluating workflow for automatic skill synthesis...".to_string(),
+        ));
         let trace = steps
             .iter()
             .enumerate()
@@ -1464,7 +1552,9 @@ impl AgentRuntime {
             Ok(res) => res,
             Err(err) => {
                 tracing::warn!(error = %err, "Skill synthesis skipped: evaluator request failed");
-                event_sink(&format!("System: skill evaluator request failed: {err}"));
+                event_sink(AgentEvent::Notice(format!(
+                    "skill evaluator request failed: {err}"
+                )));
                 return;
             }
         };
@@ -1473,7 +1563,9 @@ impl AgentRuntime {
         let trimmed = text.trim();
         if !(trimmed.starts_with("---") && trimmed.contains("name:")) {
             tracing::info!("Skill synthesis skipped: evaluator returned no skill");
-            event_sink("System: no repeatable workflow found, skill not saved");
+            event_sink(AgentEvent::Notice(
+                "no repeatable workflow found, skill not saved".to_string(),
+            ));
             return;
         }
 
@@ -1483,7 +1575,9 @@ impl AgentRuntime {
                 ?confidence,
                 "Skill synthesis skipped: confidence below threshold"
             );
-            event_sink("System: workflow rated below singularity threshold, skill not saved");
+            event_sink(AgentEvent::Notice(
+                "workflow rated below singularity threshold, skill not saved".to_string(),
+            ));
             return;
         }
 
@@ -1494,14 +1588,14 @@ impl AgentRuntime {
         match mgr.save_skill(&name, trimmed) {
             Ok(saved_path) => {
                 tracing::info!(skill = %name, "Automatically created high-confidence skill from workflow");
-                event_sink(&format!(
-                    "System: skill synthesized -> {}",
+                event_sink(AgentEvent::Notice(format!(
+                    "skill synthesized -> {}",
                     saved_path.display()
-                ));
+                )));
             }
             Err(err) => {
                 tracing::warn!(error = %err, "Skill synthesis failed: cannot persist skill");
-                event_sink(&format!("System: skill synthesis failed: {err}"));
+                event_sink(AgentEvent::Notice(format!("skill synthesis failed: {err}")));
             }
         }
     }

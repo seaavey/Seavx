@@ -3,6 +3,7 @@ pub mod batch;
 pub mod budget;
 pub mod cancel;
 pub mod engine;
+pub mod events;
 pub mod models;
 pub mod patch;
 pub mod permissions;

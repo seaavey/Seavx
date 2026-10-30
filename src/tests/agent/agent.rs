@@ -405,13 +405,16 @@ mod test_cases {
 #[cfg(test)]
 mod engine_seam {
     use crate::agent::backend::ChatBackend;
+    use crate::agent::cancel::TurnStatus;
     use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
-    use crate::agent::permissions::DenyingConfirmer;
+    use crate::agent::events::{AgentEvent, FailureKind, ToolEvent, ToolStatus};
+    use crate::agent::permissions::{Answer, Confirmer, DenyingConfirmer, PermissionRequest};
     use crate::agent::security::WorkspaceSecurity;
     use genai::adapter::AdapterKind;
     use genai::chat::{
         ChatMessage, ChatOptions, ChatRequest, ChatResponse, MessageContent, ToolResponse,
     };
+    use serde_json::json;
 
     pub(super) fn response(content: MessageContent) -> ChatResponse {
         let model = genai::ModelIden::new(AdapterKind::OpenAI, "fake-model");
@@ -601,6 +604,291 @@ mod engine_seam {
         assert_eq!(messages[3].content.tool_responses()[0].content, "file body");
         assert_eq!(messages[4].content.first_text(), Some("now"));
     }
+
+    /// A confirmer that grants everything, for the tools that ask.
+    struct AllowingConfirmer;
+
+    #[async_trait::async_trait]
+    impl Confirmer for AllowingConfirmer {
+        async fn confirm(&self, _request: PermissionRequest) -> Answer {
+            Answer::Unrestricted
+        }
+    }
+
+    fn tool_call_with(
+        call_id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> genai::chat::ToolCall {
+        serde_json::from_value(json!({
+            "call_id": call_id,
+            "fn_name": name,
+            "fn_arguments": arguments,
+        }))
+        .unwrap()
+    }
+
+    fn tool_lifecycles(events: &[AgentEvent]) -> Vec<ToolEvent> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Tool(tool) => Some(tool.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_emits_one_correlated_lifecycle_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "body").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "read_file", json!({ "path": "note.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text("done")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        runtime
+            .execute_task(
+                "do it",
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let tool = tool_lifecycles(&events);
+        assert_eq!(
+            tool.iter().map(|event| event.status).collect::<Vec<_>>(),
+            [
+                ToolStatus::Queued,
+                ToolStatus::Running,
+                ToolStatus::Completed
+            ],
+            "{tool:?}"
+        );
+        for event in &tool {
+            assert_eq!(event.call_id, "call-1");
+            assert_eq!(event.name, "read_file");
+        }
+        let terminal = tool.last().unwrap();
+        assert!(terminal.elapsed.is_some(), "the terminal event is timed");
+        assert_eq!(terminal.failure, None);
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Turn {
+                    status: TurnStatus::Completed,
+                    failure: None,
+                    ..
+                })
+            ),
+            "the turn closes the stream once: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_tool_is_recorded_as_a_permission_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with(
+                "call-2",
+                "write_file",
+                json!({ "path": "made.txt", "content": "x" }),
+            ),
+        ])));
+        fake.push(response(MessageContent::from_text("gave up")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        runtime
+            .execute_task(
+                "do it",
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let tool = tool_lifecycles(&events);
+        let terminal = tool.last().expect("a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Failed);
+        assert_eq!(terminal.failure, Some(FailureKind::PermissionDenied));
+        assert!(
+            !tool
+                .iter()
+                .any(|event| event.status == ToolStatus::Completed),
+            "a denial never reads as success: {tool:?}"
+        );
+        assert!(!temp.path().join("made.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_tool_error_is_recorded_as_a_tool_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-3", "read_file", json!({ "path": "missing.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text("gave up")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        runtime
+            .execute_task(
+                "do it",
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let terminal = tool_lifecycles(&events).pop().expect("a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Failed);
+        assert_eq!(terminal.failure, Some(FailureKind::Tool));
+    }
+
+    #[tokio::test]
+    async fn a_tool_the_mode_does_not_export_is_an_internal_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with(
+                "call-4",
+                "write_file",
+                json!({ "path": "made.txt", "content": "x" }),
+            ),
+        ])));
+        fake.push(response(MessageContent::from_text("gave up")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        runtime
+            .execute_task(
+                "do it",
+                AgentMode::Plan,
+                Vec::new(),
+                &AllowingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let terminal = tool_lifecycles(&events).pop().expect("a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Failed);
+        assert_eq!(
+            terminal.failure,
+            Some(FailureKind::Internal),
+            "a tool missing from the mode is a dispatch bug, not a tool that ran"
+        );
+        assert!(!temp.path().join("made.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_provider_failure_ends_the_turn_with_a_failed_turn_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("connection reset");
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        let outcome = runtime
+            .execute_task(
+                "do it",
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await;
+
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Turn {
+                    status: TurnStatus::Failed,
+                    failure: Some(FailureKind::Provider),
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_tool_is_never_completed() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-5", "run_command", json!({ "command": "sleep 5" })),
+        ])));
+        fake.push(response(MessageContent::from_text("unreachable")));
+        let runtime = runtime_with(&fake, temp.path());
+        let cancel = crate::agent::cancel::CancelToken::new();
+        let clone = cancel.clone();
+
+        let turn = tokio::spawn(async move {
+            let mut events = Vec::new();
+            let outcome = runtime
+                .execute_task(
+                    "do it",
+                    AgentMode::Build,
+                    Vec::new(),
+                    &AllowingConfirmer,
+                    &clone,
+                    |event| events.push(event),
+                    |_, _| {},
+                )
+                .await;
+            (outcome, events)
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        cancel.cancel();
+
+        let (outcome, events) = tokio::time::timeout(std::time::Duration::from_secs(3), turn)
+            .await
+            .expect("the turn must return after the cancel")
+            .unwrap();
+
+        assert_eq!(outcome.status, TurnStatus::Cancelled);
+        let tool = tool_lifecycles(&events);
+        assert_eq!(
+            tool.last().map(|event| event.status),
+            Some(ToolStatus::Cancelled),
+            "{tool:?}"
+        );
+        assert!(
+            !tool
+                .iter()
+                .any(|event| event.status == ToolStatus::Completed),
+            "a cancelled call never completes: {tool:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -673,13 +961,24 @@ mod context_budget {
         Vec::new()
     }
 
+    /// A sink that keeps the engine's notices: what these tests assert on.
+    fn notice_sink<'a>(
+        notices: &'a mut Vec<String>,
+    ) -> impl FnMut(crate::agent::events::AgentEvent) + 'a {
+        move |event| {
+            if let crate::agent::events::AgentEvent::Notice(note) = event {
+                notices.push(note);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn an_over_budget_history_compacts_once_and_continues() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = runtime(temp.path());
         let summarizer = ScriptedSummarizer::ok(valid_summary());
         let mut notices = notices();
-        let mut sink = |notice: &str| notices.push(notice.to_string());
+        let mut sink = notice_sink(&mut notices);
 
         let request = runtime
             .prepare_request(
@@ -690,6 +989,8 @@ mod context_budget {
                 &mut sink,
             )
             .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
 
         assert!(summarizer.calls() >= 2, "chunk calls plus a merge");
         let summary_message = request
@@ -733,7 +1034,7 @@ mod context_budget {
         let runtime = runtime(temp.path());
         let summarizer = ScriptedSummarizer::failing();
         let mut notices = notices();
-        let mut sink = |notice: &str| notices.push(notice.to_string());
+        let mut sink = notice_sink(&mut notices);
 
         let request = runtime
             .prepare_request(
@@ -744,6 +1045,8 @@ mod context_budget {
                 &mut sink,
             )
             .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
 
         let failing = notices
             .iter()
@@ -775,7 +1078,7 @@ mod context_budget {
         );
         let summarizer = ScriptedSummarizer::ok(huge);
         let mut notices = notices();
-        let mut sink = |notice: &str| notices.push(notice.to_string());
+        let mut sink = notice_sink(&mut notices);
 
         let request = runtime
             .prepare_request(
@@ -786,6 +1089,8 @@ mod context_budget {
                 &mut sink,
             )
             .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
 
         assert!(
             summarizer.calls() >= 4,
@@ -812,7 +1117,7 @@ mod context_budget {
         let runtime = runtime(temp.path());
         let summarizer = ScriptedSummarizer::ok(valid_summary());
         let mut notices = notices();
-        let mut sink = |notice: &str| notices.push(notice.to_string());
+        let mut sink = notice_sink(&mut notices);
 
         let history = vec![
             ChatMessage::user("huge question"),
@@ -827,6 +1132,8 @@ mod context_budget {
                 &mut sink,
             )
             .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
 
         assert_eq!(summarizer.calls(), 0, "nothing older exists to summarize");
         let warning = notices

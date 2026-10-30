@@ -9,7 +9,7 @@ pub enum Action {
     Mouse(MouseEvent),
     AgentToken(String),
     AgentThinking(String),
-    AgentToolStart(String),
+    AgentTool(crate::agent::events::ToolEvent),
     /// The session the title belongs to: a late answer must not rename the
     /// session the user already started.
     AgentTitle {

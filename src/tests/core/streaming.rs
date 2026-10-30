@@ -174,7 +174,7 @@ async fn a_stream_that_fails_after_one_chunk_is_not_retried() {
     fake.stream_then(vec![token("half an ans"), Err("broken pipe".into())]);
     let runtime = runtime_with(&fake, workspace.path(), true);
 
-    let mut events = Vec::new();
+    let mut events: Vec<crate::agent::events::AgentEvent> = Vec::new();
     let mut reported = Vec::new();
     let error = runtime
         .execute_task(
@@ -183,7 +183,7 @@ async fn a_stream_that_fails_after_one_chunk_is_not_retried() {
             Vec::new(),
             &DenyingConfirmer,
             &crate::agent::cancel::CancelToken::new(),
-            |event| events.push(event.to_string()),
+            |event| events.push(event),
             |message, status| reported.push((message.clone(), status)),
         )
         .await
@@ -194,7 +194,9 @@ async fn a_stream_that_fails_after_one_chunk_is_not_retried() {
     assert_eq!(fake.calls(), vec!["stream"], "no resend after output");
 
     assert!(
-        events.iter().any(|event| event == "TOKEN:half an ans"),
+        events
+            .iter()
+            .any(|event| matches!(event, crate::agent::events::AgentEvent::Token(token) if token == "half an ans")),
         "the delta reaches the sink: {events:?}"
     );
     let (partial, status) = reported.last().expect("a partial row is reported");
@@ -211,7 +213,7 @@ async fn streamed_reasoning_is_not_repeated_by_the_captured_copy() {
     fake.stream_then(vec![thinking("weighing "), thinking("it"), token("hi")]);
     let runtime = runtime_with(&fake, workspace.path(), true);
 
-    let mut events = Vec::new();
+    let mut events: Vec<crate::agent::events::AgentEvent> = Vec::new();
     let answer = runtime
         .execute_task(
             "do it",
@@ -219,7 +221,7 @@ async fn streamed_reasoning_is_not_repeated_by_the_captured_copy() {
             Vec::new(),
             &DenyingConfirmer,
             &crate::agent::cancel::CancelToken::new(),
-            |event| events.push(event.to_string()),
+            |event| events.push(event),
             |_, _| {},
         )
         .await
@@ -227,13 +229,16 @@ async fn streamed_reasoning_is_not_repeated_by_the_captured_copy() {
         .unwrap();
 
     assert_eq!(answer, "hi");
-    let thinking_events: Vec<&String> = events
+    let thinking_events: Vec<&str> = events
         .iter()
-        .filter(|event| event.starts_with("THINKING:"))
+        .filter_map(|event| match event {
+            crate::agent::events::AgentEvent::Thinking(thoughts) => Some(thoughts.as_str()),
+            _ => None,
+        })
         .collect();
     assert_eq!(
         thinking_events,
-        ["THINKING:weighing ", "THINKING:it"],
+        ["weighing ", "it"],
         "the deltas are the reasoning; the captured copy would draw it twice: {events:?}"
     );
 }
