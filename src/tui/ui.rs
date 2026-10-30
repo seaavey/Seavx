@@ -1,41 +1,34 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    widgets::{Block, Borders, Clear, Paragraph},
+    layout::{Constraint, Direction, Layout},
 };
 
-// The header tests name the mode through `use super::*`.
-#[cfg(test)]
-use crate::agent::engine::AgentMode;
 use crate::tui::app::App;
-// The modal tests name the selection and the highlight through `use super::*`.
+
+// The child test module reaches these through `use super::*`.
 #[cfg(test)]
-use crate::tui::app::ModalSelection;
-#[cfg(test)]
-use ratatui::style::Modifier;
-// The status-line tests name the agent state through `use super::*`.
-#[cfg(test)]
-use crate::tui::event::AgentState;
+use {
+    crate::agent::engine::AgentMode,
+    crate::tui::app::ModalSelection,
+    crate::tui::event::AgentState,
+    ratatui::style::{Color, Modifier},
+};
 
 mod composer;
 mod conversation;
 mod footer;
-// The child test module reaches both through `use super::*`.
-#[cfg(test)]
-pub(crate) use conversation::transcript_lines;
 mod header;
 mod modal;
 mod permission;
 mod popups;
 mod splash;
-#[cfg(test)]
-pub(crate) use splash::SPLASH;
 mod status_line;
-// The child test module reaches this through `use super::*`.
-#[cfg(test)]
-pub(crate) use status_line::Orb;
 mod theme;
+mod toast;
+
+// The child test module reaches these through `use super::*`.
+#[cfg(test)]
+pub(crate) use {conversation::transcript_lines, splash::SPLASH, status_line::Orb};
 
 pub fn render(app: &App, frame: &mut Frame) {
     let input_height = app.input_height();
@@ -90,31 +83,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     modal::render(app, frame.area(), frame, millis);
 
     // 7. Toast Notification Popup (Bottom-Right)
-    if let Some((ref msg, instant)) = app.toast
-        && instant.elapsed() < std::time::Duration::from_secs(3)
-    {
-        let toast_width = (msg.len() as u16 + 4).min(frame.area().width.saturating_sub(2));
-        let toast_area = Rect::new(
-            frame.area().width.saturating_sub(toast_width + 2),
-            input_area.y.saturating_sub(3),
-            toast_width,
-            3,
-        );
-        frame.render_widget(Clear, toast_area);
-        let toast_color = if msg.starts_with('✓') {
-            Color::Green
-        } else {
-            Color::Red
-        };
-        let toast_widget = Paragraph::new(msg.as_str())
-            .style(Style::default().fg(toast_color))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(toast_color)),
-            );
-        frame.render_widget(toast_widget, toast_area);
-    }
+    toast::render(app, frame.area(), input_area, frame);
 }
 
 #[cfg(test)]
