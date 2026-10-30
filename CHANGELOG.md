@@ -3,67 +3,7 @@
 All notable changes to Seavx are recorded here, grouped by category. One entry
 per landed change; no entry describes behaviour that is not in the code.
 
-## Unreleased
-
-### feature
-
-- Debug mode is `--debug` or `SEAVX_DEBUG=1|true`, and nothing else: a debug
-  build no longer counts, so `cargo run` keeps its data in `~/.seavx` like an
-  installed binary. With neither, the run is not a debug run.
-- Every TUI run writes the state it resolved into the workspace `.env` as
-  `SEAVX_DEBUG=true|false` — the file is created when missing, the line is
-  rewritten in place, and every other line is left byte-for-byte. `seavx exec`
-  still writes nothing.
-- A repository can ship its skills in the open: `skills/<category>/<name>/SKILL.md`
-  is now a load root, second after `.seavx/skills` and ahead of the user's own
-  skills, so a repo skill shadows a user skill of the same name. `skill_write`
-  still targets `.seavx/skills`.
-- The `/model` picker is a search box: typing narrows the list to names
-  containing the query (case-insensitive), Backspace widens it, and the title
-  shows `matched/total`. Letters are text now, so `j`/`k` no longer navigate and
-  the `/models` refresh moved to `ctrl+r`. The wheel moves the picker's cursor
-  instead of scrolling the transcript behind it.
-
-### fix
-
-- The `/model` picker refreshes off the UI thread: the refresh key used to await
-  the gateway on the event loop, which froze the terminal for up to the request
-  timeout. The title now shows a spinner while the fetch runs, the result lands
-  as an event, and a second `ctrl+r` is ignored until the list arrives.
-- `/sessions` opens the session picker (it used to print a numbered list) and
-  still resumes a number directly; `/resume` is its alias, same arguments and
-  same effect.
-- Resuming a session (the `/sessions` picker or `/sessions <n>`) replaces the
-  screen instead of appending to it: the previous transcript, compaction
-  summary, read-only flag and unsent draft no longer carry into the loaded
-  session.
-- `/clear` and `/new` reset the footer's token counter: the new session showed
-  the previous session's usage until the first reply landed.
-- The model and session pickers scroll with the cursor and paint the selected
-  row with a background. A list longer than the box stayed pinned to its first
-  rows, so the cursor walked off the bottom and moving down looked dead.
-- A streamed turn no longer draws its reasoning twice. The provider's captured
-  reasoning repeats the deltas already sent, and the engine re-emitted it after
-  the answer, so the TUI appended a second gray block below the reply; the
-  captured copy now only feeds the unstreamed path.
-- `/model` with no argument opens the picker on a stale cache instead of
-  reporting "No cached models found". `get_cached_models` still returns `None`
-  past its 24 h TTL so `seavx model` keeps refreshing; the picker reads the new
-  `get_cached_models_allow_stale`.
-- `/model <number>` outside the cached list is refused with the list size,
-  instead of being saved as a model name — a cold cache plus `/model 3` used to
-  write `model = "3"` to `config.toml`.
-
-### docs
-
-- `skills/autonomous-agents/seavx/SKILL.md` documents the agent as shipped: CLI,
-  the debug rule and both data locations, slash commands, config keys, the
-  permission model, sessions and undo.
-- `skills/autonomous-agents/seavx-dev/SKILL.md` states the rule this repository
-  works under: any coding session runs with `-d` or `SEAVX_DEBUG=true` so the
-  data lands in the repo `.seavx/`, and every feature ships with a skill entry.
-
-## 0.1.2 — 2026-10-29
+## 0.1.2 — 2026-10-30
 
 ### feature
 
@@ -97,6 +37,22 @@ per landed change; no entry describes behaviour that is not in the code.
   of an "Unknown command" error.
 - `config`, `config-recovery`, `permissions`, `session` and `stream` checks in
   `doctor`; a pending `.bak` conflict is named by `doctor` and `/config`.
+- Debug mode is `--debug` or `SEAVX_DEBUG=1|true`, and nothing else: a debug
+  build no longer counts, so `cargo run` keeps its data in `~/.seavx` like an
+  installed binary. With neither, the run is not a debug run.
+- Every TUI run writes the state it resolved into the workspace `.env` as
+  `SEAVX_DEBUG=true|false` — the file is created when missing, the line is
+  rewritten in place, and every other line is left byte-for-byte. `seavx exec`
+  still writes nothing.
+- A repository can ship its skills in the open: `skills/<category>/<name>/SKILL.md`
+  is now a load root, second after `.seavx/skills` and ahead of the user's own
+  skills, so a repo skill shadows a user skill of the same name. `skill_write`
+  still targets `.seavx/skills`.
+- The `/model` picker is a search box: typing narrows the list to names
+  containing the query (case-insensitive), Backspace widens it, and the title
+  shows `matched/total`. Letters are text now, so `j`/`k` no longer navigate and
+  the `/models` refresh moved to `ctrl+r`. The wheel moves the picker's cursor
+  instead of scrolling the transcript behind it.
 
 ### refactor
 
@@ -185,6 +141,33 @@ per landed change; no entry describes behaviour that is not in the code.
 - `Ctrl+D`, `Ctrl+Q` and the double `Ctrl+C` exit work while a permission
   question is on screen: the prompt used to consume every key, so the only way
   out was to answer. Leaving without answering denies, never approves.
+- The `/model` picker refreshes off the UI thread: the refresh key used to await
+  the gateway on the event loop, which froze the terminal for up to the request
+  timeout. The title now shows a spinner while the fetch runs, the result lands
+  as an event, and a second `ctrl+r` is ignored until the list arrives.
+- `/sessions` opens the session picker (it used to print a numbered list) and
+  still resumes a number directly; `/resume` is its alias, same arguments and
+  same effect.
+- Resuming a session (the `/sessions` picker or `/sessions <n>`) replaces the
+  screen instead of appending to it: the previous transcript, compaction
+  summary, read-only flag and unsent draft no longer carry into the loaded
+  session.
+- `/clear` and `/new` reset the footer's token counter: the new session showed
+  the previous session's usage until the first reply landed.
+- The model and session pickers scroll with the cursor and paint the selected
+  row with a background. A list longer than the box stayed pinned to its first
+  rows, so the cursor walked off the bottom and moving down looked dead.
+- A streamed turn no longer draws its reasoning twice. The provider's captured
+  reasoning repeats the deltas already sent, and the engine re-emitted it after
+  the answer, so the TUI appended a second gray block below the reply; the
+  captured copy now only feeds the unstreamed path.
+- `/model` with no argument opens the picker on a stale cache instead of
+  reporting "No cached models found". `get_cached_models` still returns `None`
+  past its 24 h TTL so `seavx model` keeps refreshing; the picker reads the new
+  `get_cached_models_allow_stale`.
+- `/model <number>` outside the cached list is refused with the list size,
+  instead of being saved as a model name — a cold cache plus `/model 3` used to
+  write `model = "3"` to `config.toml`.
 
 ### tests
 
@@ -208,6 +191,12 @@ per landed change; no entry describes behaviour that is not in the code.
   limits (no encryption at rest, no automatic crash rollback), the `doctor` check
   list, and the registry/palette relationship.
 - `src/systems/coding.md` states the streaming and cleanup rules for the agent.
+- `skills/autonomous-agents/seavx/SKILL.md` documents the agent as shipped: CLI,
+  the debug rule and both data locations, slash commands, config keys, the
+  permission model, sessions and undo.
+- `skills/autonomous-agents/seavx-dev/SKILL.md` states the rule this repository
+  works under: any coding session runs with `-d` or `SEAVX_DEBUG=true` so the
+  data lands in the repo `.seavx/`, and every feature ships with a skill entry.
 
 ### deps
 
