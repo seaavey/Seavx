@@ -1,5 +1,3 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
@@ -26,7 +24,7 @@ use effects::{apply_command_effect, spawn_session_resume};
 // The root tests call the shortcut directly; production reaches it through
 // `keys::handle`.
 #[cfg(test)]
-use keys::quit_shortcut;
+use keys::{is_mode_shortcut, quit_shortcut};
 
 pub(crate) use input::new_input;
 use references::AtCache;
@@ -55,38 +53,6 @@ pub enum Segment {
     /// newlines are the layout. Markdown would fold every row into a paragraph.
     Notice(String),
     Thinking(String),
-}
-
-/// Wrap-around previous index; no-op-safe when the list is empty.
-fn prev_index(sel: usize, len: usize) -> usize {
-    if sel == 0 {
-        len.saturating_sub(1)
-    } else {
-        sel - 1
-    }
-}
-
-/// Wrap-around next index; no-op-safe when the list is empty.
-fn next_index(sel: usize, len: usize) -> usize {
-    if sel + 1 >= len { 0 } else { sel + 1 }
-}
-
-fn is_mode_shortcut(key: &KeyEvent) -> bool {
-    key.code == KeyCode::BackTab
-        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL))
-}
-
-/// Whether a key edits the prompt text (as opposed to only moving the cursor).
-/// Only these regrow the ghost suggestion after the raw key is applied.
-fn edits_text(key: &KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Char(_) => {
-            !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-        }
-        KeyCode::Backspace | KeyCode::Enter | KeyCode::Tab => true,
-        _ => false,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,26 +199,6 @@ impl crate::agent::permissions::Confirmer for TuiConfirmer {
 }
 
 impl<'a> App<'a> {
-    /// Answer the pending permission question with one key: `y` once, `a` this
-    /// category, `u` unrestricted, `n`/`Esc` deny. Returns the answer sent, or
-    /// `None` when the key is not an answer.
-    pub fn answer_permission(
-        &mut self,
-        code: KeyCode,
-    ) -> Option<crate::agent::permissions::Answer> {
-        use crate::agent::permissions::Answer;
-        let answer = match code {
-            KeyCode::Char('y') => Answer::Once,
-            KeyCode::Char('a') => Answer::Category,
-            KeyCode::Char('u') => Answer::Unrestricted,
-            KeyCode::Char('n') | KeyCode::Esc => Answer::Deny,
-            _ => return None,
-        };
-        let pending = self.pending_permission.take()?;
-        let _ = pending.reply.send(answer);
-        Some(answer)
-    }
-
     pub fn new() -> Self {
         Self::with_history(crate::history::ChatHistory::load(
             &crate::history::config_dir(),
@@ -380,35 +326,6 @@ impl<'a> App<'a> {
             self.should_quit = true;
         }
     }
-
-    /// The turn ended: the spinner stops, and a cancel says so once.
-    pub fn finish_turn(
-        &mut self,
-        status: crate::agent::cancel::TurnStatus,
-        cleanup: Option<crate::agent::cancel::Cleanup>,
-        pid: Option<u32>,
-    ) {
-        self.status = AgentState::Idle;
-        if status != crate::agent::cancel::TurnStatus::Cancelled {
-            return;
-        }
-        let mut line = String::from("System: cancelled");
-        if cleanup == Some(crate::agent::cancel::Cleanup::Unconfirmed) {
-            line.push('\n');
-            line.push_str("System: ");
-            line.push_str(&crate::agent::cancel::cleanup_notice(
-                pid.unwrap_or_default(),
-            ));
-        }
-        self.push_notice(line);
-    }
-}
-
-/// Geometry of the `@` reference popup. Shared so drawing and mouse clicks agree.
-pub struct AtPopupLayout {
-    pub area: Rect,
-    pub window_start: usize,
-    pub max_visible: usize,
 }
 
 /// App with an isolated history file so tests never read or write the

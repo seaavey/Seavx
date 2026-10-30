@@ -1,8 +1,15 @@
 use ratatui::layout::Rect;
 
-use super::{App, AtPopupLayout, new_input};
+use super::{App, new_input};
 
 const MAX_COMPLETION_RESULTS: usize = 20;
+
+/// Geometry of the `@` reference popup. Shared so drawing and mouse clicks agree.
+pub struct AtPopupLayout {
+    pub area: Rect,
+    pub window_start: usize,
+    pub max_visible: usize,
+}
 
 pub fn scan_workspace_entries(query: &str) -> Vec<(bool, String)> {
     scan_workspace_entries_at(std::path::Path::new("."), query)

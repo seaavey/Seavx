@@ -1,7 +1,8 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use super::{App, ModalSelection, next_index, prev_index};
+use super::modal::{next_index, prev_index};
+use super::{App, ModalSelection};
 
 pub(super) fn handle(app: &mut App, mouse: MouseEvent, screen: Rect) {
     let at_matches = app.at_matches();

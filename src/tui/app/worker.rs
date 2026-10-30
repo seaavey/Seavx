@@ -1,9 +1,10 @@
+use crossterm::event::KeyCode;
 use tokio::sync::mpsc;
 
 use super::store::lock_store;
-use super::{TuiConfirmer, TurnRequest};
+use super::{App, TuiConfirmer, TurnRequest};
 use crate::agent::engine::AgentMode;
-use crate::tui::event::Action;
+use crate::tui::event::{Action, AgentState};
 
 /// Ends the turn however the worker exits, panic included, so the UI never
 /// stays stuck on `thinking`.
@@ -14,6 +15,50 @@ pub(super) struct DoneGuard(pub(super) mpsc::UnboundedSender<Action>);
 impl Drop for DoneGuard {
     fn drop(&mut self) {
         let _ = self.0.send(Action::AgentDone);
+    }
+}
+
+impl App<'_> {
+    /// The turn ended: the spinner stops, and a cancel says so once.
+    pub(super) fn finish_turn(
+        &mut self,
+        status: crate::agent::cancel::TurnStatus,
+        cleanup: Option<crate::agent::cancel::Cleanup>,
+        pid: Option<u32>,
+    ) {
+        self.status = AgentState::Idle;
+        if status != crate::agent::cancel::TurnStatus::Cancelled {
+            return;
+        }
+        let mut line = String::from("System: cancelled");
+        if cleanup == Some(crate::agent::cancel::Cleanup::Unconfirmed) {
+            line.push('\n');
+            line.push_str("System: ");
+            line.push_str(&crate::agent::cancel::cleanup_notice(
+                pid.unwrap_or_default(),
+            ));
+        }
+        self.push_notice(line);
+    }
+
+    /// Answer the pending permission question with one key: `y` once, `a` this
+    /// category, `u` unrestricted, `n`/`Esc` deny. Returns the answer sent, or
+    /// `None` when the key is not an answer.
+    pub(crate) fn answer_permission(
+        &mut self,
+        code: KeyCode,
+    ) -> Option<crate::agent::permissions::Answer> {
+        use crate::agent::permissions::Answer;
+        let answer = match code {
+            KeyCode::Char('y') => Answer::Once,
+            KeyCode::Char('a') => Answer::Category,
+            KeyCode::Char('u') => Answer::Unrestricted,
+            KeyCode::Char('n') | KeyCode::Esc => Answer::Deny,
+            _ => return None,
+        };
+        let pending = self.pending_permission.take()?;
+        let _ = pending.reply.send(answer);
+        Some(answer)
     }
 }
 

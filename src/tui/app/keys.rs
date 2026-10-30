@@ -1,13 +1,31 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
+use super::modal::{next_index, prev_index};
 use super::{
-    App, EnterAction, ModalSelection, apply_command_effect, edit_query, edits_text,
-    is_mode_shortcut, new_input, next_index, prev_index, run_agent_worker, spawn_session_resume,
-    visible_models,
+    App, EnterAction, ModalSelection, apply_command_effect, edit_query, new_input,
+    run_agent_worker, spawn_session_resume, visible_models,
 };
 use crate::agent::engine::EFFORT_LEVELS;
 use crate::tui::event::Action;
+
+pub(super) fn is_mode_shortcut(key: &KeyEvent) -> bool {
+    key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Whether a key edits the prompt text (as opposed to only moving the cursor).
+/// Only these regrow the ghost suggestion after the raw key is applied.
+pub(super) fn edits_text(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(_) => {
+            !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+        }
+        KeyCode::Backspace | KeyCode::Enter | KeyCode::Tab => true,
+        _ => false,
+    }
+}
 
 pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::UnboundedSender<Action>) {
     // Quitting is never blocked. A pending question is answered by

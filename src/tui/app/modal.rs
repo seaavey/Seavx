@@ -1,6 +1,20 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{App, ModalSelection, next_index, prev_index};
+use super::{App, ModalSelection};
+
+/// Wrap-around previous index; no-op-safe when the list is empty.
+pub(super) fn prev_index(sel: usize, len: usize) -> usize {
+    if sel == 0 {
+        len.saturating_sub(1)
+    } else {
+        sel - 1
+    }
+}
+
+/// Wrap-around next index; no-op-safe when the list is empty.
+pub(super) fn next_index(sel: usize, len: usize) -> usize {
+    if sel + 1 >= len { 0 } else { sel + 1 }
+}
 
 impl App<'_> {
     /// Open the cached-model picker. Returns `false` when the cache is empty.
