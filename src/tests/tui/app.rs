@@ -345,31 +345,36 @@ fn mode_change_is_rejected_while_busy_and_says_so() {
 }
 
 #[test]
-fn switching_modes_prints_one_line() {
+fn switching_modes_stays_silent() {
+    // The header and footer already show the active mode; a switch must not add
+    // a transcript row of its own.
     let mut app = test_app();
     app.toggle_mode();
-    assert!(transcript(&app).contains("Plan mode enabled — writes are disabled"));
-    // BackTab is the same call, so the shortcut cannot go silent again.
+    assert_eq!(app.mode, AgentMode::Plan);
+    assert!(transcript(&app).is_empty(), "{}", transcript(&app));
+
     app.toggle_mode();
-    assert!(transcript(&app).contains("Build mode enabled"));
+    assert_eq!(app.mode, AgentMode::Build);
+    assert!(transcript(&app).is_empty(), "{}", transcript(&app));
 
     let mut plan = test_app();
     plan.mode = AgentMode::Plan;
     run_command(&mut plan, "/plan off");
-    assert!(transcript(&plan).contains("Build mode enabled"));
+    assert_eq!(plan.mode, AgentMode::Build);
+    assert!(transcript(&plan).is_empty(), "{}", transcript(&plan));
 }
 
 #[test]
 fn repeating_the_mode_command_says_it_is_already_active() {
     let mut app = test_app();
     run_command(&mut app, "/plan");
-    assert!(transcript(&app).contains("Plan mode enabled — writes are disabled"));
+    assert_eq!(app.mode, AgentMode::Plan);
     run_command(&mut app, "/plan");
     assert_eq!(app.mode, AgentMode::Plan);
     assert!(transcript(&app).contains("Plan mode is already active"));
 
     run_command(&mut app, "/plan off");
-    assert!(transcript(&app).contains("Build mode enabled"));
+    assert_eq!(app.mode, AgentMode::Build);
     run_command(&mut app, "/plan off");
     assert_eq!(app.mode, AgentMode::Build);
     assert!(transcript(&app).contains("Build mode is already active"));
@@ -1094,4 +1099,70 @@ fn a_failed_refresh_stops_the_spinner_and_says_why() {
     ));
     let (toast, _) = app.toast.clone().expect("the failure is reported");
     assert!(toast.contains("429"), "{toast}");
+}
+
+// ---- Phase 3 key handling ----
+
+#[tokio::test]
+async fn escape_closes_the_ghost_then_the_popup_then_cancels_the_turn() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.history.clear();
+    app.history.push("open @src/main.rs".to_string());
+    app.input.insert_str("open @src");
+    app.refresh_ghost();
+    app.status = crate::tui::event::AgentState::Thinking;
+
+    assert!(app.ghost_active(), "the suggestion grew a dimmed tail");
+    assert!(app.popup_open(), "the @ popup is showing");
+
+    let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert!(
+        !app.ghost_active(),
+        "the first Esc takes back the suggestion only"
+    );
+    assert!(app.popup_open(), "the popup survives that press");
+    assert!(!app.cancel.is_cancelled(), "the turn keeps running");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert!(!app.popup_open(), "the second Esc closes the popup");
+    assert!(!app.cancel.is_cancelled(), "and still does not cancel");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert!(app.cancel.is_cancelled(), "the third Esc cancels");
+    assert_eq!(
+        app.status,
+        crate::tui::event::AgentState::Thinking,
+        "cancelling is the worker's business, not the key handler's"
+    );
+
+    let mut idle = test_app();
+    super::keys::handle(&mut idle, esc(), &tx).await;
+    assert!(
+        idle.should_quit,
+        "Esc with nothing open and nothing running quits"
+    );
+}
+
+#[tokio::test]
+async fn a_modal_owns_the_arrow_keys_before_the_transcript_does() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.modal = picker(&["alpha", "beta", "gamma"], 1);
+    app.scroll = 7;
+
+    // Regression: the transcript must not scroll while a picker owns the arrows.
+    // Shift+Up is the key the plain prompt would claim for scrolling, so a
+    // picker that lost the priority moves `app.scroll` instead of the cursor.
+    super::keys::handle(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+        &tx,
+    )
+    .await;
+
+    assert_eq!(selected_of(&app), 0, "Up moves the picker selection");
+    assert_eq!(app.scroll, 7, "and leaves the transcript where it was");
 }

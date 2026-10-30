@@ -1,6 +1,8 @@
 use super::*;
+use crate::agent::engine::EFFORT_LEVELS;
 use crate::tui::app::test_app;
 use ratatui::{Terminal, backend::TestBackend};
+use std::time::Instant;
 
 fn screen(input: &str) -> String {
     let mut app = test_app();
@@ -249,6 +251,24 @@ fn the_footer_marks_an_unrecognised_model_as_assumed() {
 }
 
 #[test]
+fn the_footer_keeps_the_model_token_and_effort_columns_in_a_wide_frame() {
+    let mut app = test_app();
+    app.config.model = "deepseek-chat".to_string();
+    app.config.reasoning_effort = Some("high".to_string());
+    app.total_tokens = 1234;
+    app.prompt_tokens = 1234;
+
+    let mut terminal = Terminal::new(TestBackend::new(170, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let footer: String = (0..170).map(|x| buffer[(x, 23)].symbol()).collect();
+
+    assert!(footer.contains("deepseek-chat"), "{footer}");
+    assert!(footer.contains("~1k/128k"), "{footer}");
+    assert!(footer.contains("effort high"), "{footer}");
+}
+
+#[test]
 fn streamed_reasoning_deltas_stay_in_one_paragraph() {
     let mut app = test_app();
     // The engine emits one delta per token, none of them ending in a newline.
@@ -450,4 +470,185 @@ fn a_running_refresh_is_visible_in_the_picker_title() {
     let idle = screen_of(&app);
     assert!(idle.contains("Select Model"), "{idle}");
     assert!(!idle.contains("Refreshing"), "{idle}");
+}
+
+/// Border colour of the toast box whose body contains `msg`.
+fn toast_border_color(app: &App, msg: &str) -> Color {
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|frame| render(app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String { (0..90).map(|x| buffer[(x, y)].symbol()).collect() };
+    let y = (0..24)
+        .find(|y| row(*y).contains(msg))
+        .expect("the toast message is drawn");
+    let x = (0..90)
+        .find(|x| buffer[(*x, y - 1)].symbol() == "┌")
+        .expect("the toast has a border");
+    let border = buffer[(x, y - 1)]
+        .style()
+        .fg
+        .expect("the border is coloured");
+    // The body and the border read the same variable; a border-only assertion
+    // would miss a body painted in a different colour.
+    assert_eq!(
+        buffer[(x + 1, y)].style().fg,
+        Some(border),
+        "the message takes the border colour: {:?}",
+        row(y)
+    );
+    border
+}
+
+#[test]
+fn a_success_toast_is_green_and_an_error_toast_is_red() {
+    let mut app = test_app();
+    app.toast = Some((
+        "✓ Refreshed 3 models from gateway".to_string(),
+        Instant::now(),
+    ));
+    assert_eq!(
+        toast_border_color(&app, "Refreshed 3 models from gateway"),
+        Color::Green,
+        "a ✓ prefix means success"
+    );
+
+    app.toast = Some(("✗ Gateway refused: 401".to_string(), Instant::now()));
+    assert_eq!(
+        toast_border_color(&app, "Gateway refused: 401"),
+        Color::Red,
+        "anything else is a failure"
+    );
+}
+
+#[test]
+fn the_effort_modal_marks_the_current_level() {
+    let mut app = test_app();
+    let options = EFFORT_LEVELS.to_vec();
+    let selected = options.iter().position(|level| *level == "high").unwrap();
+    app.modal = Some(ModalSelection::Effort {
+        model: "fake-model".to_string(),
+        options,
+        selected,
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String { (0..90).map(|x| buffer[(x, y)].symbol()).collect() };
+    let rows: Vec<String> = (0..24).map(row).collect();
+
+    for level in EFFORT_LEVELS {
+        // A row is `❯ level` or `  level`, padded to the box width; the trailing
+        // space keeps `high` from matching the `highx` row.
+        assert!(
+            rows.iter().any(|line| line.contains(&format!("  {level} "))
+                || line.contains(&format!("❯ {level} "))),
+            "every level is offered, {level} is missing: {rows:?}"
+        );
+    }
+
+    let prefix = "❯ high ";
+    let y = rows
+        .iter()
+        .position(|line| line.contains(prefix))
+        .expect("the current level carries the cursor");
+    // Two cells of cursor glyph, then the level name.
+    let start = rows[y][..rows[y].find(prefix).unwrap()].chars().count() as u16 + 2;
+    let style = buffer[(start, y as u16)].style();
+    assert_eq!(style.fg, Some(Color::Green), "{:?}", rows[y]);
+    assert!(
+        style.add_modifier.contains(Modifier::BOLD),
+        "the selected level is emphasised: {:?}",
+        rows[y]
+    );
+
+    // The cursor must not repaint every row.
+    let below = buffer[(start, y as u16 + 1)].style();
+    assert_eq!(
+        below.fg,
+        Some(Color::White),
+        "an unselected level keeps the default colour: {:?}",
+        rows[y + 1]
+    );
+    assert!(
+        !below.add_modifier.contains(Modifier::BOLD),
+        "only the current level is emphasised: {:?}",
+        rows[y + 1]
+    );
+}
+
+#[test]
+fn the_session_modal_highlights_the_selected_row() {
+    let mut app = test_app();
+    let rows: Vec<String> = (0..20).map(|index| format!("session-{index:02}")).collect();
+    app.modal = Some(ModalSelection::Session { rows, selected: 0 });
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String { (0..90).map(|x| buffer[(x, y)].symbol()).collect() };
+    let rows: Vec<String> = (0..24).map(row).collect();
+
+    assert!(
+        rows.iter().any(|line| line.contains("Select Session")),
+        "the box names itself: {rows:?}"
+    );
+    let y = rows
+        .iter()
+        .position(|line| line.contains("session-00"))
+        .expect("the first session is drawn");
+    let start = rows[y][..rows[y].find("session-00").unwrap()]
+        .chars()
+        .count() as u16;
+    assert_eq!(
+        buffer[(start, y as u16)].style().bg,
+        Some(Color::Yellow),
+        "the selected row has a background, not only a glyph: {:?}",
+        rows[y]
+    );
+    assert_ne!(
+        buffer[(start, y as u16 + 1)].style().bg,
+        Some(Color::Yellow),
+        "only the selected row is highlighted: {:?}",
+        rows[y + 1]
+    );
+    assert!(
+        !rows.iter().any(|line| line.contains("session-19")),
+        "a list longer than the box is clipped, not drawn over the frame: {rows:?}"
+    );
+}
+
+#[test]
+fn the_at_popup_tags_folders_and_files() {
+    let mut app = test_app();
+    app.input.insert_str("@src");
+
+    let text = screen_of(&app);
+    assert!(text.contains("[folder]"), "no folder candidate: {text}");
+    assert!(text.contains("[file]"), "no file candidate: {text}");
+}
+
+#[test]
+fn the_session_line_shows_title_and_state() {
+    let mut app = test_app();
+    app.session_title = Some("port the loader".to_string());
+    app.status = AgentState::ExecutingTool("read_file".to_string());
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..24)
+        .map(|y| (0..90).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect();
+
+    let line = rows
+        .iter()
+        .find(|line| line.contains("port the loader"))
+        .expect("the session title keeps its row");
+    assert!(line.contains("read_file"), "the tool is named: {line:?}");
+    const ORBS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    assert!(
+        ORBS.iter().any(|glyph| line.contains(glyph)),
+        "the working orb sits beside the state: {line:?}"
+    );
 }
