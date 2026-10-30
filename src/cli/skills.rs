@@ -1,17 +1,18 @@
 //! Shared skill catalogue used by the TUI `/skills` command.
 //!
 //! Read-only views only: `list` reports the winning copy and the roots that
-//! shadow it, `path` reports the roots in precedence order.
+//! shadow it, `show` prints one body, `path` reports the roots in precedence
+//! order.
 
 use std::path::{Path, PathBuf};
 
 use crate::agent::skills::SkillManager;
+use crate::cli::memory;
 
 /// One skill, as `list` shows it: the winning copy and the roots behind it.
 pub struct SkillRow {
     pub name: String,
     pub description: String,
-    pub path: PathBuf,
     pub root: PathBuf,
     /// Later roots holding a copy of the same name; the first root wins.
     pub shadowed: Vec<PathBuf>,
@@ -38,7 +39,6 @@ pub fn list_report_with_home(workspace: &Path, home: Option<&Path>) -> SkillsRep
                 None => skills.push(SkillRow {
                     name: skill.name,
                     description: skill.description,
-                    path: skill.path,
                     root: root.to_path_buf(),
                     shadowed: Vec::new(),
                 }),
@@ -77,6 +77,36 @@ pub fn render_list(report: &SkillsReport) -> String {
 
 pub fn render_paths(workspace: &Path) -> String {
     render_paths_with_home(workspace, crate::home::dir().as_deref())
+}
+
+/// The winning `SKILL.md` of one skill, cut like a memory file so a body
+/// cannot flood the screen. An unknown name is an error, never a blank page.
+pub fn render_show(workspace: &Path, name: &str) -> Result<String, String> {
+    render_show_with_home(workspace, crate::home::dir().as_deref(), name)
+}
+
+/// Testable core: `home` is injected so tests never read the real one.
+pub fn render_show_with_home(
+    workspace: &Path,
+    home: Option<&Path>,
+    name: &str,
+) -> Result<String, String> {
+    let path = SkillManager::with_home(workspace, home)
+        .list_skills()
+        .into_iter()
+        .find(|skill| skill.name == name)
+        .map(|skill| skill.path)
+        .ok_or_else(|| format!("No skill named {name}."))?;
+    let file = memory::read_memory_file(&path)
+        .ok_or_else(|| format!("Cannot read {} for {name}.", display_path(&path)))?;
+
+    let mut text = format!("## {name}\n{}\n\n{}", display_path(&path), file.content);
+    if file.truncated {
+        let shown = file.content.lines().count();
+        let more = file.total_lines.saturating_sub(shown);
+        text.push_str(&format!("\n... truncated ({more} more lines)"));
+    }
+    Ok(text)
 }
 
 /// Testable core: `home` is injected so tests never read the real one.

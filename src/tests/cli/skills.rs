@@ -94,6 +94,57 @@ fn an_empty_report_says_so_and_lists_the_roots() {
 }
 
 #[test]
+fn render_show_finds_the_winning_copy_and_errors_on_an_unknown_name() {
+    let (_temp, workspace, home) = fixture();
+    write_skill(
+        &home.join(".agents/skills/shared"),
+        "only",
+        "A shared skill.",
+    );
+
+    let text =
+        render_show_with_home(&workspace, Some(&home), "only").expect("a skill in a later root");
+    assert!(text.starts_with("## only"), "{text}");
+    assert!(text.contains("body"), "{text}");
+
+    let err = render_show_with_home(&workspace, Some(&home), "nope").unwrap_err();
+    assert!(err.contains("nope"), "the error names the skill: {err}");
+}
+
+#[test]
+fn render_show_truncates_a_long_body_and_names_the_dropped_lines() {
+    let (_temp, workspace, home) = fixture();
+    let dir = workspace.join(".seavx/skills/big");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body: String = (0..600)
+        .map(|index| format!("line {index} {}\n", "x".repeat(80)))
+        .collect();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: big\ndescription: Big.\n---\n{body}"),
+    )
+    .unwrap();
+
+    let text = render_show_with_home(&workspace, Some(&home), "big").expect("the winner");
+    assert!(
+        text.contains(&dir.join("SKILL.md").display().to_string()),
+        "{text}"
+    );
+    assert!(text.contains("line 0 "), "{text}");
+    assert!(!text.contains("line 599 "), "the tail is dropped: {text}");
+
+    let marker = text.find("... truncated (").expect("a truncation marker");
+    let more: usize = text[marker..]
+        .trim_start_matches("... truncated (")
+        .trim_end_matches(" more lines)")
+        .parse()
+        .unwrap();
+    // Three header lines (heading, path, blank) sit above the body.
+    let shown = text[..marker].lines().count() - 3;
+    assert_eq!(more, 604 - shown, "the marker names the dropped line count");
+}
+
+#[test]
 fn render_paths_lists_the_roots_in_precedence_order() {
     let (_temp, workspace, home) = fixture();
     std::fs::create_dir_all(workspace.join("skills")).unwrap();

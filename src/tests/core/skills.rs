@@ -53,6 +53,17 @@ fn the_hidden_project_dir_shadows_the_open_one() {
             .join(".seavx/skills/seavx-shadow-probe/SKILL.md"),
         "the hidden project dir wins, and the open one is not listed twice"
     );
+    let listed: Vec<_> = manager
+        .list_skills()
+        .into_iter()
+        .filter(|skill| skill.name == "seavx-shadow-probe")
+        .collect();
+    assert_eq!(listed.len(), 1, "the open copy is not listed twice");
+    assert_eq!(
+        listed[0].path,
+        temp.path()
+            .join(".seavx/skills/seavx-shadow-probe/SKILL.md")
+    );
 }
 
 #[test]

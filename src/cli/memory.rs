@@ -90,8 +90,9 @@ pub fn build_report_with_home(workspace: &Path, home: Option<&Path>) -> MemoryRe
 }
 
 /// Read one candidate, capping it at [`MAX_LINES`] lines or [`MAX_BYTES`]
-/// bytes without splitting a UTF-8 character.
-fn read_memory_file(path: &Path) -> Option<MemoryFile> {
+/// bytes without splitting a UTF-8 character. Shared with `/skills show`, so
+/// a skill body and a memory file are cut by the same rule.
+pub(crate) fn read_memory_file(path: &Path) -> Option<MemoryFile> {
     if !path.exists() {
         return None;
     }

@@ -432,15 +432,9 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
                     app.push_notice(skills::render_list(&skills::list_report(workspace)));
                 }
                 SkillsAction::Path => app.push_notice(skills::render_paths(workspace)),
-                SkillsAction::Show(name) => {
-                    let report = skills::list_report(workspace);
-                    match report.skills.iter().find(|row| row.name == name) {
-                        Some(row) => {
-                            app.push_notice(format!("{}: {}", row.name, row.path.display()))
-                        }
-                        None => app.push_notice(format!("No skill named {name}.")),
-                    }
-                }
+                SkillsAction::Show(name) => match skills::render_show(workspace, &name) {
+                    Ok(text) | Err(text) => app.push_notice(text),
+                },
                 // Disk writes land in their own commits; say so instead of a no-op.
                 SkillsAction::Add(dir) => app.push_notice(format!(
                     "Installing {} is not available yet.",
