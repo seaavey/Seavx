@@ -163,7 +163,9 @@ pub fn render_text(report: &MemoryReport, view: MemoryView) -> String {
             ".seavx/USER.md",
         ));
     }
-    if matches!(view, MemoryView::All | MemoryView::Skills) {
+    // Skills are not memory: `show` answers "what does the agent remember",
+    // and a catalogue of installed skills pushed that off the screen.
+    if matches!(view, MemoryView::Skills) {
         sections.push(render_skills(report));
     }
     if matches!(view, MemoryView::Path) {
@@ -197,6 +199,15 @@ fn render_file_section(heading: &str, file: Option<&MemoryFile>, hint: &str) -> 
     text
 }
 
+/// First sentence of a skill description, capped, so one skill is one row.
+fn one_line(description: &str) -> String {
+    let first = description.split(". ").next().unwrap_or(description).trim();
+    match first.char_indices().nth(100) {
+        Some((cut, _)) => format!("{}…", first[..cut].trim_end()),
+        None => first.to_string(),
+    }
+}
+
 fn render_skills(report: &MemoryReport) -> String {
     let mut text = String::from("## Installed skills");
     if report.skills.is_empty() {
@@ -207,7 +218,7 @@ fn render_skills(report: &MemoryReport) -> String {
         text.push_str(&format!(
             "\n- {}: {} ({})",
             skill.name,
-            skill.description,
+            one_line(&skill.description),
             display_path(&skill.path)
         ));
     }

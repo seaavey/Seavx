@@ -39,3 +39,34 @@ fn renders_missing_guidance_and_view_filters() {
     assert!(project.contains("Project memory"));
     assert!(!project.contains("Installed skills"));
 }
+
+#[test]
+fn show_reports_memory_only_and_the_skills_view_keeps_one_row_per_skill() {
+    let temp = tempdir().unwrap();
+    let mut report = build_report_with_home(temp.path(), None);
+    report.skills = vec![SkillSummary {
+        name: "demo".to_string(),
+        description: format!(
+            "{}. Second sentence that must not reach the screen.",
+            "word ".repeat(40)
+        ),
+        path: temp.path().join("demo/SKILL.md"),
+    }];
+
+    // `show` answers what the agent remembers; the catalogue would push it off screen.
+    let all = render_text(&report, MemoryView::All);
+    assert!(!all.contains("Installed skills"), "{all}");
+
+    let skills = render_text(&report, MemoryView::Skills);
+    let rows: Vec<&str> = skills
+        .lines()
+        .filter(|line| line.starts_with("- demo:"))
+        .collect();
+    assert_eq!(rows.len(), 1, "one skill, one row: {skills}");
+    assert!(
+        rows[0].contains('…'),
+        "a long description is cut: {}",
+        rows[0]
+    );
+    assert!(!skills.contains("Second sentence"), "{skills}");
+}
