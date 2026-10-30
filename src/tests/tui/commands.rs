@@ -1182,10 +1182,11 @@ fn test_counts_come_from_cargos_summary_or_are_unavailable() {
         (None, None, None, None)
     );
 
-    // The process status decides the verdict, never the text.
+    // The process status decides the verdict, never the text. Assert the
+    // verdict line: the counts line can say "failed" or "passed" either way.
     let passed = test_report("cargo test", Some(0), output, false);
     assert!(
-        passed.contains("passed") && passed.contains("passed 9"),
+        passed.contains("`cargo test` passed (exit 0)") && passed.contains("passed 9"),
         "{passed}"
     );
     let failed = test_report(
@@ -1194,7 +1195,10 @@ fn test_counts_come_from_cargos_summary_or_are_unavailable() {
         "test result: ok. 1 passed; 0 failed",
         false,
     );
-    assert!(failed.contains("failed"), "{failed}");
+    assert!(
+        failed.contains("`cargo test` failed (exit 101)"),
+        "a non-zero exit is never a pass: {failed}"
+    );
     let unknown = test_report("cargo test", Some(0), output, true);
     assert!(unknown.contains("counts unavailable"), "{unknown}");
 }
