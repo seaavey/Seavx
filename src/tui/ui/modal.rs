@@ -1,6 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     widgets::Clear,
 };
 
@@ -9,6 +10,15 @@ use crate::tui::app::{App, ModalSelection};
 mod effort;
 mod model;
 mod session;
+
+/// Cursor look for a selectable list: a background, not just a colour, so it
+/// survives a terminal font that has no `❯` glyph.
+pub(super) fn cursor() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
 
 pub(super) fn render(app: &App, area: Rect, frame: &mut Frame, millis: u128) {
     let Some(modal) = app.modal.as_ref() else {

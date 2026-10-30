@@ -1,10 +1,11 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     widgets::{Block, Borders, List, ListItem, ListState},
 };
 
+use super::cursor;
 use crate::tui::app::App;
 
 pub(super) fn render(
@@ -65,14 +66,7 @@ pub(super) fn render(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
-        // A background, not just a color: the cursor must survive a
-        // font that has no ❯ glyph.
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(cursor())
         .highlight_symbol("❯ ");
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);

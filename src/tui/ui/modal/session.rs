@@ -1,9 +1,11 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     widgets::{Block, Borders, List, ListItem, ListState},
 };
+
+use super::cursor;
 
 pub(super) fn render(area: Rect, frame: &mut Frame, rows: &[String], selected: usize) {
     // Same as the model picker: a long list scrolls with the cursor.
@@ -19,12 +21,7 @@ pub(super) fn render(area: Rect, frame: &mut Frame, rows: &[String], selected: u
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(cursor())
         .highlight_symbol("❯ ");
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
