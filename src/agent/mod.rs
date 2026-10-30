@@ -4,6 +4,7 @@ pub mod budget;
 pub mod cancel;
 pub mod engine;
 pub mod events;
+pub mod git_review;
 pub mod models;
 pub mod patch;
 pub mod permissions;
