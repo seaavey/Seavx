@@ -65,6 +65,10 @@ fn render_list_keeps_one_line_per_skill() {
     let rows: Vec<&str> = text.lines().filter(|line| line.starts_with("- ")).collect();
     assert_eq!(rows.len(), 2, "{text}");
     assert!(
+        rows[0].starts_with("- alpha:") && rows[1].starts_with("- beta:"),
+        "the list is sorted, not in filesystem order: {text}"
+    );
+    assert!(
         rows[1].contains('…'),
         "a long description is capped: {text}"
     );
