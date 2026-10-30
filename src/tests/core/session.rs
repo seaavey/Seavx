@@ -2489,3 +2489,58 @@ fn a_v5_database_fixture_migrates_to_v6_and_keeps_a_pending_question() {
     assert_eq!(store.goal("ws", 1).unwrap().tasks.len(), 1);
     assert_eq!(store.load(1).unwrap().messages.len(), 1);
 }
+
+/// A database a real 0.1.2 binary wrote: `seavx run "say the fixture line"`
+/// against a local OpenAI-compatible endpoint, so the schema, the payload
+/// format and the rows are that release's, not a rebuild of today's.
+const V012_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/tests/fixtures/sessions-v0.1.2.db"
+);
+
+#[test]
+fn a_real_v0_1_2_database_migrates_to_v6_and_accepts_new_rows() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    std::fs::copy(V012_FIXTURE, &path).unwrap();
+
+    let before: u32 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(before, 2, "the fixture is the 0.1.2 schema");
+
+    let store = SessionStore::open_at(&path).expect("the 0.1.2 file opens");
+    let after: u32 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, SCHEMA_VERSION);
+
+    let workspace: String = store
+        .connection
+        .query_row("SELECT workspace FROM sessions WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let session = store.load(1).expect("the 0.1.2 session survives");
+    assert!(session.slug.starts_with("svx-"), "{}", session.slug);
+    assert_eq!(session.model.as_deref(), Some("fixture-model"));
+    assert_eq!(session.payload_format, "genai-chat-v1");
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].status, MessageStatus::Complete);
+    assert!(session.messages[0].payload.contains("say the fixture line"));
+    assert!(session.messages[1].payload.contains("fixture reply"));
+    assert!(
+        store
+            .list(&workspace)
+            .unwrap()
+            .iter()
+            .any(|row| row.id == 1),
+        "the migrated session still lists"
+    );
+
+    // Writable after the upgrade: the point of a migration.
+    store.record_user(1, "after the upgrade").unwrap();
+    assert_eq!(store.load(1).unwrap().messages.len(), 3);
+}
