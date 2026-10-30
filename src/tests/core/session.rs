@@ -1,8 +1,9 @@
 use crate::agent::events::{AgentEvent, FailureKind, SUMMARY_LIMIT, ToolEvent, ToolStatus};
 use crate::session::{
     CriterionState, GoalState, INTERRUPTED_RESULT, LoadedSession, MessageStatus, NewEvent,
-    PAYLOAD_FORMAT, RESUME_BUDGET_BYTES, SCHEMA_VERSION, SessionError, SessionStore, StoredMessage,
-    TaskState, TurnState, WRITE_BUDGET, export_json, render_text, replay,
+    PAYLOAD_FORMAT, QuestionKind, QuestionState, RESUME_BUDGET_BYTES, SCHEMA_VERSION, SessionError,
+    SessionStore, StoredMessage, TaskState, TurnState, WRITE_BUDGET, export_json, render_text,
+    replay,
 };
 use genai::chat::{ChatMessage, MessageContent, ToolCall, ToolResponse};
 
@@ -416,6 +417,7 @@ fn loaded(messages: Vec<StoredMessage>) -> LoadedSession {
         messages,
         total_tokens: 0,
         prompt_tokens: 0,
+        pending_calls: Vec::new(),
     }
 }
 
@@ -1487,7 +1489,7 @@ fn only_lifecycle_events_are_durable_and_they_map_to_their_rows() {
 }
 
 #[test]
-fn a_v2_database_fixture_migrates_to_v4_and_keeps_its_messages() {
+fn a_v2_database_fixture_migrates_to_current_schema_and_keeps_its_messages() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("sessions.db");
     let user = serde_json::to_string(&ChatMessage::user("old prompt")).unwrap();
@@ -1521,7 +1523,10 @@ fn a_v2_database_fixture_migrates_to_v4_and_keeps_its_messages() {
         .connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4, "a v2 file lands on the current schema");
+    assert_eq!(
+        version, SCHEMA_VERSION,
+        "a v2 file lands on the current schema"
+    );
 
     let payloads: Vec<String> = store
         .connection()
@@ -1590,7 +1595,7 @@ CREATE INDEX agent_events_session_seq ON agent_events(session_id, seq);
 ";
 
 #[test]
-fn a_v3_database_fixture_migrates_to_v4_and_preserves_messages_and_event_order() {
+fn a_v3_database_fixture_migrates_through_v5_and_preserves_messages_and_event_order() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("sessions.db");
     let user = serde_json::to_string(&ChatMessage::user("old prompt")).unwrap();
@@ -1631,7 +1636,7 @@ fn a_v3_database_fixture_migrates_to_v4_and_preserves_messages_and_event_order()
         .connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, SCHEMA_VERSION);
 
     // Transcript bytes and ids are untouched.
     let payloads: Vec<String> = store
@@ -1925,4 +1930,181 @@ fn a_draft_objective_can_be_edited_and_an_active_one_cannot() {
         "an approved goal is not editable"
     );
     assert_eq!(store.goal("ws", id).unwrap().objective, "second wording");
+}
+
+#[test]
+fn pending_question_and_asked_event_commit_atomically() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let id = {
+        let store = SessionStore::open_at(&path).unwrap();
+        let session = store.create("ws", None, Some("asking")).unwrap();
+        store
+            .ask_question(
+                "ws",
+                Some(session),
+                1,
+                "call-1",
+                "Which file should I change?",
+                QuestionKind::Single,
+                &["a.rs".to_string(), "b.rs".to_string()],
+            )
+            .unwrap()
+    };
+
+    let store = SessionStore::open_at(&path).unwrap();
+    let question = store.question("ws", id).unwrap();
+    assert_eq!(question.state, QuestionState::Pending);
+    assert_eq!(question.tool_call_id, "call-1");
+    assert_eq!(
+        question.options,
+        vec!["a.rs".to_string(), "b.rs".to_string()]
+    );
+
+    let kinds: Vec<String> = store
+        .connection
+        .prepare("SELECT kind FROM agent_events WHERE kind = 'question'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(kinds.len(), 1, "exactly one question_asked event");
+}
+
+#[test]
+fn question_text_and_options_are_redacted_and_capped_at_4_kib_total() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let session = store.create("ws", None, None).unwrap();
+
+    let id = store
+        .ask_question(
+            "ws",
+            Some(session),
+            1,
+            "call-1",
+            "token sk-live-abcdef please",
+            QuestionKind::Text,
+            &[],
+        )
+        .unwrap();
+    let stored = store.question("ws", id).unwrap();
+    assert!(
+        !stored.question.contains("sk-live-abcdef"),
+        "{}",
+        stored.question
+    );
+
+    let oversized = "x".repeat(4096);
+    let error = store
+        .ask_question(
+            "ws",
+            Some(session),
+            1,
+            "call-2",
+            &oversized,
+            QuestionKind::Text,
+            &["y".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("4096"), "{error}");
+}
+
+#[test]
+fn answer_skip_and_cancel_are_idempotent_and_correlated() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let session = store.create("ws", None, None).unwrap();
+    let id = store
+        .ask_question(
+            "ws",
+            Some(session),
+            2,
+            "call-9",
+            "Which one?",
+            QuestionKind::Text,
+            &[],
+        )
+        .unwrap();
+
+    store
+        .resolve_question("ws", id, QuestionState::Answered, "the second one")
+        .unwrap();
+    // A retried turn must not append a second decision or change the answer.
+    let again = store
+        .resolve_question("ws", id, QuestionState::Skipped, "")
+        .unwrap();
+    assert_eq!(again.state, QuestionState::Answered);
+    assert_eq!(again.answer, "the second one");
+
+    let events: Vec<String> = store
+        .connection
+        .prepare("SELECT status FROM agent_events WHERE kind = 'question' ORDER BY seq")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        events,
+        vec!["pending", "answered"],
+        "one decision, one event"
+    );
+
+    // Another workspace cannot touch it.
+    assert!(
+        store
+            .resolve_question("/other", id, QuestionState::Cancelled, "")
+            .is_err()
+    );
+}
+
+#[test]
+fn a_pending_question_is_not_repaired_as_interrupted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let session = store.create("ws", None, None).unwrap();
+    let called = ChatMessage::assistant(MessageContent::from_tool_calls(vec![
+        tool_call("call-asked", "ask_user"),
+        tool_call("call-other", "read_file"),
+    ]));
+    store
+        .record_message(session, &called, MessageStatus::Complete)
+        .unwrap();
+    store
+        .ask_question(
+            "ws",
+            Some(session),
+            1,
+            "call-asked",
+            "Which?",
+            QuestionKind::Text,
+            &[],
+        )
+        .unwrap();
+
+    let loaded = store.load(session).unwrap();
+    assert_eq!(loaded.pending_calls, vec!["call-asked".to_string()]);
+    let outcome = replay(&loaded);
+    let repaired: Vec<String> = outcome
+        .synthetic
+        .iter()
+        .filter_map(|message| {
+            message
+                .content
+                .tool_responses()
+                .first()
+                .map(|response| response.call_id.clone())
+        })
+        .collect();
+    assert!(
+        repaired.iter().any(|call| call == "call-other"),
+        "an unrelated missing call still repairs: {repaired:?}"
+    );
+    assert!(
+        !repaired.iter().any(|call| call == "call-asked"),
+        "a question waiting on the user is not an interruption: {repaired:?}"
+    );
 }

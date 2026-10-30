@@ -18,7 +18,8 @@ pub const PAYLOAD_FORMAT: &str = "genai-chat-v1";
 /// adds it to a v1 file and names every existing row. 3 added the `agent_events`
 /// ledger, which every older file gains in the same transaction. 4 added goals,
 /// criteria and tasks, and rebuilt that ledger so a goal can own its events.
-pub const SCHEMA_VERSION: u32 = 4;
+/// 5 added resumable clarification questions and the `question` event kind.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Total budget for one write: three attempts, 100 ms and 200 ms waits.
 pub const WRITE_BUDGET: Duration = Duration::from_secs(5);
@@ -96,6 +97,78 @@ pub struct StoredMessage {
     pub payload: String,
     pub created_at: i64,
 }
+
+/// What kind of answer a question takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionKind {
+    Single,
+    Multi,
+    Text,
+}
+
+impl QuestionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Multi => "multi",
+            Self::Text => "text",
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        match text {
+            "multi" => Self::Multi,
+            "text" => Self::Text,
+            _ => Self::Single,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionState {
+    Pending,
+    Answered,
+    Skipped,
+    Cancelled,
+}
+
+impl QuestionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Answered => "answered",
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        match text {
+            "answered" => Self::Answered,
+            "skipped" => Self::Skipped,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// One durable clarification: what was asked, of whom, and what came back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestion {
+    pub id: i64,
+    pub workspace: String,
+    pub session_id: Option<i64>,
+    pub turn_id: u64,
+    pub tool_call_id: String,
+    pub question: String,
+    pub kind: QuestionKind,
+    pub options: Vec<String>,
+    pub state: QuestionState,
+    pub answer: String,
+}
+
+/// Total bytes a question and its option labels may occupy.
+pub const QUESTION_LIMIT: usize = 4096;
 
 /// A goal's place in its lifecycle. Only the user moves it to `active`; only
 /// evidence moves it to `completed`.
@@ -277,6 +350,53 @@ impl Goal {
     }
 }
 
+fn question_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingQuestion> {
+    let options: String = row.get(7)?;
+    Ok(PendingQuestion {
+        id: row.get(0)?,
+        workspace: row.get(1)?,
+        session_id: row.get(2)?,
+        turn_id: row.get::<_, i64>(3)? as u64,
+        tool_call_id: row.get(4)?,
+        question: row.get(5)?,
+        kind: QuestionKind::parse(&row.get::<_, String>(6)?),
+        options: serde_json::from_str(&options).unwrap_or_default(),
+        state: QuestionState::parse(&row.get::<_, String>(8)?),
+        answer: row.get(9)?,
+    })
+}
+
+/// A question event shares the session's sequence when it has one.
+fn log_question_event(
+    connection: &Connection,
+    session: Option<i64>,
+    question: i64,
+    status: &str,
+    tool_call_id: &str,
+    summary: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let seq: i64 = match session {
+        Some(session) => connection.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM agent_events WHERE session_id = ?1",
+            [session],
+            |row| row.get(0),
+        )?,
+        None => connection.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM agent_events WHERE session_id IS NULL",
+            [],
+            |row| row.get(0),
+        )?,
+    };
+    connection.execute(
+        "INSERT INTO agent_events(session_id, goal_id, seq, turn_id, kind, status, tool_call_id, summary, created_at)
+         VALUES (?1, NULL, ?2, 0, 'question', ?3, ?4, ?5, ?6)",
+        params![session, seq, status, tool_call_id, summary, now],
+    )?;
+    let _ = question;
+    Ok(())
+}
+
 /// The goal's state, after proving it belongs to this workspace.
 fn goal_state(connection: &Connection, workspace: &str, id: i64) -> rusqlite::Result<GoalState> {
     let state: Option<String> = connection
@@ -455,6 +575,8 @@ pub struct LoadedSession {
     pub messages: Vec<StoredMessage>,
     pub total_tokens: i64,
     pub prompt_tokens: i64,
+    /// Calls still waiting on a human answer: replay must not repair them.
+    pub pending_calls: Vec<String>,
 }
 
 /// Stored payload bytes a resume may replay before it starts cutting turns.
@@ -580,6 +702,8 @@ pub fn replay(session: &LoadedSession) -> ReplayOutcome {
         let missing: Vec<String> = call_ids_of(&message)
             .into_iter()
             .filter(|call_id| !answered.contains(call_id))
+            // A question still waiting on the user is not an interruption.
+            .filter(|call_id| !session.pending_calls.contains(call_id))
             .collect();
         history.push(message);
         for call_id in missing {
@@ -806,7 +930,7 @@ CREATE TABLE IF NOT EXISTS agent_events(
     goal_id INTEGER REFERENCES goals(id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
     turn_id INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('tool','turn','goal','task')),
+    kind TEXT NOT NULL CHECK(kind IN ('tool','turn','goal','task','question')),
     status TEXT NOT NULL,
     failure TEXT,
     tool_call_id TEXT,
@@ -840,6 +964,23 @@ CREATE TABLE IF NOT EXISTS goal_criteria(
     waiver_reason TEXT,
     UNIQUE(goal_id, position)
 );
+CREATE TABLE IF NOT EXISTS pending_questions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id INTEGER NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('single','multi','text')),
+    options TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL CHECK(state IN ('pending','answered','skipped','cancelled')),
+    answer TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    UNIQUE(workspace, session_id, turn_id, tool_call_id)
+);
+CREATE INDEX IF NOT EXISTS pending_questions_open
+    ON pending_questions(workspace, state);
 CREATE TABLE IF NOT EXISTS agent_tasks(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
@@ -1010,7 +1151,16 @@ impl SessionStore {
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<_, _>>()?;
         drop(ledger_columns);
-        if !ledger_names.iter().any(|name| name == "goal_id") {
+        // v5 admits a `question` event; the CHECK is part of the table, so the
+        // rebuild runs again for a v4 file.
+        let ledger_ddl: String = transaction.query_row(
+            "SELECT COALESCE((SELECT sql FROM sqlite_master WHERE name = 'agent_events'), '')",
+            [],
+            |row| row.get(0),
+        )?;
+        let needs_rebuild = !ledger_names.iter().any(|name| name == "goal_id")
+            || !ledger_ddl.contains("'question'");
+        if needs_rebuild {
             transaction.execute_batch(
                 "ALTER TABLE agent_events RENAME TO agent_events_v3;
                  CREATE TABLE agent_events(
@@ -1019,7 +1169,8 @@ impl SessionStore {
                      goal_id INTEGER REFERENCES goals(id) ON DELETE CASCADE,
                      seq INTEGER NOT NULL,
                      turn_id INTEGER NOT NULL,
-                     kind TEXT NOT NULL CHECK(kind IN ('tool','turn','goal','task')),
+                     kind TEXT NOT NULL
+                         CHECK(kind IN ('tool','turn','goal','task','question')),
                      status TEXT NOT NULL,
                      failure TEXT,
                      tool_call_id TEXT,
@@ -1254,6 +1405,7 @@ impl SessionStore {
             messages,
             total_tokens: header.5,
             prompt_tokens: header.6,
+            pending_calls: self.pending_call_ids(id).unwrap_or_default(),
         })
     }
 
@@ -1420,6 +1572,159 @@ impl SessionStore {
                 }
             }
         })
+    }
+
+    // ---- clarifying questions ---------------------------------------------
+
+    /// Persist a pending question and its `question_asked` event together, before
+    /// anyone is shown it.
+    // The argument list is the question's own shape; a struct with one caller
+    // would only rename the same fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ask_question(
+        &self,
+        workspace: &str,
+        session: Option<i64>,
+        turn_id: u64,
+        tool_call_id: &str,
+        question: &str,
+        kind: QuestionKind,
+        options: &[String],
+    ) -> Result<i64, SessionError> {
+        let text = crate::agent::security::redact(question);
+        let labels: Vec<String> = options
+            .iter()
+            .map(|option| crate::agent::security::redact(option))
+            .collect();
+        let total = text.len() + labels.iter().map(String::len).sum::<usize>();
+        if total > QUESTION_LIMIT {
+            return Err(SessionError::Refused(format!(
+                "the question and its options exceed {QUESTION_LIMIT} bytes"
+            )));
+        }
+        let options_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
+        let now = crate::util::epoch_secs() as i64;
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let created = (|| {
+                connection.execute(
+                    "INSERT INTO pending_questions
+                     (workspace, session_id, turn_id, tool_call_id, question, kind, options, state, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+                    params![
+                        workspace,
+                        session,
+                        turn_id as i64,
+                        tool_call_id,
+                        text,
+                        kind.as_str(),
+                        options_json,
+                        now
+                    ],
+                )?;
+                let id = connection.last_insert_rowid();
+                log_question_event(connection, session, id, "pending", tool_call_id, &text, now)?;
+                Ok(id)
+            })();
+            finish(connection, created)
+        })?
+    }
+
+    pub fn question(&self, workspace: &str, id: i64) -> Result<PendingQuestion, SessionError> {
+        let question = self
+            .connection
+            .query_row(
+                "SELECT id, workspace, session_id, turn_id, tool_call_id, question, kind,
+                        options, state, answer
+                 FROM pending_questions WHERE id = ?1 AND workspace = ?2",
+                params![id, workspace],
+                question_row,
+            )
+            .optional()?
+            .ok_or(SessionError::Unknown(id))?;
+        Ok(question)
+    }
+
+    /// Every unanswered question of this workspace, oldest first.
+    pub fn open_questions(&self, workspace: &str) -> Result<Vec<PendingQuestion>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, workspace, session_id, turn_id, tool_call_id, question, kind,
+                    options, state, answer
+             FROM pending_questions WHERE workspace = ?1 AND state = 'pending'
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map([workspace], question_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Resolve once. A second call returns the stored outcome and writes nothing,
+    /// so a retried turn cannot append a second decision.
+    pub fn resolve_question(
+        &self,
+        workspace: &str,
+        id: i64,
+        state: QuestionState,
+        answer: &str,
+    ) -> Result<PendingQuestion, SessionError> {
+        if state == QuestionState::Pending {
+            return Err(SessionError::Refused(
+                "a question cannot resolve to pending".to_string(),
+            ));
+        }
+        let answer = crate::agent::events::bounded(
+            &crate::agent::security::redact(answer),
+            crate::agent::events::SUMMARY_LIMIT,
+        );
+        let now = crate::util::epoch_secs() as i64;
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let resolved = (|| {
+                let current: Option<String> = connection
+                    .query_row(
+                        "SELECT state FROM pending_questions WHERE id = ?1 AND workspace = ?2",
+                        params![id, workspace],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(current) = current else {
+                    return Err(SessionError::Unknown(id));
+                };
+                if current != "pending" {
+                    // Already resolved: the stored outcome stands, no new event.
+                    return Ok(());
+                }
+                connection.execute(
+                    "UPDATE pending_questions SET state = ?3, answer = ?4, resolved_at = ?5
+                     WHERE id = ?1 AND workspace = ?2",
+                    params![id, workspace, state.as_str(), answer, now],
+                )?;
+                let session: Option<i64> = connection.query_row(
+                    "SELECT session_id FROM pending_questions WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                let call: String = connection.query_row(
+                    "SELECT tool_call_id FROM pending_questions WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                log_question_event(connection, session, id, state.as_str(), &call, &answer, now)?;
+                Ok(())
+            })();
+            finish(connection, resolved)
+        })??;
+        self.question(workspace, id)
+    }
+
+    /// Calls of this session whose question is still open: replay must not
+    /// invent an interrupted result for them.
+    pub fn pending_call_ids(&self, session: i64) -> Result<Vec<String>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT tool_call_id FROM pending_questions
+             WHERE session_id = ?1 AND state = 'pending'",
+        )?;
+        let rows = statement.query_map([session], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     // ---- goals -------------------------------------------------------------

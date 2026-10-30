@@ -447,6 +447,7 @@ fn loaded(messages: Vec<crate::session::StoredMessage>) -> crate::session::Loade
         messages,
         total_tokens: 42,
         prompt_tokens: 21,
+        pending_calls: Vec::new(),
     }
 }
 
