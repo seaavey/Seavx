@@ -1,6 +1,8 @@
 use tokio::sync::mpsc;
 
 use super::App;
+use super::worker::run_agent_worker;
+use crate::agent::engine::AgentMode;
 use crate::tui::event::{Action, AgentState};
 
 /// Load one session off the event loop and hand it back as an action. Both
@@ -51,6 +53,18 @@ pub(super) fn apply_command_effect(
             });
         }
         CommandEffect::RunSessions { number } => spawn_session_resume(app, tx, number),
+        CommandEffect::RunAsk { question } => {
+            // The same submit path a typed prompt takes; only the mode differs,
+            // and it never touches `app.mode`.
+            if let Some(request) = app.submit_turn(&question) {
+                let is_first_turn = app.session_title.is_none();
+                let context = app.session_context.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    run_agent_worker(request, tx, is_first_turn, AgentMode::Ask, context).await;
+                });
+            }
+        }
         CommandEffect::OpenSessionPicker => match crate::session::SessionStore::open() {
             Ok(store) => {
                 app.open_session_picker(&store);

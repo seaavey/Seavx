@@ -77,6 +77,12 @@ fn every_registry_entry_parses_to_a_handled_command() {
                 mode: AgentMode::Plan,
             },
         ),
+        (
+            "/ask",
+            SlashCommand::Ask {
+                question: String::new(),
+            },
+        ),
         ("/clear", SlashCommand::Clear),
         ("/new", SlashCommand::Clear),
         ("/help", SlashCommand::Help),
@@ -134,6 +140,7 @@ fn every_handled_command_appears_in_the_registry() {
         "/compact",
         "/config",
         "/plan",
+        "/ask",
         "/clear",
         "/new",
         "/help",
@@ -177,6 +184,9 @@ fn every_handled_command_appears_in_the_registry() {
         SlashCommand::Plan {
             mode: AgentMode::Build,
         },
+        SlashCommand::Ask {
+            question: String::new(),
+        },
         SlashCommand::Clear,
         SlashCommand::Help,
         SlashCommand::Init,
@@ -215,6 +225,7 @@ fn the_palette_is_the_table() {
             "/compact",
             "/config",
             "/plan",
+            "/ask",
             "/clear",
             "/new",
             "/help",
@@ -745,4 +756,73 @@ fn status_never_reports_an_idle_app_as_busy_and_works_mid_turn() {
     let last = app.segments.last().expect("a notice was pushed");
     let text = format!("{last:?}");
     assert!(text.contains("thinking"), "{text}");
+}
+
+#[test]
+fn ask_parses_a_question_and_rejects_an_empty_one() {
+    assert_eq!(
+        parse("/ask where is the loop"),
+        Some(SlashCommand::Ask {
+            question: "where is the loop".to_string()
+        })
+    );
+    assert_eq!(
+        parse("/ask   multiple   spaces  "),
+        Some(SlashCommand::Ask {
+            question: "multiple spaces".to_string()
+        })
+    );
+    // A bare `/ask` still parses, so the registry guard holds; it answers with
+    // its usage instead of reading as a typo.
+    assert_eq!(
+        parse("/ask"),
+        Some(SlashCommand::Ask {
+            question: String::new()
+        })
+    );
+
+    let mut app = crate::tui::app::test_app();
+    assert_eq!(
+        execute(
+            &mut app,
+            SlashCommand::Ask {
+                question: String::new()
+            }
+        ),
+        CommandEffect::Handled
+    );
+    assert!(
+        app.segments
+            .iter()
+            .any(|segment| format!("{segment:?}").contains("/ask <question>")),
+        "the bare command explains itself: {:?}",
+        app.segments
+    );
+}
+
+#[test]
+fn ask_submits_one_turn_without_changing_the_standing_mode() {
+    let mut app = crate::tui::app::test_app();
+    app.mode = crate::agent::engine::AgentMode::Plan;
+
+    let effect = execute(
+        &mut app,
+        SlashCommand::Ask {
+            question: "why is it like this".to_string(),
+        },
+    );
+    assert_eq!(
+        effect,
+        CommandEffect::RunAsk {
+            question: "why is it like this".to_string()
+        }
+    );
+    assert_eq!(
+        app.mode,
+        crate::agent::engine::AgentMode::Plan,
+        "the standing mode survives an ask turn"
+    );
+    // The turn itself is submitted by the effect handler in the event loop, so
+    // here only the effect and the untouched mode are observable.
+    assert_eq!(app.turn_id, 0);
 }

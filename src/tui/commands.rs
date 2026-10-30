@@ -19,6 +19,7 @@ pub enum CommandId {
     Compact,
     Config,
     Plan,
+    Ask,
     Clear,
     New,
     Help,
@@ -67,6 +68,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "/plan [on|off]",
         summary: "Enter plan mode (read-only)",
         id: CommandId::Plan,
+    },
+    CommandSpec {
+        name: "/ask",
+        usage: "/ask <question>",
+        summary: "Ask a question about the code, read-only, one turn",
+        id: CommandId::Ask,
     },
     CommandSpec {
         name: "/clear",
@@ -161,6 +168,10 @@ pub enum SlashCommand {
     Plan {
         mode: AgentMode,
     },
+    /// One read-only question about the code. The standing mode is untouched.
+    Ask {
+        question: String,
+    },
     Help,
     Exit,
     Init,
@@ -204,15 +215,32 @@ pub enum SkillsAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandEffect {
     Handled,
-    SkillsAdd { dir: std::path::PathBuf },
-    SkillsRemove { name: String },
-    SkillsFetch { url: String, names: Vec<String> },
+    SkillsAdd {
+        dir: std::path::PathBuf,
+    },
+    SkillsRemove {
+        name: String,
+    },
+    SkillsFetch {
+        url: String,
+        names: Vec<String>,
+    },
     Quit,
     OpenModelPicker,
-    RunDoctor { offline: bool },
-    RunCompact { instructions: Option<String> },
+    RunDoctor {
+        offline: bool,
+    },
+    RunCompact {
+        instructions: Option<String>,
+    },
     RunUndo,
-    RunSessions { number: u32 },
+    RunSessions {
+        number: u32,
+    },
+    /// Submit one Ask turn; the worker runs it in `AgentMode::Ask`.
+    RunAsk {
+        question: String,
+    },
     OpenSessionPicker,
 }
 
@@ -265,6 +293,11 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         CommandId::Init => no_args(&args, trimmed, SlashCommand::Init),
         CommandId::Undo => no_args(&args, trimmed, SlashCommand::Undo),
         CommandId::Status => no_args(&args, trimmed, SlashCommand::Status),
+        // The whole remainder is the question. A bare `/ask` still parses: it
+        // answers with its usage instead of reading as a typo.
+        CommandId::Ask => SlashCommand::Ask {
+            question: args.join(" "),
+        },
         CommandId::Compact => SlashCommand::Compact {
             instructions: (!args.is_empty()).then(|| args.join(" ")),
         },
@@ -515,6 +548,14 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },
         SlashCommand::Undo => CommandEffect::RunUndo,
+        SlashCommand::Ask { question } => {
+            if question.trim().is_empty() {
+                app.push_notice("Usage: /ask <question>".to_string());
+                CommandEffect::Handled
+            } else {
+                CommandEffect::RunAsk { question }
+            }
+        }
         SlashCommand::Sessions { index } => match index {
             // The picker is the list: no number means "let me choose".
             None => CommandEffect::OpenSessionPicker,
