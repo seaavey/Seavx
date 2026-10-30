@@ -66,6 +66,30 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             app.persistence_error = Some(message.clone());
             app.push_notice(message);
         }
+        Action::ReviewResolved(result) => {
+            app.status = AgentState::Idle;
+            match result {
+                Ok(input) => {
+                    let task = crate::agent::git_review::task_text(&input);
+                    if let Some(request) = app.submit_turn(&task) {
+                        let is_first_turn = app.session_title.is_none();
+                        let context = app.session_context.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            crate::tui::app::worker::run_agent_worker(
+                                request,
+                                tx,
+                                is_first_turn,
+                                crate::agent::engine::AgentMode::Review,
+                                context,
+                            )
+                            .await;
+                        });
+                    }
+                }
+                Err(error) => app.push_notice(format!("Review could not start: {error}")),
+            }
+        }
         Action::AgentTool(tool) => {
             let label = format!("{}({})", tool.name, tool.summary);
             match tool.status {

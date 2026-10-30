@@ -83,6 +83,12 @@ fn every_registry_entry_parses_to_a_handled_command() {
                 question: String::new(),
             },
         ),
+        (
+            "/review",
+            SlashCommand::Review {
+                target: crate::agent::git_review::ReviewTarget::WorkingTree,
+            },
+        ),
         ("/clear", SlashCommand::Clear),
         ("/new", SlashCommand::Clear),
         ("/help", SlashCommand::Help),
@@ -141,6 +147,7 @@ fn every_handled_command_appears_in_the_registry() {
         "/config",
         "/plan",
         "/ask",
+        "/review",
         "/clear",
         "/new",
         "/help",
@@ -187,6 +194,9 @@ fn every_handled_command_appears_in_the_registry() {
         SlashCommand::Ask {
             question: String::new(),
         },
+        SlashCommand::Review {
+            target: crate::agent::git_review::ReviewTarget::WorkingTree,
+        },
         SlashCommand::Clear,
         SlashCommand::Help,
         SlashCommand::Init,
@@ -226,6 +236,7 @@ fn the_palette_is_the_table() {
             "/config",
             "/plan",
             "/ask",
+            "/review",
             "/clear",
             "/new",
             "/help",
@@ -825,4 +836,72 @@ fn ask_submits_one_turn_without_changing_the_standing_mode() {
     // The turn itself is submitted by the effect handler in the event loop, so
     // here only the effect and the untouched mode are observable.
     assert_eq!(app.turn_id, 0);
+}
+
+#[test]
+fn review_parses_its_targets_and_refuses_bad_forms() {
+    use crate::agent::git_review::ReviewTarget;
+
+    assert_eq!(
+        parse("/review"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::WorkingTree
+        })
+    );
+    assert_eq!(
+        parse("/review working-tree"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::WorkingTree
+        })
+    );
+    assert_eq!(
+        parse("/review staged"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::Staged
+        })
+    );
+    assert_eq!(
+        parse("/review commit HEAD~1"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::Commit("HEAD~1".to_string())
+        })
+    );
+    assert_eq!(
+        parse("/review base main"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::Base("main".to_string())
+        })
+    );
+    for bad in [
+        "/review commit",
+        "/review base",
+        "/review nope",
+        "/review staged now",
+    ] {
+        assert!(
+            matches!(parse(bad), Some(SlashCommand::Unknown(_))),
+            "{bad} must be refused, not run"
+        );
+    }
+}
+
+#[test]
+fn review_asks_for_a_resolution_without_touching_the_standing_mode() {
+    use crate::agent::git_review::ReviewTarget;
+
+    let mut app = crate::tui::app::test_app();
+    app.mode = crate::agent::engine::AgentMode::Build;
+    let effect = execute(
+        &mut app,
+        SlashCommand::Review {
+            target: ReviewTarget::Staged,
+        },
+    );
+    assert_eq!(
+        effect,
+        CommandEffect::RunReview {
+            target: ReviewTarget::Staged
+        }
+    );
+    assert_eq!(app.mode, crate::agent::engine::AgentMode::Build);
 }

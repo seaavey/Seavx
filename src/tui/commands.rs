@@ -20,6 +20,7 @@ pub enum CommandId {
     Config,
     Plan,
     Ask,
+    Review,
     Clear,
     New,
     Help,
@@ -74,6 +75,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "/ask <question>",
         summary: "Ask a question about the code, read-only, one turn",
         id: CommandId::Ask,
+    },
+    CommandSpec {
+        name: "/review",
+        usage: "/review [working-tree|staged|commit <ref>|base <ref>]",
+        summary: "Review a git target and report findings, read-only",
+        id: CommandId::Review,
     },
     CommandSpec {
         name: "/clear",
@@ -172,6 +179,10 @@ pub enum SlashCommand {
     Ask {
         question: String,
     },
+    /// One read-only review of a resolved Git target.
+    Review {
+        target: crate::agent::git_review::ReviewTarget,
+    },
     Help,
     Exit,
     Init,
@@ -241,6 +252,10 @@ pub enum CommandEffect {
     RunAsk {
         question: String,
     },
+    /// Resolve the target off the UI thread, then run one Review turn.
+    RunReview {
+        target: crate::agent::git_review::ReviewTarget,
+    },
     OpenSessionPicker,
 }
 
@@ -293,6 +308,11 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         CommandId::Init => no_args(&args, trimmed, SlashCommand::Init),
         CommandId::Undo => no_args(&args, trimmed, SlashCommand::Undo),
         CommandId::Status => no_args(&args, trimmed, SlashCommand::Status),
+        // Empty arguments mean `working-tree`; a bad form is a typo, not a run.
+        CommandId::Review => match crate::agent::git_review::parse_target(&args) {
+            Ok(target) => SlashCommand::Review { target },
+            Err(_) => SlashCommand::Unknown(trimmed.to_string()),
+        },
         // The whole remainder is the question. A bare `/ask` still parses: it
         // answers with its usage instead of reading as a typo.
         CommandId::Ask => SlashCommand::Ask {
@@ -548,6 +568,7 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },
         SlashCommand::Undo => CommandEffect::RunUndo,
+        SlashCommand::Review { target } => CommandEffect::RunReview { target },
         SlashCommand::Ask { question } => {
             if question.trim().is_empty() {
                 app.push_notice("Usage: /ask <question>".to_string());

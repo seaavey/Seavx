@@ -8,6 +8,8 @@ pub enum Action {
     Key(KeyEvent),
     Mouse(MouseEvent),
     AgentToken(String),
+    /// `/review` finished resolving a Git target off the UI thread.
+    ReviewResolved(Result<crate::agent::git_review::ReviewInput, String>),
     AgentThinking(String),
     AgentTool(crate::agent::events::ToolEvent),
     /// The session the title belongs to: a late answer must not rename the

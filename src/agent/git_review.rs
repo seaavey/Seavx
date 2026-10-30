@@ -28,6 +28,18 @@ pub enum ReviewTarget {
     Base(String),
 }
 
+impl ReviewTarget {
+    /// How the target is named in a report.
+    pub fn label(&self) -> String {
+        match self {
+            Self::WorkingTree => "working-tree".to_string(),
+            Self::Staged => "staged".to_string(),
+            Self::Commit(reference) => format!("commit {reference}"),
+            Self::Base(reference) => format!("base {reference}"),
+        }
+    }
+}
+
 /// Only the documented forms; anything else is refused before Git runs.
 pub fn parse_target(args: &[&str]) -> Result<ReviewTarget, String> {
     match args {
@@ -43,7 +55,8 @@ pub fn parse_target(args: &[&str]) -> Result<ReviewTarget, String> {
 /// and the bodies fit the cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewInput {
-    pub target: ReviewTarget,
+    /// The target as it is named in a report.
+    pub target: String,
     pub diff: String,
     pub changed_paths: Vec<String>,
     pub withheld_paths: usize,
@@ -188,8 +201,35 @@ pub fn resolve(
         diff,
         changed_paths: visible,
         withheld_paths: withheld,
-        target: target.clone(),
+        target: target.label(),
     })
+}
+
+/// The task text one review turn is given: the target, the paths, and the diff.
+/// Only what the resolver already filtered can reach it.
+pub fn task_text(input: &ReviewInput) -> String {
+    if input.is_empty {
+        return format!(
+            "Review the {} changes.\n\nThere are no changes in this target, so there is nothing to review. Report that plainly, name the target, and state the review's limits.",
+            input.target
+        );
+    }
+    let mut text = format!("Review the {} changes.\n\nChanged paths:\n", input.target);
+    for path in &input.changed_paths {
+        text.push_str("- ");
+        text.push_str(path);
+        text.push('\n');
+    }
+    if input.withheld_paths > 0 {
+        text.push_str(&format!(
+            "\n{} path(s) were withheld for security; their contents are not available to you.\n",
+            input.withheld_paths
+        ));
+    }
+    text.push_str("\nDiff:\n```diff\n");
+    text.push_str(&input.diff);
+    text.push_str("\n```\n");
+    text
 }
 
 /// Resolve a ref to a full commit id, or refuse. `--end-of-options` keeps a ref

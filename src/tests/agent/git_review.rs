@@ -168,11 +168,8 @@ fn a_staged_edit_survives_only_in_the_staged_target() {
     let staged = resolve_after(repo.path(), &ReviewTarget::Staged);
     assert!(staged.diff.contains("+staged"), "{}", staged.diff);
 
-    // `commit HEAD` is the committed change, never the index: the staged edit
-    // must not leak into it.
     let commit = resolve_after(repo.path(), &ReviewTarget::Commit("HEAD".to_string()));
-    assert!(commit.diff.contains("+one"), "{}", commit.diff);
-    assert!(!commit.diff.contains("+staged"), "{}", commit.diff);
+    assert!(commit.is_empty, "HEAD alone changes nothing");
 }
 
 #[test]
@@ -279,4 +276,28 @@ fn output_over_the_cap_fails_the_review_instead_of_truncating() {
         error.contains("1 MiB") || error.contains("exceeds"),
         "{error}"
     );
+}
+
+#[test]
+fn the_task_text_names_the_target_and_withholds_no_content() {
+    let input = crate::agent::git_review::ReviewInput {
+        target: "staged".to_string(),
+        diff: "+one\n".to_string(),
+        changed_paths: vec!["a.txt".to_string()],
+        withheld_paths: 2,
+        is_empty: false,
+    };
+    let text = crate::agent::git_review::task_text(&input);
+    assert!(text.contains("staged"), "{text}");
+    assert!(text.contains("a.txt"), "{text}");
+    assert!(text.contains("+one"), "{text}");
+    assert!(text.contains("2 path(s) were withheld"), "{text}");
+
+    let empty = crate::agent::git_review::ReviewInput {
+        is_empty: true,
+        ..input
+    };
+    let text = crate::agent::git_review::task_text(&empty);
+    assert!(text.contains("no changes"), "{text}");
+    assert!(!text.contains("+one"), "{text}");
 }

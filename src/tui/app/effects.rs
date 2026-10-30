@@ -53,6 +53,17 @@ pub(super) fn apply_command_effect(
             });
         }
         CommandEffect::RunSessions { number } => spawn_session_resume(app, tx, number),
+        CommandEffect::RunReview { target } => {
+            // Git work never runs on the event loop; the resolved input comes
+            // back as an action, and only then is a turn submitted.
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let security = crate::agent::security::WorkspaceSecurity::new(".");
+                let result = crate::agent::git_review::resolve(security.root(), &target, &security);
+                let _ = tx.send(Action::ReviewResolved(result));
+            });
+        }
         CommandEffect::RunAsk { question } => {
             // The same submit path a typed prompt takes; only the mode differs,
             // and it never touches `app.mode`.
