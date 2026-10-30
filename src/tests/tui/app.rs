@@ -1095,3 +1095,67 @@ fn a_failed_refresh_stops_the_spinner_and_says_why() {
     let (toast, _) = app.toast.clone().expect("the failure is reported");
     assert!(toast.contains("429"), "{toast}");
 }
+
+// ---- Phase 3 key handling ----
+
+#[tokio::test]
+async fn escape_closes_the_ghost_then_the_popup_then_cancels_the_turn() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.history.clear();
+    app.history.push("open @src/main.rs".to_string());
+    app.input.insert_str("open @src");
+    app.refresh_ghost();
+    app.status = crate::tui::event::AgentState::Thinking;
+
+    assert!(app.ghost_active(), "the suggestion grew a dimmed tail");
+    assert!(app.popup_open(), "the @ popup is showing");
+
+    let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert!(
+        !app.ghost_active(),
+        "the first Esc takes back the suggestion only"
+    );
+    assert!(app.popup_open(), "the popup survives that press");
+    assert!(!app.cancel.is_cancelled(), "the turn keeps running");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert!(!app.popup_open(), "the second Esc closes the popup");
+    assert!(!app.cancel.is_cancelled(), "and still does not cancel");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert!(app.cancel.is_cancelled(), "the third Esc cancels");
+    assert_eq!(
+        app.status,
+        crate::tui::event::AgentState::Thinking,
+        "cancelling is the worker's business, not the key handler's"
+    );
+
+    let mut idle = test_app();
+    super::keys::handle(&mut idle, esc(), &tx).await;
+    assert!(
+        idle.should_quit,
+        "Esc with nothing open and nothing running quits"
+    );
+}
+
+#[tokio::test]
+async fn a_modal_owns_the_arrow_keys_before_the_transcript_does() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.modal = picker(&["alpha", "beta", "gamma"], 1);
+    app.scroll = 7;
+
+    // Regression: the transcript must not scroll while a picker owns the arrows.
+    super::keys::handle(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        &tx,
+    )
+    .await;
+
+    assert_eq!(selected_of(&app), 0, "Up moves the picker selection");
+    assert_eq!(app.scroll, 7, "and leaves the transcript where it was");
+}
