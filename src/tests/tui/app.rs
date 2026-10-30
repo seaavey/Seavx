@@ -968,6 +968,172 @@ fn the_resume_picker_lists_this_workspaces_sessions_newest_first() {
 }
 
 #[test]
+fn the_session_verbs_run_off_thread_against_the_store() {
+    use crate::tui::app::effects::run_sessions_op;
+    use crate::tui::commands::SessionsOp;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let workspace = "ws";
+    let source = store.create(workspace, None, Some("parser work")).unwrap();
+    for text in ["first", "second", "third"] {
+        store
+            .record_message(
+                source,
+                &genai::chat::ChatMessage::user(text),
+                crate::session::MessageStatus::Complete,
+            )
+            .unwrap();
+    }
+    let other = store.create(workspace, None, Some("unrelated")).unwrap();
+    store
+        .record_message(
+            other,
+            &genai::chat::ChatMessage::user("nothing here"),
+            crate::session::MessageStatus::Complete,
+        )
+        .unwrap();
+    // A session in another workspace, so the scope is proven, not assumed.
+    let elsewhere = store
+        .create("/other", None, Some("elsewhere notes"))
+        .unwrap();
+    store
+        .record_message(
+            elsewhere,
+            &genai::chat::ChatMessage::user("elsewhere body"),
+            crate::session::MessageStatus::Complete,
+        )
+        .unwrap();
+    let before: Vec<i64> = store
+        .list_with_archived(workspace, true)
+        .unwrap()
+        .iter()
+        .map(|summary| summary.id)
+        .collect();
+
+    // Fork the source at an explicit completed boundary.
+    let report = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Fork {
+            id: source.to_string(),
+            at: Some(2),
+        },
+    )
+    .expect("forks");
+    assert!(report.starts_with("Forked session"), "{report}");
+    let forked = store
+        .list_with_archived(workspace, true)
+        .unwrap()
+        .into_iter()
+        .find(|summary| !before.contains(&summary.id))
+        .expect("the fork is a new session of this workspace");
+    assert_eq!(
+        store.load(forked.id).unwrap().messages.len(),
+        2,
+        "the prefix"
+    );
+    assert_eq!(
+        store.load(source).unwrap().messages.len(),
+        3,
+        "the source keeps every message"
+    );
+
+    // Archive hides a row from the default list and search, never deletes it.
+    let report = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Archive {
+            id: other.to_string(),
+            archived: true,
+        },
+    )
+    .expect("archives");
+    assert!(report.contains("hidden, not deleted"), "{report}");
+    let listed = crate::cli::sessions::list_text(&store, workspace, false).unwrap();
+    assert!(!listed.contains("unrelated"), "{listed}");
+    assert!(
+        crate::cli::sessions::list_text(&store, workspace, true)
+            .unwrap()
+            .contains("unrelated")
+    );
+    assert_eq!(store.load(other).unwrap().messages.len(), 1, "no data loss");
+
+    // Search is literal, workspace-scoped and archived-aware.
+    let found = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Search {
+            query: "parser work".to_string(),
+            all: false,
+        },
+    )
+    .expect("searches");
+    assert!(found.contains("parser work"), "{found}");
+    let archived_hit = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Search {
+            query: "nothing here".to_string(),
+            all: false,
+        },
+    )
+    .expect("searches");
+    assert!(
+        archived_hit.contains("No session matches"),
+        "{archived_hit}"
+    );
+    let with_archived = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Search {
+            query: "nothing here".to_string(),
+            all: true,
+        },
+    )
+    .expect("searches");
+    assert!(with_archived.contains("unrelated"), "{with_archived}");
+    assert!(
+        run_sessions_op(
+            &store,
+            workspace,
+            SessionsOp::Search {
+                query: "elsewhere".to_string(),
+                all: true,
+            },
+        )
+        .expect("searches")
+        .contains("No session matches"),
+        "another workspace's session is never a hit"
+    );
+    assert!(
+        run_sessions_op(
+            &store,
+            "/other",
+            SessionsOp::Search {
+                query: "elsewhere".to_string(),
+                all: true,
+            },
+        )
+        .expect("searches")
+        .contains("elsewhere notes"),
+        "its own workspace still finds it"
+    );
+
+    // A key that is not in the store is refused with what to do next.
+    let unknown = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Archive {
+            id: "svx-missing".to_string(),
+            archived: true,
+        },
+    )
+    .unwrap_err();
+    assert!(unknown.contains("/sessions"), "{unknown}");
+}
+
+#[test]
 fn quitting_is_never_blocked_by_a_pending_permission() {
     let mut app = test_app();
     let (reply, _answer) = tokio::sync::oneshot::channel();

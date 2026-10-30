@@ -77,6 +77,9 @@ pub enum Action {
     },
     /// The result of a `/test` run, or the reason it did not run.
     TestDone(String),
+    /// A `/sessions fork|archive|unarchive|find` finished: its report, or why
+    /// it did nothing.
+    SessionsOpDone(String),
     PermissionAsk {
         request: crate::agent::permissions::PermissionRequest,
         reply: tokio::sync::oneshot::Sender<crate::agent::permissions::Answer>,

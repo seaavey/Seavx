@@ -325,6 +325,10 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             app.status = AgentState::Idle;
             app.push_notice(report);
         }
+        Action::SessionsOpDone(report) => {
+            app.status = AgentState::Idle;
+            app.push_notice(report);
+        }
         Action::UndoDone(result) => {
             app.status = AgentState::Idle;
             match result {

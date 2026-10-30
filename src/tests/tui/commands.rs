@@ -682,6 +682,71 @@ fn sessions_opens_the_picker_and_resumes_a_number() {
 }
 
 #[test]
+fn the_session_verbs_parse_into_one_op_command() {
+    let fork = |id: &str, at: Option<i64>| SlashCommand::SessionsOp {
+        op: SessionsOp::Fork {
+            id: id.to_string(),
+            at,
+        },
+    };
+    let archive = |id: &str, archived: bool| SlashCommand::SessionsOp {
+        op: SessionsOp::Archive {
+            id: id.to_string(),
+            archived,
+        },
+    };
+
+    assert_eq!(parse("/sessions fork 3"), Some(fork("3", None)));
+    assert_eq!(parse("/sessions fork 3 --at 2"), Some(fork("3", Some(2))));
+    assert_eq!(parse("/sessions archive 3"), Some(archive("3", true)));
+    assert_eq!(parse("/sessions unarchive 3"), Some(archive("3", false)));
+    // The query is every remaining word, with `--all` read off its tail.
+    assert_eq!(
+        parse("/sessions find a b --all"),
+        Some(SlashCommand::SessionsOp {
+            op: SessionsOp::Search {
+                query: "a b".to_string(),
+                all: true,
+            },
+        })
+    );
+    assert_eq!(
+        parse("/sessions find a b"),
+        Some(SlashCommand::SessionsOp {
+            op: SessionsOp::Search {
+                query: "a b".to_string(),
+                all: false,
+            },
+        })
+    );
+
+    // A fork names its source and a real sequence: both forms are refused.
+    assert!(matches!(
+        parse("/sessions fork"),
+        Some(SlashCommand::Unknown(_))
+    ));
+    assert!(matches!(
+        parse("/sessions fork 3 --at 0"),
+        Some(SlashCommand::Unknown(_))
+    ));
+    assert!(matches!(
+        parse("/sessions find"),
+        Some(SlashCommand::Unknown(_))
+    ));
+
+    let mut app = crate::tui::app::test_app();
+    assert_eq!(
+        execute(&mut app, fork("3", Some(2))),
+        CommandEffect::RunSessionsOp {
+            op: SessionsOp::Fork {
+                id: "3".to_string(),
+                at: Some(2),
+            },
+        }
+    );
+}
+
+#[test]
 fn resuming_a_read_only_session_is_refused_with_the_reason() {
     let (_temp, store, workspace) = fixture_store();
     store

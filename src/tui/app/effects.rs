@@ -201,6 +201,55 @@ fn run_goal(
     }
 }
 
+/// Apply one `/sessions` verb that acts on a stored session instead of opening
+/// it. Every id is resolved once, and the store checks workspace ownership
+/// before it reads or writes anything.
+pub(super) fn run_sessions_op(
+    store: &crate::session::SessionStore,
+    workspace: &str,
+    op: crate::tui::commands::SessionsOp,
+) -> Result<String, String> {
+    use crate::tui::commands::SessionsOp;
+    let resolve = |key: &str| {
+        store.id_for(key).map_err(|error| match error {
+            crate::session::SessionError::UnknownKey(key) => {
+                format!("Unknown session {key}. Run /sessions to list them.")
+            }
+            other => other.to_string(),
+        })
+    };
+
+    match op {
+        SessionsOp::Fork { id, at } => {
+            let source = resolve(&id)?;
+            let fork = store
+                .fork(workspace, source, at)
+                .map_err(|error| error.to_string())?;
+            let forked = store.load(fork).map_err(|error| error.to_string())?;
+            Ok(format!(
+                "Forked session {source} into {} ({} messages).",
+                forked.slug,
+                forked.messages.len()
+            ))
+        }
+        SessionsOp::Archive { id, archived } => {
+            let id = resolve(&id)?;
+            store
+                .archive(workspace, id, archived)
+                .map_err(|error| error.to_string())?;
+            Ok(if archived {
+                format!("Archived session {id}. It is hidden, not deleted.")
+            } else {
+                format!("Unarchived session {id}.")
+            })
+        }
+        // The same bounded, literal, workspace-scoped search the CLI prints.
+        SessionsOp::Search { query, all } => {
+            crate::cli::sessions::search_text(store, workspace, &query, all)
+        }
+    }
+}
+
 /// The one line `/status` shows: the goal that holds this workspace, if any.
 fn live_goal_line(workspace: &str) -> Option<String> {
     let store = crate::session::SessionStore::open().ok()?;
@@ -295,6 +344,20 @@ pub(super) fn apply_command_effect(
             });
         }
         CommandEffect::RunSessions { number } => spawn_session_resume(app, tx, number),
+        CommandEffect::RunSessionsOp { op } => {
+            // Store work never runs on the event loop. A refusal is reported by
+            // the same notice as a success: the user needs the reason.
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            let workspace = crate::session::workspace_key();
+            tokio::task::spawn_blocking(move || {
+                let report = crate::session::SessionStore::open()
+                    .map_err(|error| error.to_string())
+                    .and_then(|store| run_sessions_op(&store, &workspace, op))
+                    .unwrap_or_else(|error| error);
+                let _ = tx.send(Action::SessionsOpDone(report));
+            });
+        }
         CommandEffect::RunGoal { action } => {
             let tx = tx.clone();
             let workspace = crate::session::workspace_key();

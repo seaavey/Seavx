@@ -29,6 +29,14 @@ pub enum GoalAction {
     Cancel(Option<i64>),
 }
 
+/// The session verbs that act on a stored session rather than open it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionsOp {
+    Fork { id: String, at: Option<i64> },
+    Archive { id: String, archived: bool },
+    Search { query: String, all: bool },
+}
+
 /// One command's identity, independent of how it is spelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandId {
@@ -179,8 +187,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/sessions",
-        usage: "/sessions [number]",
-        summary: "Pick a stored session, or resume one by its number",
+        usage: "/sessions [number] | fork <id> [--at <n>] | archive <id> | unarchive <id> | find <text> [--all]",
+        summary: "Pick a stored session, resume one, or fork, archive and search them",
         id: CommandId::Sessions,
     },
     CommandSpec {
@@ -236,6 +244,10 @@ pub enum SlashCommand {
     },
     /// Propose and, once permitted, run the workspace's test command.
     Test,
+    /// Fork, archive or search a stored session.
+    SessionsOp {
+        op: SessionsOp,
+    },
     /// Talk to the turn that is running; delivered at its next safe boundary.
     Steer {
         text: String,
@@ -338,6 +350,9 @@ pub enum CommandEffect {
     /// One goal operation, run against the store off the UI thread.
     RunGoal {
         action: GoalAction,
+    },
+    RunSessionsOp {
+        op: SessionsOp,
     },
     RunTest,
     /// Read the current goal's tasks.
@@ -482,6 +497,37 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         // One grammar for both spellings; `/resume` is the alias.
         CommandId::Sessions | CommandId::Resume => match args.as_slice() {
             [] => SlashCommand::Sessions { index: None },
+            ["fork", id] => SlashCommand::SessionsOp {
+                op: SessionsOp::Fork {
+                    id: (*id).to_string(),
+                    at: None,
+                },
+            },
+            ["fork", id, "--at", at] => match at.parse::<i64>() {
+                Ok(at) if at > 0 => SlashCommand::SessionsOp {
+                    op: SessionsOp::Fork {
+                        id: (*id).to_string(),
+                        at: Some(at),
+                    },
+                },
+                _ => SlashCommand::Unknown(trimmed.to_string()),
+            },
+            [verb @ ("archive" | "unarchive"), id] => SlashCommand::SessionsOp {
+                op: SessionsOp::Archive {
+                    id: (*id).to_string(),
+                    archived: *verb == "archive",
+                },
+            },
+            ["find", rest @ ..] if !rest.is_empty() => {
+                let query = rest.join(" ");
+                let (query, all) = match query.strip_suffix(" --all") {
+                    Some(query) => (query.to_string(), true),
+                    None => (query, false),
+                };
+                SlashCommand::SessionsOp {
+                    op: SessionsOp::Search { query, all },
+                }
+            }
             [number] => match number.parse::<u32>() {
                 Ok(number) if number > 0 => SlashCommand::Sessions {
                     index: Some(number),
@@ -911,6 +957,7 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
             }
             CommandEffect::Handled
         }
+        SlashCommand::SessionsOp { op } => CommandEffect::RunSessionsOp { op },
         SlashCommand::Test => CommandEffect::RunTest,
         SlashCommand::Sessions { index } => match index {
             // The picker is the list: no number means "let me choose".
