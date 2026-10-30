@@ -4,11 +4,6 @@
 //! shadow it, `show` prints one body, `path` reports the roots in precedence
 //! order.
 
-// The fetch side is wired to `/skills install` in the next task; until then
-// nothing outside the tests constructs it. `expect` turns into a build error
-// the moment the last item here is used, so this cannot rot.
-#![cfg_attr(not(test), expect(dead_code, reason = "wired by /skills install next"))]
-
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -217,6 +212,8 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
 /// One skill found in a fetched repository, before the owner picks it.
 pub struct Candidate {
     pub name: String,
+    // The picker shows this; `/skills install` is what fills it, next task.
+    #[cfg_attr(not(test), expect(dead_code, reason = "shown by /skills install next"))]
     pub description: String,
     pub source: PathBuf,
 }
@@ -255,6 +252,12 @@ impl Drop for Checkout {
 ///
 /// `git` does the fetch: one feature does not buy a dependency. A URL that is
 /// not a repository is an error; a repository with no skill is an empty list.
+// `/skills install` calls this next task; `expect` fails loudly once it does,
+// so the fetch cannot quietly rot.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by /skills install next")
+)]
 pub fn fetch(url: &str) -> Result<Fetched, String> {
     let checkout = Checkout {
         dir: std::env::temp_dir().join(format!(

@@ -644,7 +644,7 @@ fn the_skill_picker_lists_candidates_and_their_marks() {
     );
     assert!(text.contains("[ ] pdf"), "an unmarked row is blank: {text}");
     assert!(
-        text.contains("1/3 marked"),
+        text.contains("Install Skills 1/3"),
         "the title counts the marks: {text}"
     );
     assert!(text.contains("Draws a chart"), "{text}");

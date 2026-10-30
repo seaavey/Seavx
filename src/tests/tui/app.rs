@@ -1166,3 +1166,70 @@ async fn a_modal_owns_the_arrow_keys_before_the_transcript_does() {
     assert_eq!(selected_of(&app), 0, "Up moves the picker selection");
     assert_eq!(app.scroll, 7, "and leaves the transcript where it was");
 }
+
+fn skill_picker(selected: usize, marked: Vec<bool>) -> Option<ModalSelection> {
+    Some(ModalSelection::Skills {
+        names: ["pdf", "charts", "deploy"].map(str::to_string).to_vec(),
+        descriptions: vec![String::new(); 3],
+        selected,
+        marked,
+    })
+}
+
+#[tokio::test]
+async fn the_skill_picker_toggles_marks_and_installs_the_current_row() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.pending_skills = None;
+    app.modal = skill_picker(1, vec![false; 3]);
+
+    super::keys::handle(
+        &mut app,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        &tx,
+    )
+    .await;
+
+    match &app.modal {
+        Some(ModalSelection::Skills { marked, .. }) => assert_eq!(
+            marked,
+            &[false, true, false],
+            "Space marks the row under the cursor"
+        ),
+        other => panic!("the picker stays open after a toggle: {other:?}"),
+    }
+
+    super::keys::handle(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &tx,
+    )
+    .await;
+
+    assert!(app.modal.is_none(), "Enter closes the picker");
+    match rx.try_recv() {
+        Ok(Action::SkillsInstallMarked(indices)) => {
+            assert_eq!(indices, vec![1], "the marked row is what Enter installs")
+        }
+        other => panic!("Enter sends the pick: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn escape_closes_the_skill_picker_without_installing() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.pending_skills = None;
+    app.modal = skill_picker(0, vec![true, false, false]);
+
+    super::keys::handle(
+        &mut app,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &tx,
+    )
+    .await;
+
+    assert!(app.modal.is_none(), "Esc closes the picker");
+    assert!(app.pending_skills.is_none(), "and drops the checkout");
+    assert!(rx.try_recv().is_err(), "Esc installs nothing");
+}

@@ -33,8 +33,9 @@ pub(super) fn render(
         })
         .collect();
 
+    // 54 columns minus the borders: the long labels were clipped after "a all".
     let title = format!(
-        " Install Skills {}/{} marked · space toggle · a all · enter install · esc ",
+        " Install Skills {}/{} · space · a · enter · esc ",
         marked.iter().filter(|mark| **mark).count(),
         names.len()
     );
