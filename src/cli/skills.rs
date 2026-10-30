@@ -140,6 +140,73 @@ fn display_path(path: &Path) -> String {
     text.strip_prefix("./").unwrap_or(&text).to_string()
 }
 
+/// Install a skill from a local directory into the workspace's own root.
+///
+/// The name is the source directory's basename, because that is how the loader
+/// names skills. Nothing is overwritten: an existing destination is an error,
+/// and a symlink anywhere in the source is refused rather than followed, so an
+/// install can never copy files from outside the directory the user pointed at.
+pub fn install(workspace: &Path, source: &Path) -> Result<PathBuf, String> {
+    if !source.is_dir() {
+        return Err(format!("{} is not a directory.", source.display()));
+    }
+    if !source.join("SKILL.md").is_file() {
+        return Err(format!("{} has no SKILL.md.", source.display()));
+    }
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains("..")
+        || crate::util::is_skipped(&name)
+    {
+        return Err(format!("{name:?} is not a usable skill name."));
+    }
+
+    let destination = workspace.join(".seavx/skills").join(&name);
+    if destination.exists() {
+        return Err(format!("{} already exists.", destination.display()));
+    }
+
+    // A copy that fails halfway must not leave a half-installed skill behind.
+    if let Err(error) = copy_tree(source, &destination) {
+        let _ = std::fs::remove_dir_all(&destination);
+        return Err(error);
+    }
+    Ok(destination)
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(destination)
+        .map_err(|error| format!("Cannot create {}: {error}", destination.display()))?;
+
+    let entries = std::fs::read_dir(source)
+        .map_err(|error| format!("Cannot read {}: {error}", source.display()))?;
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("Cannot inspect {}: {error}", from.display()))?;
+        if kind.is_symlink() {
+            return Err(format!(
+                "{} is a symlink; refusing to copy it.",
+                from.display()
+            ));
+        }
+        if kind.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)
+                .map_err(|error| format!("Cannot copy {}: {error}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "../tests/cli/skills.rs"]
 mod tests;

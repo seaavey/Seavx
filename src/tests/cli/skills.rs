@@ -162,3 +162,80 @@ fn render_paths_lists_the_roots_in_precedence_order() {
         assert_eq!(*row, format!("- {} ({state})", root.display()));
     }
 }
+
+#[test]
+fn install_copies_the_whole_directory_and_the_skill_shows_up() {
+    let (_temp, workspace, home) = fixture();
+    let source = workspace.join("incoming/my-skill");
+    write_skill(
+        &workspace.join("incoming"),
+        "my-skill",
+        "An installed skill.",
+    );
+    std::fs::create_dir_all(source.join("scripts")).unwrap();
+    std::fs::write(source.join("scripts/run.sh"), "echo hi").unwrap();
+
+    let destination = install(&workspace, &source).unwrap();
+
+    assert_eq!(destination, workspace.join(".seavx/skills/my-skill"));
+    assert_eq!(
+        std::fs::read_to_string(destination.join("scripts/run.sh")).unwrap(),
+        "echo hi"
+    );
+    let report = list_report_with_home(&workspace, Some(&home));
+    assert!(
+        report.skills.iter().any(|row| row.name == "my-skill"),
+        "an installed skill is loadable: {:?}",
+        report
+            .skills
+            .iter()
+            .map(|row| &row.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn install_refuses_a_source_without_a_skill_file() {
+    let (_temp, workspace, _home) = fixture();
+    let source = workspace.join("incoming/empty");
+    std::fs::create_dir_all(&source).unwrap();
+
+    let error = install(&workspace, &source).unwrap_err();
+    assert!(error.contains("no SKILL.md"), "{error}");
+}
+
+#[test]
+fn install_refuses_to_overwrite_an_existing_skill() {
+    let (_temp, workspace, _home) = fixture();
+    let source = workspace.join("incoming/demo");
+    write_skill(&workspace.join("incoming"), "demo", "The new copy.");
+    let existing = workspace.join(".seavx/skills/demo");
+    write_skill(&workspace.join(".seavx/skills"), "demo", "The old copy.");
+
+    let error = install(&workspace, &source).unwrap_err();
+    assert!(error.contains("already exists"), "{error}");
+    let kept = std::fs::read_to_string(existing.join("SKILL.md")).unwrap();
+    assert!(kept.contains("The old copy."), "{kept}");
+}
+
+#[cfg(unix)]
+#[test]
+fn install_refuses_a_source_that_contains_a_symlink() {
+    let (_temp, workspace, _home) = fixture();
+    let source = workspace.join("incoming/linked");
+    write_skill(
+        &workspace.join("incoming"),
+        "linked",
+        "A skill with a link.",
+    );
+    let outside = workspace.join("outside.txt");
+    std::fs::write(&outside, "secret").unwrap();
+    std::os::unix::fs::symlink(&outside, source.join("leak.txt")).unwrap();
+
+    let error = install(&workspace, &source).unwrap_err();
+    assert!(error.contains("symlink"), "{error}");
+    assert!(
+        !workspace.join(".seavx/skills/linked").exists(),
+        "a refused install leaves nothing behind"
+    );
+}

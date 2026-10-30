@@ -194,6 +194,7 @@ pub enum SkillsAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandEffect {
     Handled,
+    SkillsAdd { dir: std::path::PathBuf },
     Quit,
     OpenModelPicker,
     RunDoctor { offline: bool },
@@ -430,22 +431,28 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
             match action {
                 SkillsAction::List => {
                     app.push_notice(skills::render_list(&skills::list_report(workspace)));
+                    CommandEffect::Handled
                 }
-                SkillsAction::Path => app.push_notice(skills::render_paths(workspace)),
-                SkillsAction::Show(name) => match skills::render_show(workspace, &name) {
-                    Ok(text) | Err(text) => app.push_notice(text),
-                },
-                // Disk writes land in their own commits; say so instead of a no-op.
-                SkillsAction::Add(dir) => app.push_notice(format!(
-                    "Installing {} is not available yet.",
-                    dir.display()
-                )),
-                SkillsAction::Remove { name, confirmed } => app.push_notice(format!(
-                    "Removing {name} is not available yet{}.",
-                    if confirmed { "" } else { "; --yes is required" }
-                )),
+                SkillsAction::Path => {
+                    app.push_notice(skills::render_paths(workspace));
+                    CommandEffect::Handled
+                }
+                SkillsAction::Show(name) => {
+                    match skills::render_show(workspace, &name) {
+                        Ok(text) | Err(text) => app.push_notice(text),
+                    }
+                    CommandEffect::Handled
+                }
+                // The copy runs off the UI thread; the notice comes back as an action.
+                SkillsAction::Add(dir) => CommandEffect::SkillsAdd { dir },
+                SkillsAction::Remove { name, confirmed } => {
+                    app.push_notice(format!(
+                        "Removing {name} is not available yet{}.",
+                        if confirmed { "" } else { "; --yes is required" }
+                    ));
+                    CommandEffect::Handled
+                }
             }
-            CommandEffect::Handled
         }
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },

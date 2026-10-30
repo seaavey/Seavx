@@ -39,6 +39,7 @@ pub enum Action {
         result: Result<crate::tui::compact::CompactResult, String>,
     },
     UndoDone(Result<Vec<std::path::PathBuf>, String>),
+    SkillsInstalled(Result<std::path::PathBuf, String>),
     /// `/sessions`: the numbered list, or the reason it could not be read.
     /// `/sessions <n>`: the session to open, or the refusal with its reason.
     SessionResume(Result<crate::session::LoadedSession, String>),
