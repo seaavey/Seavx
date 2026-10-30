@@ -123,6 +123,16 @@ seavx resume                 # list them and pick a number
 seavx resume svx-2f124b69    # same as sessions resume
 ```
 
+Skills have a CLI surface too; the interactive picker stays in the TUI (`/skills install <url>`):
+
+```bash
+seavx skills                          # every skill your roots can load, with the owning root
+seavx skills install https://github.com/anthropics/skills   # what that repository holds
+seavx skills install https://github.com/anthropics/skills pdf docx   # install two of them
+seavx skills add ../my-skill          # copy a local directory that has SKILL.md
+seavx skills remove pdf --yes         # immediate, refuses a symlinked copy
+```
+
 Retention: sessions are not pruned (roughly 1 KB per turn). To delete, stop
 Seavx and remove the database: `rm ~/.seavx/sessions.db*`. To back up, copy
 `sessions.db` with its `-wal` and `-shm` files while Seavx is closed, or run

@@ -66,7 +66,7 @@ pub fn render_list(report: &SkillsReport) -> String {
         text.push_str(&format!(
             "\n- {}: {} ({})",
             row.name,
-            one_line(&row.description),
+            first_sentence(&row.description),
             display_path(&row.root)
         ));
         if !row.shadowed.is_empty() {
@@ -129,7 +129,7 @@ fn render_roots(roots: &[PathBuf]) -> String {
 }
 
 /// First sentence of a description, capped, so one skill is one row.
-pub(crate) fn one_line(description: &str) -> String {
+pub(crate) fn first_sentence(description: &str) -> String {
     let first = description.split(". ").next().unwrap_or(description).trim();
     match first.char_indices().nth(100) {
         Some((cut, _)) => format!("{}…", first[..cut].trim_end()),
@@ -358,6 +358,116 @@ pub fn remove_with_home(
     std::fs::remove_dir_all(&dir)
         .map_err(|error| format!("Cannot remove {}: {error}", dir.display()))?;
     Ok(dir)
+}
+
+/// `seavx skills …`: the same functions the TUI command calls, on stdout.
+///
+/// The picker is a TUI affordance and stays there: from the shell you either
+/// name the skills you want or read the printed list and run it again.
+#[derive(clap::Subcommand, Debug)]
+pub enum SkillsCommand {
+    /// List the skills this workspace can load
+    List,
+    /// Print one skill's SKILL.md
+    Show {
+        /// Skill name, as `list` prints it
+        name: String,
+    },
+    /// Print the skill roots in precedence order
+    Path,
+    /// Copy a local directory that holds SKILL.md into .seavx/skills
+    Add {
+        /// Directory containing SKILL.md
+        dir: std::path::PathBuf,
+    },
+    /// Install skills from a git repository; without names it prints what the repository holds
+    Install {
+        /// Repository URL, cloned with `git clone --depth 1`
+        url: String,
+        /// Skill names to install; omit to list them instead
+        names: Vec<String>,
+    },
+    /// Delete the winning copy of a skill
+    Remove {
+        /// Skill name, as `list` prints it
+        name: String,
+        /// Required: the delete is immediate and irreversible
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+pub fn run(command: Option<SkillsCommand>) -> anyhow::Result<()> {
+    let workspace = std::env::current_dir()?;
+    match command.unwrap_or(SkillsCommand::List) {
+        SkillsCommand::List => println!("{}", render_list(&list_report(&workspace))),
+        SkillsCommand::Path => println!("{}", render_paths(&workspace)),
+        SkillsCommand::Show { name } => match render_show(&workspace, &name) {
+            Ok(text) => println!("{text}"),
+            Err(error) => anyhow::bail!(error),
+        },
+        SkillsCommand::Add { dir } => match install(&workspace, &dir) {
+            Ok(path) => println!("Installed skill at {}", path.display()),
+            Err(error) => anyhow::bail!(error),
+        },
+        SkillsCommand::Install { url, names } => {
+            let fetched = match fetch(&url) {
+                Ok(fetched) => fetched,
+                Err(error) => anyhow::bail!(error),
+            };
+            if fetched.candidates.is_empty() {
+                println!("No skills with a SKILL.md in that repository.");
+                return Ok(());
+            }
+            if names.is_empty() {
+                for candidate in &fetched.candidates {
+                    println!(
+                        "- {}: {}",
+                        candidate.name,
+                        super::skills::first_sentence(&candidate.description)
+                    );
+                }
+                println!(
+                    "\nInstall some by name: seavx skills install {} <name>...",
+                    url
+                );
+                return Ok(());
+            }
+            let mut failures = 0;
+            for name in &names {
+                match fetched
+                    .candidates
+                    .iter()
+                    .position(|candidate| &candidate.name == name)
+                {
+                    Some(index) => match fetched.install(&workspace, index) {
+                        Ok(path) => println!("installed {name} at {}", path.display()),
+                        Err(error) => {
+                            failures += 1;
+                            println!("refused {name}: {error}");
+                        }
+                    },
+                    None => {
+                        failures += 1;
+                        println!("refused {name}: not in this repository");
+                    }
+                }
+            }
+            if failures > 0 {
+                anyhow::bail!("{failures} of {} skill(s) were not installed", names.len());
+            }
+        }
+        SkillsCommand::Remove { name, yes } => {
+            if !yes {
+                anyhow::bail!("pass --yes to remove {name}: the delete is immediate");
+            }
+            match remove(&workspace, &name) {
+                Ok(path) => println!("Removed skill at {}", path.display()),
+                Err(error) => anyhow::bail!(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

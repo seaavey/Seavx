@@ -95,10 +95,38 @@ pub fn is_skipped(name: &str) -> bool {
 /// Value of a `key: value` line in a markdown-like document, quotes stripped.
 pub fn frontmatter_value(md: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}:");
-    md.lines()
-        .find_map(|line| line.trim().strip_prefix(&prefix))
-        .map(unquote)
-        .map(str::to_string)
+    let lines: Vec<&str> = md.lines().collect();
+    let index = lines
+        .iter()
+        .position(|line| line.trim().starts_with(&prefix))?;
+    let inline = lines[index]
+        .trim()
+        .strip_prefix(&prefix)
+        .unwrap_or("")
+        .trim();
+
+    // A YAML block scalar (`>` folded, `|` literal) keeps its text on the
+    // following indented lines; the marker alone is not a description.
+    if matches!(inline, ">" | "|" | ">-" | "|-" | ">+" | "|+") {
+        let mut folded: Vec<String> = Vec::new();
+        for line in &lines[index + 1..] {
+            if line.trim().is_empty() {
+                if folded.is_empty() {
+                    continue;
+                }
+                folded.push(String::new());
+                continue;
+            }
+            if !line.starts_with([' ', '\t']) {
+                break;
+            }
+            folded.push(line.trim().to_string());
+        }
+        let text = folded.join(" ").trim().to_string();
+        return (!text.is_empty()).then_some(text);
+    }
+
+    Some(unquote(inline).to_string())
 }
 
 /// Trim whitespace, then a single pair of double or single quotes.

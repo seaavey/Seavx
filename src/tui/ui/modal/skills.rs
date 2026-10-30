@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use super::cursor;
-use crate::cli::skills::one_line;
+use crate::cli::skills::first_sentence;
 
 pub(super) fn render(
     area: Rect,
@@ -28,7 +28,7 @@ pub(super) fn render(
             } else {
                 "[ ]"
             };
-            ListItem::new(format!("{mark} {name} — {}", one_line(description)))
+            ListItem::new(format!("{mark} {name} — {}", first_sentence(description)))
                 .style(Style::default().fg(Color::White))
         })
         .collect();
