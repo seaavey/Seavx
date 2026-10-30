@@ -10,6 +10,8 @@ use ratatui::{
 #[cfg(test)]
 use crate::agent::engine::AgentMode;
 use crate::tui::app::{App, ModalSelection};
+// The status-line tests name the agent state through `use super::*`.
+#[cfg(test)]
 use crate::tui::event::AgentState;
 
 mod conversation;
@@ -20,6 +22,10 @@ mod header;
 mod splash;
 #[cfg(test)]
 pub(crate) use splash::SPLASH;
+mod status_line;
+// The child test module reaches this through `use super::*`.
+#[cfg(test)]
+pub(crate) use status_line::Orb;
 mod theme;
 
 pub fn render(app: &App, frame: &mut Frame) {
@@ -61,29 +67,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     conversation::render(app, conversation, frame);
 
     // 3. Session title on the left, agent state on the right
-    let title = app.session_title.as_deref().unwrap_or("new session");
-    let (state, state_style) = match &app.status {
-        AgentState::Idle => ("ready", dim),
-        AgentState::Thinking => ("thinking", Style::default().fg(Color::Yellow)),
-        AgentState::Checking => ("checking", Style::default().fg(Color::Yellow)),
-        AgentState::Compacting => ("compacting", Style::default().fg(Color::Yellow)),
-        AgentState::Streaming => ("streaming", Style::default().fg(Color::Yellow)),
-        AgentState::ExecutingTool(tool) => (tool.as_str(), Style::default().fg(Color::Cyan)),
-    };
-    let orb = Orb::for_state(&app.status);
-    let used = title.chars().count() + state.chars().count() + 8;
-    let fill = "─".repeat((status_bar.width as usize).saturating_sub(used));
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("─ ", dim),
-            Span::styled(title.to_string(), Style::default().fg(Color::Cyan)),
-            Span::styled(format!(" {fill} "), dim),
-            Span::styled(orb.glyph(millis), Style::default().fg(orb.color())),
-            Span::styled(format!(" {state}"), state_style),
-            Span::styled(" ─", dim),
-        ])),
-        status_bar,
-    );
+    status_line::render(app, status_bar, frame, millis);
 
     // 4. Permission question: its own box above the composer, the tool and its
     // effect on one row, the four answers on the next.
@@ -450,51 +434,6 @@ pub fn render(app: &App, frame: &mut Frame) {
                     .border_style(Style::default().fg(toast_color)),
             );
         frame.render_widget(toast_widget, toast_area);
-    }
-}
-
-/// Conversation transcript: answer text plain, reasoning indented and gray.
-/// Animated status orb, ported from libraries.dev thinking-orbs (dotted orb, 2D).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Orb {
-    Idle,
-    Breathing,
-    Composing,
-    Working,
-}
-
-impl Orb {
-    fn for_state(state: &AgentState) -> Self {
-        match state {
-            AgentState::Idle => Orb::Idle,
-            AgentState::Thinking => Orb::Breathing,
-            AgentState::Checking | AgentState::Compacting => Orb::Working,
-            AgentState::Streaming => Orb::Composing,
-            AgentState::ExecutingTool(_) => Orb::Working,
-        }
-    }
-
-    /// Frames per state: ring morph, undulating sash, particles on tilted orbits.
-    fn frames(self) -> &'static [&'static str] {
-        match self {
-            Orb::Idle => &["○"],
-            // Face-on ring filling and draining; `○`/`◌` alone read as a still dot.
-            Orb::Breathing => &["○", "◔", "◐", "◕", "●", "◕", "◐", "◔"],
-            Orb::Composing => &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄"],
-            Orb::Working => &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-        }
-    }
-
-    fn color(self) -> Color {
-        match self {
-            Orb::Idle => Color::DarkGray,
-            _ => Color::Cyan,
-        }
-    }
-
-    fn glyph(self, millis: u128) -> &'static str {
-        let frames = self.frames();
-        frames[(millis / 90) as usize % frames.len()]
     }
 }
 
