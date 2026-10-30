@@ -1,8 +1,8 @@
 use crate::agent::events::{AgentEvent, FailureKind, SUMMARY_LIMIT, ToolEvent, ToolStatus};
 use crate::session::{
-    INTERRUPTED_RESULT, LoadedSession, MessageStatus, NewEvent, PAYLOAD_FORMAT,
-    RESUME_BUDGET_BYTES, SCHEMA_VERSION, SessionError, SessionStore, StoredMessage, TurnState,
-    WRITE_BUDGET, export_json, render_text, replay,
+    CriterionState, GoalState, INTERRUPTED_RESULT, LoadedSession, MessageStatus, NewEvent,
+    PAYLOAD_FORMAT, RESUME_BUDGET_BYTES, SCHEMA_VERSION, SessionError, SessionStore, StoredMessage,
+    TaskState, TurnState, WRITE_BUDGET, export_json, render_text, replay,
 };
 use genai::chat::{ChatMessage, MessageContent, ToolCall, ToolResponse};
 
@@ -1487,7 +1487,7 @@ fn only_lifecycle_events_are_durable_and_they_map_to_their_rows() {
 }
 
 #[test]
-fn a_v2_database_fixture_migrates_to_v3_and_keeps_its_messages() {
+fn a_v2_database_fixture_migrates_to_v4_and_keeps_its_messages() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("sessions.db");
     let user = serde_json::to_string(&ChatMessage::user("old prompt")).unwrap();
@@ -1521,7 +1521,7 @@ fn a_v2_database_fixture_migrates_to_v3_and_keeps_its_messages() {
         .connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4, "a v2 file lands on the current schema");
 
     let payloads: Vec<String> = store
         .connection()
@@ -1567,4 +1567,299 @@ fn a_v2_database_fixture_migrates_to_v3_and_keeps_its_messages() {
         .record_message(1, &ChatMessage::user("new prompt"), MessageStatus::Complete)
         .unwrap();
     assert_eq!(row_count(&store), 3);
+}
+
+/// The v3 ledger, before goals existed: `kind` admits only tool and turn, and
+/// every row has a session.
+const V3_EVENTS: &str = "
+CREATE TABLE agent_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    turn_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('tool','turn')),
+    status TEXT NOT NULL,
+    failure TEXT,
+    tool_call_id TEXT,
+    summary TEXT NOT NULL DEFAULT '',
+    pid INTEGER,
+    created_at INTEGER NOT NULL,
+    UNIQUE(session_id, seq)
+);
+CREATE INDEX agent_events_session_seq ON agent_events(session_id, seq);
+";
+
+#[test]
+fn a_v3_database_fixture_migrates_to_v4_and_preserves_messages_and_event_order() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let user = serde_json::to_string(&ChatMessage::user("old prompt")).unwrap();
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(V2_SCHEMA).unwrap();
+        connection.execute_batch(V3_EVENTS).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 3;")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(slug, workspace, title, model, payload_format, status, created_at, updated_at)
+                 VALUES ('svx-v3', 'ws', 'v3 session', 'm', ?1, 'active', 1, 1)",
+                [PAYLOAD_FORMAT],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+                 VALUES (1, 1, 'user', 'complete', ?1, 1)",
+                [&user],
+            )
+            .unwrap();
+        for (seq, status) in [(1, "queued"), (2, "completed")] {
+            connection
+                .execute(
+                    "INSERT INTO agent_events(session_id, seq, turn_id, kind, status, tool_call_id, summary, created_at)
+                     VALUES (1, ?1, 1, 'tool', ?2, 'call-1', 'read_file(x)', 1)",
+                    rusqlite::params![seq, status],
+                )
+                .unwrap();
+        }
+    }
+
+    let store = SessionStore::open_at(&path).expect("a v3 file opens");
+    let version: u32 = store
+        .connection()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
+
+    // Transcript bytes and ids are untouched.
+    let payloads: Vec<String> = store
+        .connection()
+        .prepare("SELECT payload FROM messages ORDER BY seq")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(payloads, vec![user]);
+
+    // The ledger kept every row, in order, with the new column empty.
+    let events = store.events(1).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(events[1].status, "completed");
+    let goal_ids: Vec<Option<i64>> = store
+        .connection()
+        .prepare("SELECT goal_id FROM agent_events ORDER BY seq")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(goal_ids, vec![None, None]);
+
+    // And a goal can now be created in that file.
+    store.create_goal("ws", Some(1), "ship it").unwrap();
+}
+
+#[test]
+fn goal_transitions_and_events_commit_atomically_and_survive_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let id = {
+        let store = SessionStore::open_at(&path).unwrap();
+        let id = store.create_goal("ws", None, "ship the release").unwrap();
+        assert_eq!(store.goal("ws", id).unwrap().state, GoalState::Draft);
+        store
+            .set_goal_plan(
+                "ws",
+                id,
+                &["all tests pass".to_string()],
+                &["write code".to_string()],
+            )
+            .unwrap();
+        store.set_goal_state("ws", id, GoalState::Active).unwrap();
+        id
+    };
+
+    let store = SessionStore::open_at(&path).unwrap();
+    let goal = store.goal("ws", id).unwrap();
+    assert_eq!(goal.state, GoalState::Active);
+    assert_eq!(goal.criteria.len(), 1);
+    assert_eq!(goal.tasks.len(), 1);
+
+    // draft, plan, active: one event each, in that order.
+    let statuses: Vec<String> = store
+        .connection
+        .prepare("SELECT status FROM agent_events WHERE goal_id = ?1 ORDER BY seq")
+        .unwrap()
+        .query_map([id], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(statuses, vec!["draft", "draft", "active"]);
+}
+
+#[test]
+fn goal_and_task_queries_are_workspace_scoped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let mine = store.create_goal("/mine", None, "mine").unwrap();
+    store.create_goal("/theirs", None, "theirs").unwrap();
+
+    assert!(
+        store.goal("/theirs", mine).is_err(),
+        "another workspace cannot read it"
+    );
+    assert!(store.goal("/mine", mine).is_ok());
+    assert_eq!(store.goals("/mine").unwrap().len(), 1);
+    assert_eq!(store.goals("/theirs").unwrap().len(), 1);
+}
+
+#[test]
+fn a_second_active_goal_is_refused_with_the_existing_id() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let first = store.create_goal("ws", None, "first").unwrap();
+    let second = store.create_goal("ws", None, "second").unwrap();
+    store
+        .set_goal_state("ws", first, GoalState::Active)
+        .unwrap();
+
+    let error = store
+        .set_goal_state("ws", second, GoalState::Active)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&first.to_string()), "{error}");
+    assert_eq!(store.goal("ws", second).unwrap().state, GoalState::Draft);
+
+    // Another workspace is untouched.
+    let elsewhere = store.create_goal("/other", None, "elsewhere").unwrap();
+    assert!(
+        store
+            .set_goal_state("/other", elsewhere, GoalState::Active)
+            .is_ok()
+    );
+}
+
+#[test]
+fn illegal_transitions_and_foreign_ids_do_not_change_state() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create_goal("ws", None, "goal").unwrap();
+
+    // draft cannot jump to completed or paused.
+    for next in [GoalState::Completed, GoalState::Paused] {
+        assert!(store.set_goal_state("ws", id, next).is_err(), "{next:?}");
+    }
+    // A foreign workspace cannot move it either.
+    assert!(
+        store
+            .set_goal_state("/elsewhere", id, GoalState::Active)
+            .is_err()
+    );
+    assert!(
+        store
+            .set_task_state("ws", id, 0, TaskState::Completed, "x")
+            .is_err()
+    );
+    assert_eq!(store.goal("ws", id).unwrap().state, GoalState::Draft);
+
+    // Edit closes once the goal is active.
+    store.set_goal_state("ws", id, GoalState::Active).unwrap();
+    assert!(
+        store
+            .set_goal_plan("ws", id, &["c".to_string()], &[])
+            .is_err()
+    );
+    // And a completed goal takes no further moves.
+    store
+        .set_goal_state("ws", id, GoalState::Cancelled)
+        .unwrap();
+    assert!(store.set_goal_state("ws", id, GoalState::Active).is_err());
+}
+
+#[test]
+fn a_goal_completes_only_with_evidence_or_a_user_waiver() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create_goal("ws", None, "finish").unwrap();
+    store
+        .set_goal_plan(
+            "ws",
+            id,
+            &["tests pass".to_string(), "docs explain it".to_string()],
+            &["run tests".to_string()],
+        )
+        .unwrap();
+    store.set_goal_state("ws", id, GoalState::Active).unwrap();
+
+    // A pending criterion blocks completion, and the task is still open.
+    let error = store
+        .set_goal_state("ws", id, GoalState::Completed)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("criterion 1"), "{error}");
+
+    // Satisfying needs evidence; waiving needs a reason.
+    assert!(
+        store
+            .set_criterion_state("ws", id, 0, CriterionState::Satisfied, "", None)
+            .is_err()
+    );
+    assert!(
+        store
+            .set_criterion_state("ws", id, 1, CriterionState::Waived, "", None)
+            .is_err()
+    );
+    store
+        .set_criterion_state(
+            "ws",
+            id,
+            0,
+            CriterionState::Satisfied,
+            "cargo test: exit 0",
+            None,
+        )
+        .unwrap();
+    store
+        .set_criterion_state(
+            "ws",
+            id,
+            1,
+            CriterionState::Waived,
+            "",
+            Some("no docs in this repo"),
+        )
+        .unwrap();
+
+    // The task is still open, so completion is still refused.
+    assert!(
+        store
+            .set_goal_state("ws", id, GoalState::Completed)
+            .is_err()
+    );
+    assert!(
+        store
+            .set_task_state("ws", id, 0, TaskState::Completed, "")
+            .is_err()
+    );
+    store
+        .set_task_state("ws", id, 0, TaskState::Completed, "cargo test: exit 0")
+        .unwrap();
+    store
+        .set_goal_state("ws", id, GoalState::Completed)
+        .unwrap();
+
+    let goal = store.goal("ws", id).unwrap();
+    assert_eq!(goal.state, GoalState::Completed);
+    assert_eq!(goal.criteria[0].evidence, "cargo test: exit 0");
+    assert_eq!(
+        goal.criteria[1].waiver_reason.as_deref(),
+        Some("no docs in this repo")
+    );
 }

@@ -16,8 +16,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub const PAYLOAD_FORMAT: &str = "genai-chat-v1";
 /// Schema version this build understands. 2 added the `slug` column; `migrate`
 /// adds it to a v1 file and names every existing row. 3 added the `agent_events`
-/// ledger, which every older file gains in the same transaction.
-pub const SCHEMA_VERSION: u32 = 3;
+/// ledger, which every older file gains in the same transaction. 4 added goals,
+/// criteria and tasks, and rebuilt that ledger so a goal can own its events.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Total budget for one write: three attempts, 100 ms and 200 ms waits.
 pub const WRITE_BUDGET: Duration = Duration::from_secs(5);
@@ -94,6 +95,273 @@ pub struct StoredMessage {
     pub status: MessageStatus,
     pub payload: String,
     pub created_at: i64,
+}
+
+/// A goal's place in its lifecycle. Only the user moves it to `active`; only
+/// evidence moves it to `completed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalState {
+    Draft,
+    Active,
+    Blocked,
+    Paused,
+    Completed,
+    Cancelled,
+}
+
+impl GoalState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Active => "active",
+            Self::Blocked => "blocked",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        match text {
+            "active" => Self::Active,
+            "blocked" => Self::Blocked,
+            "paused" => Self::Paused,
+            "completed" => Self::Completed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Draft,
+        }
+    }
+
+    /// Whether `next` is a legal move from this state.
+    fn allows(self, next: Self) -> bool {
+        match self {
+            Self::Draft => matches!(next, Self::Active | Self::Cancelled),
+            Self::Active => matches!(
+                next,
+                Self::Blocked | Self::Paused | Self::Completed | Self::Cancelled
+            ),
+            Self::Blocked => matches!(next, Self::Active | Self::Paused | Self::Cancelled),
+            Self::Paused => matches!(next, Self::Active | Self::Cancelled),
+            Self::Completed | Self::Cancelled => false,
+        }
+    }
+
+    /// A goal holding the workspace turn; at most one may.
+    fn is_live(self) -> bool {
+        matches!(self, Self::Active | Self::Blocked)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Pending,
+    Running,
+    Blocked,
+    Completed,
+    Cancelled,
+}
+
+impl TaskState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        match text {
+            "running" => Self::Running,
+            "blocked" => Self::Blocked,
+            "completed" => Self::Completed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CriterionState {
+    Pending,
+    Satisfied,
+    Waived,
+}
+
+impl CriterionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Satisfied => "satisfied",
+            Self::Waived => "waived",
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        match text {
+            "satisfied" => Self::Satisfied,
+            "waived" => Self::Waived,
+            _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Criterion {
+    pub position: i64,
+    pub text: String,
+    pub state: CriterionState,
+    /// Bounded, redacted reference: a command and its status, a path and a line.
+    pub evidence: String,
+    /// Required when the user waives the criterion.
+    pub waiver_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalTask {
+    pub position: i64,
+    pub title: String,
+    pub state: TaskState,
+    pub evidence: String,
+}
+
+/// A goal with its criteria and ordered tasks, as the store holds it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Goal {
+    pub id: i64,
+    pub workspace: String,
+    pub session_id: Option<i64>,
+    pub objective: String,
+    pub state: GoalState,
+    pub criteria: Vec<Criterion>,
+    pub tasks: Vec<GoalTask>,
+}
+
+impl Goal {
+    /// Completion needs every criterion satisfied with evidence, or waived by
+    /// the user with a reason. The model cannot assert this.
+    pub fn completion_blocker(&self) -> Option<String> {
+        for criterion in &self.criteria {
+            match criterion.state {
+                CriterionState::Satisfied if criterion.evidence.trim().is_empty() => {
+                    return Some(format!(
+                        "criterion {} is satisfied without evidence",
+                        criterion.position + 1
+                    ));
+                }
+                CriterionState::Waived
+                    if criterion
+                        .waiver_reason
+                        .as_deref()
+                        .is_none_or(|reason| reason.trim().is_empty()) =>
+                {
+                    return Some(format!(
+                        "criterion {} is waived without a reason",
+                        criterion.position + 1
+                    ));
+                }
+                CriterionState::Pending => {
+                    return Some(format!(
+                        "criterion {} is still pending",
+                        criterion.position + 1
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for task in &self.tasks {
+            if matches!(
+                task.state,
+                TaskState::Pending | TaskState::Running | TaskState::Blocked
+            ) {
+                return Some(format!(
+                    "task {} is still {}",
+                    task.position + 1,
+                    task.state.as_str()
+                ));
+            }
+        }
+        None
+    }
+}
+
+/// The goal's state, after proving it belongs to this workspace.
+fn goal_state(connection: &Connection, workspace: &str, id: i64) -> rusqlite::Result<GoalState> {
+    let state: Option<String> = connection
+        .query_row(
+            "SELECT status FROM goals WHERE id = ?1 AND workspace = ?2",
+            params![id, workspace],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match state {
+        Some(state) => Ok(GoalState::parse(&state)),
+        None => Err(rusqlite::Error::QueryReturnedNoRows),
+    }
+}
+
+/// The other goal of this workspace that holds the turn, if one does.
+fn conflicting_goal(
+    connection: &Connection,
+    workspace: &str,
+    id: i64,
+) -> rusqlite::Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT id FROM goals
+             WHERE workspace = ?1 AND id <> ?2 AND status IN ('active','blocked')",
+            params![workspace, id],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
+/// Append one goal-scoped lifecycle event, in the caller's transaction.
+fn log_goal_event(
+    connection: &Connection,
+    goal: i64,
+    session: Option<i64>,
+    kind: &str,
+    status: &str,
+    summary: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    // One sequence per scope: a session's goal events join that session's
+    // sequence, an unattended goal numbers its own.
+    let seq: i64 = match session {
+        Some(session) => connection.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM agent_events WHERE session_id = ?1",
+            [session],
+            |row| row.get(0),
+        )?,
+        None => connection.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM agent_events WHERE goal_id = ?1",
+            [goal],
+            |row| row.get(0),
+        )?,
+    };
+    connection.execute(
+        "INSERT INTO agent_events(session_id, goal_id, seq, turn_id, kind, status, summary, created_at)
+         VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)",
+        params![session, goal, seq, kind, status, summary, now],
+    )?;
+    Ok(())
+}
+
+/// Commit the caller's transaction, or roll it back and keep the first error.
+fn finish<T, E>(connection: &Connection, outcome: Result<T, E>) -> rusqlite::Result<Result<T, E>> {
+    match outcome {
+        Ok(value) => {
+            connection.execute_batch("COMMIT")?;
+            Ok(Ok(value))
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Ok(Err(error))
+        }
+    }
 }
 
 /// One row of the execution trace, before it is stored. Only the lifecycle
@@ -523,10 +791,12 @@ CREATE INDEX IF NOT EXISTS messages_session_seq ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS sessions_workspace_updated ON sessions(workspace, updated_at DESC);
 CREATE TABLE IF NOT EXISTS agent_events(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    -- A goal event has no session: the goal is the scope then.
+    session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+    goal_id INTEGER REFERENCES goals(id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
     turn_id INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('tool','turn')),
+    kind TEXT NOT NULL CHECK(kind IN ('tool','turn','goal','task')),
     status TEXT NOT NULL,
     failure TEXT,
     tool_call_id TEXT,
@@ -536,6 +806,41 @@ CREATE TABLE IF NOT EXISTS agent_events(
     UNIQUE(session_id, seq)
 );
 CREATE INDEX IF NOT EXISTS agent_events_session_seq ON agent_events(session_id, seq);
+CREATE TABLE IF NOT EXISTS goals(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('draft','active','blocked','paused','completed','cancelled')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goals_workspace ON goals(workspace, updated_at DESC);
+-- At most one goal may hold the turn: active, or blocked waiting on the user.
+CREATE UNIQUE INDEX IF NOT EXISTS goals_one_live
+    ON goals(workspace) WHERE status IN ('active','blocked');
+CREATE TABLE IF NOT EXISTS goal_criteria(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','satisfied','waived')),
+    evidence TEXT NOT NULL DEFAULT '',
+    waiver_reason TEXT,
+    UNIQUE(goal_id, position)
+);
+CREATE TABLE IF NOT EXISTS agent_tasks(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('pending','running','blocked','completed','cancelled')),
+    evidence TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    UNIQUE(goal_id, position)
+);
 ";
 
 #[derive(Debug)]
@@ -685,6 +990,51 @@ impl SessionStore {
         // table does not have yet would fail the whole batch.
         transaction.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS sessions_slug ON sessions(slug) WHERE slug <> ''",
+        )?;
+
+        // v3's ledger has no `goal_id` and a `kind` CHECK that refused goal
+        // events. SQLite cannot alter either in place, so the table is rebuilt
+        // row for row inside this transaction, ids and sequence intact.
+        let mut ledger_columns = transaction.prepare("PRAGMA table_info(agent_events)")?;
+        let ledger_names: Vec<String> = ledger_columns
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        drop(ledger_columns);
+        if !ledger_names.iter().any(|name| name == "goal_id") {
+            transaction.execute_batch(
+                "ALTER TABLE agent_events RENAME TO agent_events_v3;
+                 CREATE TABLE agent_events(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+                     goal_id INTEGER REFERENCES goals(id) ON DELETE CASCADE,
+                     seq INTEGER NOT NULL,
+                     turn_id INTEGER NOT NULL,
+                     kind TEXT NOT NULL CHECK(kind IN ('tool','turn','goal','task')),
+                     status TEXT NOT NULL,
+                     failure TEXT,
+                     tool_call_id TEXT,
+                     summary TEXT NOT NULL DEFAULT '',
+                     pid INTEGER,
+                     created_at INTEGER NOT NULL,
+                     UNIQUE(session_id, seq)
+                 );
+                 INSERT INTO agent_events(id, session_id, goal_id, seq, turn_id, kind,
+                                          status, failure, tool_call_id, summary, pid, created_at)
+                     SELECT id, session_id, NULL, seq, turn_id, kind, status, failure,
+                            tool_call_id, summary, pid, created_at
+                     FROM agent_events_v3;
+                 DROP TABLE agent_events_v3;
+                 CREATE INDEX IF NOT EXISTS agent_events_session_seq
+                     ON agent_events(session_id, seq);
+                 CREATE UNIQUE INDEX IF NOT EXISTS agent_events_goal_seq
+                     ON agent_events(goal_id, seq) WHERE goal_id IS NOT NULL;",
+            )?;
+        }
+        // After the rebuild, never in `SCHEMA`: on a v3 file the column does not
+        // exist yet, and the whole batch would fail on the index alone.
+        transaction.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS agent_events_goal_seq
+                 ON agent_events(goal_id, seq) WHERE goal_id IS NOT NULL;",
         )?;
 
         let mut unnamed = transaction.prepare("SELECT id FROM sessions WHERE slug = ''")?;
@@ -1060,6 +1410,338 @@ impl SessionStore {
                 }
             }
         })
+    }
+
+    // ---- goals -------------------------------------------------------------
+
+    /// A new goal is a `draft`: nothing runs until the user approves it.
+    pub fn create_goal(
+        &self,
+        workspace: &str,
+        session: Option<i64>,
+        objective: &str,
+    ) -> Result<i64, SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        let objective = crate::agent::events::bounded(
+            &crate::agent::security::redact(objective),
+            crate::agent::events::SUMMARY_LIMIT,
+        );
+        if objective.trim().is_empty() {
+            return Err(SessionError::Refused(
+                "a goal needs an objective".to_string(),
+            ));
+        }
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let created = (|| {
+                connection.execute(
+                    "INSERT INTO goals(workspace, session_id, objective, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'draft', ?4, ?4)",
+                    params![workspace, session, objective, now],
+                )?;
+                let id = connection.last_insert_rowid();
+                log_goal_event(connection, id, session, "goal", "draft", &objective, now)?;
+                Ok(id)
+            })();
+            finish(connection, created)
+        })?
+    }
+
+    pub fn goal(&self, workspace: &str, id: i64) -> Result<Goal, SessionError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT id, workspace, session_id, objective, status FROM goals
+                 WHERE id = ?1 AND workspace = ?2",
+                params![id, workspace],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(SessionError::Unknown(id))?;
+
+        let mut criteria_stmt = self.connection.prepare(
+            "SELECT position, text, status, evidence, waiver_reason FROM goal_criteria
+             WHERE goal_id = ?1 ORDER BY position",
+        )?;
+        let criteria = criteria_stmt
+            .query_map([id], |row| {
+                Ok(Criterion {
+                    position: row.get(0)?,
+                    text: row.get(1)?,
+                    state: CriterionState::parse(&row.get::<_, String>(2)?),
+                    evidence: row.get(3)?,
+                    waiver_reason: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut task_stmt = self.connection.prepare(
+            "SELECT position, title, status, evidence FROM agent_tasks
+             WHERE goal_id = ?1 ORDER BY position",
+        )?;
+        let tasks = task_stmt
+            .query_map([id], |row| {
+                Ok(GoalTask {
+                    position: row.get(0)?,
+                    title: row.get(1)?,
+                    state: TaskState::parse(&row.get::<_, String>(2)?),
+                    evidence: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Goal {
+            id: row.0,
+            workspace: row.1,
+            session_id: row.2,
+            objective: row.3,
+            state: GoalState::parse(&row.4),
+            criteria,
+            tasks,
+        })
+    }
+
+    /// Every goal in one workspace, newest first.
+    pub fn goals(&self, workspace: &str) -> Result<Vec<Goal>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM goals WHERE workspace = ?1 ORDER BY updated_at DESC, id DESC",
+        )?;
+        let ids: Vec<i64> = statement
+            .query_map([workspace], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+        ids.into_iter().map(|id| self.goal(workspace, id)).collect()
+    }
+
+    /// Replace the draft's criteria and ordered tasks. Only a draft is editable.
+    pub fn set_goal_plan(
+        &self,
+        workspace: &str,
+        id: i64,
+        criteria: &[String],
+        tasks: &[String],
+    ) -> Result<(), SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let written = (|| {
+                let state = goal_state(connection, workspace, id)?;
+                if state != GoalState::Draft {
+                    return Err(SessionError::Refused(format!(
+                        "goal {id} is {}; only a draft can be edited",
+                        state.as_str()
+                    )));
+                }
+                connection.execute("DELETE FROM goal_criteria WHERE goal_id = ?1", [id])?;
+                connection.execute("DELETE FROM agent_tasks WHERE goal_id = ?1", [id])?;
+                for (position, text) in criteria.iter().enumerate() {
+                    connection.execute(
+                        "INSERT INTO goal_criteria(goal_id, position, text, status)
+                         VALUES (?1, ?2, ?3, 'pending')",
+                        params![id, position as i64, text.trim()],
+                    )?;
+                }
+                for (position, title) in tasks.iter().enumerate() {
+                    connection.execute(
+                        "INSERT INTO agent_tasks(goal_id, position, title, status, updated_at)
+                         VALUES (?1, ?2, ?3, 'pending', ?4)",
+                        params![id, position as i64, title.trim(), now],
+                    )?;
+                }
+                connection.execute(
+                    "UPDATE goals SET updated_at = ?2 WHERE id = ?1",
+                    params![id, now],
+                )?;
+                log_goal_event(
+                    connection,
+                    id,
+                    None,
+                    "goal",
+                    "draft",
+                    &format!("{} criteria, {} tasks", criteria.len(), tasks.len()),
+                    now,
+                )?;
+                Ok(())
+            })();
+            finish(connection, written)
+        })?
+    }
+
+    /// Move a goal. The user is the only one who can approve it, and completion
+    /// is refused while a criterion or task is still open.
+    pub fn set_goal_state(
+        &self,
+        workspace: &str,
+        id: i64,
+        next: GoalState,
+    ) -> Result<(), SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let moved = (|| {
+                let state = goal_state(connection, workspace, id)?;
+                if !state.allows(next) {
+                    return Err(SessionError::Refused(format!(
+                        "goal {id} cannot go from {} to {}",
+                        state.as_str(),
+                        next.as_str()
+                    )));
+                }
+                if next.is_live()
+                    && let Some(other) = conflicting_goal(connection, workspace, id)?
+                {
+                    return Err(SessionError::Refused(format!(
+                        "goal {other} is already active in this workspace"
+                    )));
+                }
+                if next == GoalState::Completed {
+                    let goal = self.goal(workspace, id)?;
+                    if let Some(blocker) = goal.completion_blocker() {
+                        return Err(SessionError::Refused(format!(
+                            "goal {id} cannot be completed: {blocker}"
+                        )));
+                    }
+                }
+                connection.execute(
+                    "UPDATE goals SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![id, next.as_str(), now],
+                )?;
+                log_goal_event(
+                    connection,
+                    id,
+                    None,
+                    "goal",
+                    next.as_str(),
+                    &format!("goal {}", next.as_str()),
+                    now,
+                )?;
+                Ok(())
+            })();
+            finish(connection, moved)
+        })?
+    }
+
+    /// A task is complete only with evidence attached.
+    pub fn set_task_state(
+        &self,
+        workspace: &str,
+        id: i64,
+        position: i64,
+        next: TaskState,
+        evidence: &str,
+    ) -> Result<(), SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        let evidence = crate::agent::events::bounded(
+            &crate::agent::security::redact(evidence),
+            crate::agent::events::SUMMARY_LIMIT,
+        );
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let moved = (|| {
+                goal_state(connection, workspace, id)?;
+                if next == TaskState::Completed && evidence.trim().is_empty() {
+                    return Err(SessionError::Refused(format!(
+                        "task {} cannot be completed without evidence",
+                        position + 1
+                    )));
+                }
+                let changed = connection.execute(
+                    "UPDATE agent_tasks SET status = ?3, evidence = ?4, updated_at = ?5
+                     WHERE goal_id = ?1 AND position = ?2",
+                    params![id, position, next.as_str(), evidence, now],
+                )?;
+                if changed == 0 {
+                    return Err(SessionError::Unknown(id));
+                }
+                log_goal_event(
+                    connection,
+                    id,
+                    None,
+                    "task",
+                    next.as_str(),
+                    &format!("task {} {}", position + 1, next.as_str()),
+                    now,
+                )?;
+                Ok(())
+            })();
+            finish(connection, moved)
+        })?
+    }
+
+    /// Satisfy a criterion with evidence, or waive it with the user's reason.
+    pub fn set_criterion_state(
+        &self,
+        workspace: &str,
+        id: i64,
+        position: i64,
+        next: CriterionState,
+        evidence: &str,
+        waiver: Option<&str>,
+    ) -> Result<(), SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        let evidence = crate::agent::events::bounded(
+            &crate::agent::security::redact(evidence),
+            crate::agent::events::SUMMARY_LIMIT,
+        );
+        let waiver = waiver.map(|reason| {
+            crate::agent::events::bounded(
+                &crate::agent::security::redact(reason),
+                crate::agent::events::SUMMARY_LIMIT,
+            )
+        });
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let moved = (|| {
+                goal_state(connection, workspace, id)?;
+                match next {
+                    CriterionState::Satisfied if evidence.trim().is_empty() => {
+                        return Err(SessionError::Refused(format!(
+                            "criterion {} cannot be satisfied without evidence",
+                            position + 1
+                        )));
+                    }
+                    CriterionState::Waived
+                        if waiver
+                            .as_deref()
+                            .is_none_or(|reason| reason.trim().is_empty()) =>
+                    {
+                        return Err(SessionError::Refused(format!(
+                            "criterion {} needs a reason to be waived",
+                            position + 1
+                        )));
+                    }
+                    _ => {}
+                }
+                let changed = connection.execute(
+                    "UPDATE goal_criteria
+                     SET status = ?3, evidence = ?4, waiver_reason = ?5
+                     WHERE goal_id = ?1 AND position = ?2",
+                    params![id, position, next.as_str(), evidence, waiver],
+                )?;
+                if changed == 0 {
+                    return Err(SessionError::Unknown(id));
+                }
+                log_goal_event(
+                    connection,
+                    id,
+                    None,
+                    "goal",
+                    next.as_str(),
+                    &format!("criterion {} {}", position + 1, next.as_str()),
+                    now,
+                )?;
+                Ok(())
+            })();
+            finish(connection, moved)
+        })?
     }
 
     /// Append one trace row and return its per-session `seq`. `seq` is allocated
