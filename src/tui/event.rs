@@ -16,9 +16,20 @@ pub enum Action {
         prompt_tokens: i32,
     },
     AgentDone,
+    /// The worker created or adopted a session row.
+    SessionStarted(i64),
+    /// Persistence degraded for the rest of the run; one notice, no retry.
+    SessionFailed(String),
     DoctorDone(DoctorReport),
     CompactDone {
         result: Result<crate::tui::compact::CompactResult, String>,
+    },
+    UndoDone(Result<Vec<std::path::PathBuf>, String>),
+    /// A tool call needs an answer. The worker blocks on `reply`; dropping it
+    /// (quit, panic) resolves as a denial.
+    PermissionAsk {
+        request: crate::agent::permissions::PermissionRequest,
+        reply: tokio::sync::oneshot::Sender<crate::agent::permissions::Answer>,
     },
 }
 

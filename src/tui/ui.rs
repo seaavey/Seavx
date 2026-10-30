@@ -100,7 +100,21 @@ pub fn render(app: &App, frame: &mut Frame) {
         chunks[2],
     );
 
-    // 4. Prompt box
+    // 4. Prompt box, with any pending permission question directly above it
+    if let Some(pending) = app.pending_permission.as_ref() {
+        let question = format!(
+            "permission: {} — {}  [y once · a category · u unrestricted · n deny]",
+            pending.request.tool, pending.request.effect
+        );
+        let line = Paragraph::new(question).style(Style::default().fg(Color::Yellow));
+        let area = Rect {
+            height: 1,
+            y: chunks[3].y.saturating_sub(1),
+            ..chunks[3]
+        };
+        frame.render_widget(Clear, area);
+        frame.render_widget(line, area);
+    }
     frame.render_widget(&app.input, chunks[3]);
 
     // 4b. Inline Slash Command Auto-complete Menu
@@ -559,5 +573,5 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 #[cfg(test)]
-#[path = "../../tests/tui/ui.rs"]
+#[path = "../tests/tui/ui.rs"]
 mod tests;

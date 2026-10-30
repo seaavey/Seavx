@@ -37,6 +37,8 @@ pub enum SlashCommand {
     Memory {
         view: MemoryView,
     },
+    /// Restore files from the newest checkpoint.
+    Undo,
     Unknown(String),
 }
 
@@ -47,6 +49,7 @@ pub enum CommandEffect {
     OpenModelPicker,
     RunDoctor { offline: bool },
     RunCompact { instructions: Option<String> },
+    RunUndo,
 }
 
 /// Parse one line of input. Returns `None` when the line is not a slash
@@ -85,6 +88,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             _ => SlashCommand::Unknown(trimmed.to_string()),
         },
         "/config" => parse_config(&args, trimmed),
+        "/undo" if args.is_empty() => SlashCommand::Undo,
         "/memory" if args.len() <= 1 => match args.first().copied() {
             None | Some("show") => SlashCommand::Memory {
                 view: MemoryView::All,
@@ -200,8 +204,8 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
 
     match command {
         SlashCommand::Clear => {
-            app.clear_transcript();
-            app.session_title = None;
+            // A new session id; nothing stored is deleted or asked about.
+            app.start_new_session();
             app.scroll = 0;
             app.auto_scroll = true;
             CommandEffect::Handled
@@ -224,6 +228,7 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         }
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },
+        SlashCommand::Undo => CommandEffect::RunUndo,
         SlashCommand::Init => {
             match config::init_workspace(std::path::Path::new(".")) {
                 Ok((path, true)) => {
@@ -390,5 +395,5 @@ pub fn sanitize(text: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "../../tests/tui/commands.rs"]
+#[path = "../tests/tui/commands.rs"]
 mod tests;

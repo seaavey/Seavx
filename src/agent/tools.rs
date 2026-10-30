@@ -1,12 +1,15 @@
 use crate::agent::engine::AgentMode;
+use crate::agent::permissions::ActionKind;
 use crate::agent::security::WorkspaceSecurity;
+use crate::atomic_file::{ModePolicy, write_atomic};
+use crate::checkpoint::{CheckpointInput, CheckpointStore, CheckpointTarget, EntryState};
 use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[async_trait]
@@ -18,6 +21,18 @@ pub trait AgentTool: Send + Sync {
     /// Tools default to mutation. Only explicitly classified tools are safe in Plan Mode.
     fn is_read_only(&self) -> bool {
         false
+    }
+
+    /// What this call may do. Defaults to a workspace write; tools that never
+    /// mutate, and `run_command`, override it.
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Write
+    }
+
+    /// Where this call writes when the destination is chosen by the tool rather
+    /// than by `validate_path`, so the engine can classify a global write.
+    fn destination(&self, _args: &Value, _security: &WorkspaceSecurity) -> Option<PathBuf> {
+        None
     }
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String>;
@@ -33,37 +48,112 @@ fn schema<T: JsonSchema>() -> Value {
     serde_json::to_value(schema_for!(T)).unwrap_or_default()
 }
 
-/// Create parent directories when needed, then write content. Shared core of
-/// `write_file` and `skill_write`; `ctx` labels the target in error messages.
-async fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    tokio::fs::write(path, content)
-        .await
+/// Create parent directories when needed, then write content atomically. Shared
+/// core of `write_file` and `skill_write`; `ctx` labels the target in errors.
+fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), String> {
+    crate::agent::security::check_write_target(path)?;
+    write_atomic(path, content.as_bytes(), ModePolicy::Preserve)
         .map_err(|e| format!("Failed to write {ctx}: {e}"))
 }
 
-/// Read a file, replace the first occurrence of `old_string`, and write it back.
-/// Shared core of `edit_file` and `skill_patch`; `ctx` labels the target in errors.
-async fn replace_first(
+/// Capture the pre-write bytes of `path` so `/undo` can restore them. A target
+/// outside the workspace is accepted only inside an allowed global root.
+fn capture_checkpoint(security: &WorkspaceSecurity, path: &Path) -> Result<(), String> {
+    // Existence decides the class, never a successful read: recording an
+    // existing file as `created` would make `/undo` delete it.
+    let exists = std::fs::symlink_metadata(path).is_ok();
+    let original = if exists {
+        Some(std::fs::read(path).map_err(|error| {
+            format!(
+                "refusing to write {}: it exists but cannot be read, so it cannot be checkpointed ({error})",
+                path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let state = if exists {
+        EntryState::Modified
+    } else {
+        EntryState::Created
+    };
+    let target = match path.strip_prefix(security.root()) {
+        Ok(_) => CheckpointTarget::Workspace(path.to_path_buf()),
+        Err(_) => {
+            let allowed_root =
+                crate::agent::permissions::global_root_for(crate::home::dir().as_deref(), path)
+                    .ok_or_else(|| {
+                        format!(
+                            "Refusing to write outside the workspace: {}",
+                            path.display()
+                        )
+                    })?;
+            CheckpointTarget::Global {
+                path: path.to_path_buf(),
+                allowed_root,
+            }
+        }
+    };
+
+    CheckpointStore::create(
+        security.root(),
+        &[CheckpointInput {
+            target,
+            state,
+            original,
+        }],
+    )
+    .map(|_| ())
+    .map_err(|error| format!("Checkpoint failed: {error}"))
+}
+
+/// Replace `old_string` and write the file back, returning how many occurrences
+/// changed. A snippet that occurs more than once is refused unless `replace_all`
+/// is set: silently editing the first match edits the wrong place.
+async fn replace_unique(
     path: &Path,
     old_string: &str,
     new_string: &str,
+    replace_all: bool,
     ctx: &str,
-) -> Result<(), String> {
-    let content = tokio::fs::read_to_string(path)
+) -> Result<usize, String> {
+    if old_string.is_empty() {
+        return Err("old_string must not be empty".to_string());
+    }
+
+    let content = crate::agent::security::read_verified(path)
         .await
         .map_err(|e| format!("Failed to read {ctx} for editing: {e}"))?;
 
-    if !content.contains(old_string) {
+    let occurrences = content.matches(old_string).count();
+    if occurrences == 0 {
         return Err(format!("Target old_string not found in {ctx}"));
     }
+    if occurrences > 1 && !replace_all {
+        let samples: Vec<String> = content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(old_string))
+            .take(3)
+            .map(|(index, line)| format!("line {}: {}", index + 1, line.trim()))
+            .collect();
+        return Err(format!(
+            "old_string occurs {occurrences} times in {ctx}; add context or pass replace_all\n{}",
+            samples.join("\n")
+        ));
+    }
 
-    let updated = content.replacen(old_string, new_string, 1);
-    tokio::fs::write(path, updated)
-        .await
-        .map_err(|e| format!("Failed to save {ctx} edit: {e}"))
+    // An identical replacement is a noted no-op, not a rewrite of the same bytes.
+    if old_string == new_string {
+        return Ok(0);
+    }
+
+    let count = if replace_all { occurrences } else { 1 };
+    let updated = content.replacen(old_string, new_string, count);
+    crate::agent::security::check_write_target(path)?;
+    write_atomic(path, updated.as_bytes(), ModePolicy::Preserve)
+        .map_err(|e| format!("Failed to save {ctx} edit: {e}"))?;
+    Ok(count)
 }
 
 // 1. read_file
@@ -82,6 +172,10 @@ impl AgentTool for ReadFileTool {
         "read_file"
     }
 
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Read
+    }
+
     fn description(&self) -> &'static str {
         "Read file contents within workspace, with optional line offset (1-based) and limit"
     }
@@ -97,9 +191,7 @@ impl AgentTool for ReadFileTool {
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<ReadFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| format!("Failed to read file: {e}"))?;
+        let content = crate::agent::security::read_verified(&path).await?;
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -152,7 +244,8 @@ impl AgentTool for WriteFileTool {
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<WriteFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        write_with_parents(&path, parsed.content, "file").await?;
+        capture_checkpoint(security, &path)?;
+        write_with_parents(&path, parsed.content, "file")?;
         Ok(format!("Successfully wrote {}", parsed.path))
     }
 }
@@ -163,6 +256,9 @@ struct EditFileArgs {
     path: String,
     old_string: String,
     new_string: String,
+    /// Replace every occurrence instead of refusing an ambiguous snippet.
+    #[serde(default)]
+    replace_all: bool,
 }
 
 pub struct EditFileTool;
@@ -184,8 +280,23 @@ impl AgentTool for EditFileTool {
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<EditFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        replace_first(&path, &parsed.old_string, &parsed.new_string, "file").await?;
-        Ok(format!("Successfully updated {}", parsed.path))
+        capture_checkpoint(security, &path)?;
+        let count = replace_unique(
+            &path,
+            &parsed.old_string,
+            &parsed.new_string,
+            parsed.replace_all,
+            "file",
+        )
+        .await?;
+        Ok(if count == 0 {
+            format!("No change to {}: old_string equals new_string", parsed.path)
+        } else {
+            format!(
+                "Successfully updated {} ({count} replacement(s))",
+                parsed.path
+            )
+        })
     }
 }
 
@@ -201,6 +312,10 @@ pub struct ListDirectoryTool;
 impl AgentTool for ListDirectoryTool {
     fn name(&self) -> &'static str {
         "list_directory"
+    }
+
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Read
     }
 
     fn description(&self) -> &'static str {
@@ -256,6 +371,14 @@ impl AgentTool for RunCommandTool {
         "run_command"
     }
 
+    fn classify(&self, args: &Value, security: &WorkspaceSecurity) -> ActionKind {
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        crate::agent::shell::classify(command, security).kind
+    }
+
     fn description(&self) -> &'static str {
         "Run shell command safely in workspace root with 30s timeout"
     }
@@ -266,46 +389,110 @@ impl AgentTool for RunCommandTool {
 
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<RunCommandArgs>(args)?;
+        let class = crate::agent::shell::classify(&parsed.command, security);
 
-        let blocked = ["rm -rf /", ":(){ :|:& };:"];
-        for b in &blocked {
-            if parsed.command.contains(b) {
-                return Err("Command refused by security policy".to_string());
-            }
+        // The engine already refused this through the matrix; the belt exists so a
+        // caller that skips the engine still cannot run it.
+        if class.kind == ActionKind::Destructive {
+            return Err("Command refused by security policy".to_string());
         }
 
-        // Windows has no `sh`; `cmd /C` runs the same command through the system shell.
-        #[cfg(windows)]
-        let mut shell = {
-            let mut cmd = tokio::process::Command::new("cmd");
-            cmd.arg("/C");
-            cmd
+        let output = run_shell(&parsed.command, security, COMMAND_TIMEOUT).await?;
+        let stdout = cap_stream(&String::from_utf8_lossy(&output.stdout));
+        let stderr = cap_stream(&String::from_utf8_lossy(&output.stderr));
+
+        // A recursive read names a directory, so its lines are filtered: the
+        // policy cannot see the files it walked.
+        let recursive = class.segments.iter().any(|segment| {
+            crate::agent::shell::RECURSIVE_READERS.contains(&segment.program.as_str())
+        });
+        let (stdout, withheld) = if recursive {
+            crate::agent::shell::filter_output(&stdout, security)
+        } else {
+            (stdout, 0)
         };
-        #[cfg(not(windows))]
-        let mut shell = {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c");
-            cmd
-        };
+        let _ = withheld;
 
-        let cmd = shell
-            .arg(&parsed.command)
-            .current_dir(security.root())
-            .output();
-
-        let output = tokio::time::timeout(std::time::Duration::from_secs(30), cmd)
-            .await
-            .map_err(|_| "Command execution timed out (30s limit)".to_string())?
-            .map_err(|e| format!("Process execution failed: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
         let status = output.status.code().unwrap_or(-1);
-
-        Ok(format!(
-            "exit: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        ))
+        let text = format!("exit: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        Ok(crate::agent::security::redact(&text))
     }
+}
+
+/// Wall-clock ceiling for one command; the child is killed when it expires.
+pub(crate) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-stream ceiling, split evenly between the head and the tail.
+const STREAM_CAP: usize = 32 * 1024;
+const STREAM_HALF: usize = 16 * 1024;
+
+/// Run one command with a cleared environment: a tool call cannot read the
+/// agent's own `SEAVX_*` variables, and the child dies with the future.
+pub(crate) async fn run_shell(
+    command: &str,
+    security: &WorkspaceSecurity,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    // Windows has no `sh`; `cmd /C` runs the same command through the system shell.
+    #[cfg(windows)]
+    let mut shell = {
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C");
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut shell = {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c");
+        cmd
+    };
+
+    shell
+        .arg(command)
+        .current_dir(security.root())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env_clear()
+        .kill_on_drop(true);
+    for name in ["PATH", "LANG", "TERM"] {
+        if let Ok(value) = std::env::var(name) {
+            shell.env(name, value);
+        }
+    }
+    // Most tooling breaks without `HOME`; the agent's own variables never pass.
+    if let Some(home) = crate::home::dir() {
+        shell.env("HOME", home);
+    }
+
+    let child = shell
+        .spawn()
+        .map_err(|e| format!("Process execution failed: {e}"))?;
+    match tokio::time::timeout(limit, child.wait_with_output()).await {
+        Err(_) => Err(format!(
+            "Command execution timed out ({}s limit)",
+            limit.as_secs()
+        )),
+        Ok(Err(error)) => Err(format!("Process execution failed: {error}")),
+        Ok(Ok(output)) => Ok(output),
+    }
+}
+
+/// Keep a bounded head and tail so a chatty command cannot flood the context.
+fn cap_stream(text: &str) -> String {
+    if text.len() <= STREAM_CAP {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(STREAM_HALF).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(STREAM_HALF)
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let omitted = text.len().saturating_sub(head.len() + tail.len());
+    format!("{head}\n[{omitted} bytes omitted]\n{tail}")
 }
 
 // 6. search_files
@@ -322,6 +509,10 @@ pub struct SearchFilesTool;
 impl AgentTool for SearchFilesTool {
     fn name(&self) -> &'static str {
         "search_files"
+    }
+
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Read
     }
 
     fn description(&self) -> &'static str {
@@ -343,51 +534,68 @@ impl AgentTool for SearchFilesTool {
         let root = security.validate_path(&search_path)?;
 
         let pattern = parsed.pattern.clone();
-        let results = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
-            let mut matches = Vec::new();
-            let mut stack = vec![root];
+        let results =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<String>, usize), String> {
+                let mut matches = Vec::new();
+                let mut skipped = 0usize;
+                let mut stack = vec![root];
 
-            while let Some(current_dir) = stack.pop() {
-                let read_dir = match std::fs::read_dir(&current_dir) {
-                    Ok(rd) => rd,
-                    Err(_) => continue,
-                };
+                while let Some(current_dir) = stack.pop() {
+                    let read_dir = match std::fs::read_dir(&current_dir) {
+                        Ok(rd) => rd,
+                        Err(_) => continue,
+                    };
 
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    let file_name = path
-                        .file_name()
-                        .map(|s| s.to_string_lossy())
-                        .unwrap_or_default();
+                    for entry in read_dir.flatten() {
+                        let path = entry.path();
+                        let file_name = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy())
+                            .unwrap_or_default();
 
-                    // Skip hidden dirs, build artifacts and dependencies like every other walk.
-                    if crate::util::is_skipped(&file_name) {
-                        continue;
-                    }
-
-                    if path.is_dir() {
-                        stack.push(path);
-                    } else if path.is_file() {
-                        if target_mode == "files" {
-                            if file_name.contains(&pattern) {
-                                matches.push(path.display().to_string());
+                        // Policy before the skip list: a protected file is counted even
+                        // when it is hidden, while a protected directory is dropped
+                        // without a count because it is not a file result.
+                        if crate::agent::security::check_file(&path).is_err() {
+                            if path.is_file() {
+                                skipped += 1;
                             }
-                        } else {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                for (idx, line) in content.lines().enumerate() {
-                                    if line.contains(&pattern) {
-                                        matches.push(format!(
-                                            "{}:{}: {}",
-                                            path.display(),
-                                            idx + 1,
-                                            line.trim()
-                                        ));
-                                        if matches.len() >= 100 {
-                                            break;
+                            continue;
+                        }
+
+                        // Skip hidden dirs, build artifacts and dependencies like every other walk.
+                        if crate::util::is_skipped(&file_name) {
+                            continue;
+                        }
+
+                        if path.is_dir() {
+                            stack.push(path);
+                        } else if path.is_file() {
+                            if target_mode == "files" {
+                                if file_name.contains(&pattern) {
+                                    matches.push(path.display().to_string());
+                                }
+                            } else {
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    for (idx, line) in content.lines().enumerate() {
+                                        if line.contains(&pattern) {
+                                            matches.push(format!(
+                                                "{}:{}: {}",
+                                                path.display(),
+                                                idx + 1,
+                                                line.trim()
+                                            ));
+                                            if matches.len() >= 100 {
+                                                break;
+                                            }
                                         }
                                     }
                                 }
                             }
+                        }
+
+                        if matches.len() >= 100 {
+                            break;
                         }
                     }
 
@@ -396,27 +604,46 @@ impl AgentTool for SearchFilesTool {
                     }
                 }
 
-                if matches.len() >= 100 {
-                    break;
-                }
-            }
+                Ok((matches, skipped))
+            })
+            .await
+            .map_err(|e| format!("Search task failed: {e}"))??;
 
-            Ok(matches)
-        })
-        .await
-        .map_err(|e| format!("Search task failed: {e}"))??;
-
-        if results.is_empty() {
-            Ok(format!("No matches found for pattern '{}'", parsed.pattern))
+        let (results, skipped) = results;
+        let mut output = if results.is_empty() {
+            format!("No matches found for pattern '{}'", parsed.pattern)
         } else {
             let count = results.len();
             let mut output = results.join("\n");
             if count >= 100 {
                 output.push_str("\n[Truncated to 100 results]");
             }
-            Ok(output)
+            output
+        };
+        if skipped > 0 {
+            output.push_str(&format!("\n[{skipped} files skipped by policy]"));
         }
+        Ok(crate::agent::security::redact(&output))
     }
+}
+
+/// The file `save_memory` writes, shared by `execute` and the permission check.
+fn memory_target(
+    security: &WorkspaceSecurity,
+    target: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let user_target = target == Some("user");
+    let is_debug = crate::util::is_debug();
+    let path = match (user_target, is_debug) {
+        (true, true) => security.root().join(".seavx").join("USER.md"),
+        (true, false) => crate::home::dir()
+            .ok_or_else(|| "home directory not set".to_string())?
+            .join(".seavx")
+            .join("USER.md"),
+        (false, true) => security.root().join(".seavx").join("MEMORY.md"),
+        (false, false) => security.root().join("MEMORY.md"),
+    };
+    Ok(path)
 }
 
 // 7. save_memory
@@ -462,6 +689,14 @@ impl AgentTool for SaveMemoryTool {
         "save_memory"
     }
 
+    fn destination(
+        &self,
+        args: &Value,
+        security: &WorkspaceSecurity,
+    ) -> Option<std::path::PathBuf> {
+        memory_target(security, args.get("target").and_then(Value::as_str)).ok()
+    }
+
     fn description(&self) -> &'static str {
         "Save a durable lesson/preference with confidence score (0-100%). Rejects if confidence < 70%."
     }
@@ -497,30 +732,11 @@ impl AgentTool for SaveMemoryTool {
             }
         }
 
-        let is_debug = crate::util::is_debug();
-
         let target = parsed.target.unwrap_or_else(|| "project".to_string());
-        let target_file = if target == "user" {
-            if is_debug {
-                // In debug mode, save USER.md locally inside repo .seavx/USER.md
-                let seavx_dir = security.root().join(".seavx");
-                let _ = tokio::fs::create_dir_all(&seavx_dir).await;
-                seavx_dir.join("USER.md")
-            } else {
-                let home =
-                    crate::home::dir().ok_or_else(|| "home directory not set".to_string())?;
-                let dir = home.join(".seavx");
-                let _ = tokio::fs::create_dir_all(&dir).await;
-                dir.join("USER.md")
-            }
-        } else if is_debug {
-            // In debug mode, save project memory under .seavx/MEMORY.md
-            let seavx_dir = security.root().join(".seavx");
-            let _ = tokio::fs::create_dir_all(&seavx_dir).await;
-            seavx_dir.join("MEMORY.md")
-        } else {
-            security.root().join("MEMORY.md")
-        };
+        let target_file = memory_target(security, Some(&target))?;
+        if let Some(dir) = target_file.parent() {
+            let _ = tokio::fs::create_dir_all(dir).await;
+        }
 
         let existing = tokio::fs::read_to_string(&target_file)
             .await
@@ -547,8 +763,8 @@ impl AgentTool for SaveMemoryTool {
 
         updated.push_str(&format!("- [{confidence}%] {lesson}\n"));
 
-        tokio::fs::write(&target_file, updated)
-            .await
+        capture_checkpoint(security, &target_file)?;
+        write_atomic(&target_file, updated.as_bytes(), ModePolicy::Preserve)
             .map_err(|e| format!("Failed to write memory: {e}"))?;
 
         Ok(format!(
@@ -557,6 +773,17 @@ impl AgentTool for SaveMemoryTool {
             lesson
         ))
     }
+}
+
+/// Where a skill write lands: the existing file when it exists, else the path the
+/// manager would create.
+fn skill_destination(args: &Value, security: &WorkspaceSecurity) -> Option<std::path::PathBuf> {
+    let name = args.get("name").and_then(Value::as_str)?;
+    find_skill_file(security, name).ok().or_else(|| {
+        crate::agent::skills::SkillManager::new(security.root())
+            .skill_path(name)
+            .ok()
+    })
 }
 
 fn find_skill_file(security: &WorkspaceSecurity, name: &str) -> Result<std::path::PathBuf, String> {
@@ -582,6 +809,10 @@ impl AgentTool for SkillViewTool {
         "skill_view"
     }
 
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Read
+    }
+
     fn description(&self) -> &'static str {
         "Read full instructions of an available skill by name"
     }
@@ -603,6 +834,75 @@ impl AgentTool for SkillViewTool {
     }
 }
 
+// 8b. apply_patch
+#[derive(Deserialize, JsonSchema)]
+struct ApplyPatchArgs {
+    /// A unified diff. Every hunk must match exactly; nothing is written unless
+    /// every file applies.
+    patch: String,
+}
+
+pub struct ApplyPatchTool;
+
+#[async_trait]
+impl AgentTool for ApplyPatchTool {
+    fn name(&self) -> &'static str {
+        "apply_patch"
+    }
+
+    fn description(&self) -> &'static str {
+        "Apply a unified diff to one or more files as a single all-or-nothing, undoable change"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        schema::<ApplyPatchArgs>()
+    }
+
+    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+        let parsed = parse_args::<ApplyPatchArgs>(args)?;
+        let files = crate::agent::patch::parse(&parsed.patch)
+            .map_err(|error| format!("Patch refused: {error}"))?;
+
+        // Every file applies in memory first, so a later failure writes nothing.
+        let mut edits = Vec::new();
+        let mut summary = Vec::new();
+        let mut hunks = 0usize;
+        for file in &files {
+            let requested = file
+                .path
+                .to_str()
+                .ok_or_else(|| format!("{}: path is not valid UTF-8", file.path.display()))?;
+            let path = security.validate_path(requested)?;
+            let current = match crate::agent::security::read_verified(&path).await {
+                Ok(text) => text,
+                Err(_) if file.create => String::new(),
+                Err(error) => return Err(format!("{requested}: {error}")),
+            };
+            let (updated, stats) = crate::agent::patch::apply_to(&current, file)?;
+            hunks += stats.hunks;
+            summary.push(format!(
+                "+{} -{} {}",
+                stats.added,
+                stats.removed,
+                file.path.display()
+            ));
+            edits.push(crate::agent::batch::FileEdit {
+                path,
+                content: updated.into_bytes(),
+            });
+        }
+
+        let report = crate::agent::batch::commit(security, edits)
+            .map_err(|error| format!("Patch not applied: {error}"))?;
+        Ok(format!(
+            "Applied {hunks} hunk(s) in {} file(s):\n{}\ncheckpoint: {}",
+            report.written.len(),
+            summary.join("\n"),
+            report.checkpoint.display()
+        ))
+    }
+}
+
 // 9. skill_write
 #[derive(Deserialize, JsonSchema)]
 struct SkillWriteArgs {
@@ -616,6 +916,14 @@ pub struct SkillWriteTool;
 impl AgentTool for SkillWriteTool {
     fn name(&self) -> &'static str {
         "skill_write"
+    }
+
+    fn destination(
+        &self,
+        args: &Value,
+        security: &WorkspaceSecurity,
+    ) -> Option<std::path::PathBuf> {
+        skill_destination(args, security)
     }
 
     fn description(&self) -> &'static str {
@@ -634,12 +942,14 @@ impl AgentTool for SkillWriteTool {
 
         // Overwrite in place when the skill already exists (could live in a shared skills root).
         if let Ok(path) = find_skill_file(security, &parsed.name) {
-            write_with_parents(&path, parsed.content, "skill").await?;
+            capture_checkpoint(security, &path)?;
+            write_with_parents(&path, parsed.content, "skill")?;
             return Ok(format!("Successfully updated {}", path.display()));
         }
 
-        let path = crate::agent::skills::SkillManager::new(security.root())
-            .save_skill(&parsed.name, &parsed.content)?;
+        let manager = crate::agent::skills::SkillManager::new(security.root());
+        capture_checkpoint(security, &manager.skill_path(&parsed.name)?)?;
+        let path = manager.save_skill(&parsed.name, &parsed.content)?;
         Ok(format!("Successfully created {}", path.display()))
     }
 }
@@ -660,6 +970,14 @@ impl AgentTool for SkillPatchTool {
         "skill_patch"
     }
 
+    fn destination(
+        &self,
+        args: &Value,
+        security: &WorkspaceSecurity,
+    ) -> Option<std::path::PathBuf> {
+        skill_destination(args, security)
+    }
+
     fn description(&self) -> &'static str {
         "Replace an exact snippet with new text inside an existing skill's SKILL.md"
     }
@@ -671,8 +989,26 @@ impl AgentTool for SkillPatchTool {
     async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
         let parsed = parse_args::<SkillPatchArgs>(args)?;
         let path = find_skill_file(security, &parsed.name)?;
-        replace_first(&path, &parsed.old_string, &parsed.new_string, "skill").await?;
-        Ok(format!("Successfully patched {}", parsed.name))
+        capture_checkpoint(security, &path)?;
+        let count = replace_unique(
+            &path,
+            &parsed.old_string,
+            &parsed.new_string,
+            false,
+            "skill",
+        )
+        .await?;
+        Ok(if count == 0 {
+            format!(
+                "No change to skill {}: old_string equals new_string",
+                parsed.name
+            )
+        } else {
+            format!(
+                "Successfully patched {} ({count} replacement(s))",
+                parsed.name
+            )
+        })
     }
 }
 
@@ -695,6 +1031,7 @@ impl ToolRegistry {
         registry.register(Arc::new(RunCommandTool));
         registry.register(Arc::new(SearchFilesTool));
         registry.register(Arc::new(SaveMemoryTool));
+        registry.register(Arc::new(ApplyPatchTool));
         registry.register(Arc::new(SkillViewTool));
         registry.register(Arc::new(SkillWriteTool));
         registry.register(Arc::new(SkillPatchTool));
@@ -741,3 +1078,7 @@ impl ToolRegistry {
         Ok(tool)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/core/tools.rs"]
+mod tests;

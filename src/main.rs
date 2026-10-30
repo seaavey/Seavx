@@ -1,7 +1,10 @@
 pub mod agent;
+mod atomic_file;
+mod checkpoint;
 mod cli;
 mod history;
 mod home;
+pub mod session;
 mod tui;
 mod util;
 
@@ -64,6 +67,12 @@ enum Commands {
     /// Inspect agent memory
     Memory,
 
+    /// List, show, resume or export stored sessions
+    Sessions {
+        #[command(subcommand)]
+        command: cli::sessions::SessionsCommand,
+    },
+
     /// Self-update SEAVX to the latest release
     Update {
         /// Force update even if already up to date
@@ -82,9 +91,7 @@ enum SetupSection {
 }
 
 fn init_tracing(debug_flag: bool) -> anyhow::Result<Option<PathBuf>> {
-    let log_dir = PathBuf::from(".seavx");
-    std::fs::create_dir_all(&log_dir)?;
-    let log_file_path = log_dir.join("debug.log");
+    let log_file_path = util::prepare_log_file(std::path::Path::new(".seavx"))?;
 
     let file = OpenOptions::new()
         .create(true)
@@ -129,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 Some(prompt.join(" "))
             };
-            tui::app::start_tui(initial_prompt).await?;
+            tui::app::start_tui(initial_prompt, None).await?;
         }
         Some(Commands::Exec { prompt }) => {
             let task = prompt.join(" ");
@@ -140,16 +147,27 @@ async fn main() -> anyhow::Result<()> {
 
             let security = agent::security::WorkspaceSecurity::new(".");
             let config = agent::engine::AgentConfig::load(security.root());
-            let runtime = agent::engine::AgentRuntime::new(config, security);
+            for batch in crate::checkpoint::recover_pending(security.root()).unwrap_or_default() {
+                eprintln!("{}", batch.render());
+            }
 
+            let runtime = agent::engine::AgentRuntime::new(config, security);
             println!("Executing task: {task}\n");
             let result = runtime
-                .execute_task(&task, agent::engine::AgentMode::Build, |evt| {
-                    // Reasoning blocks are a TUI concern; headless runs skip them.
-                    if !evt.starts_with("THINKING:") {
-                        println!("{evt}");
-                    }
-                })
+                .execute_task(
+                    &task,
+                    agent::engine::AgentMode::Build,
+                    Vec::new(),
+                    &agent::permissions::DenyingConfirmer,
+                    |evt| {
+                        // Reasoning blocks are a TUI concern; headless runs skip them.
+                        if !evt.starts_with("THINKING:") {
+                            println!("{evt}");
+                        }
+                    },
+                    // `seavx exec` stays session-free: no row is ever written.
+                    |_| {},
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -182,10 +200,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Model { model, effort }) => cli::model::run(model, effort).await?,
         Some(Commands::Memory) => cli::memory::run()?,
+        Some(Commands::Sessions { command }) => cli::sessions::run(command).await?,
         Some(Commands::Update { force }) => cli::update::run(force).await?,
         Some(Commands::Uninstall) => cli::uninstall::run()?,
         None => {
-            tui::app::start_tui(None).await?;
+            tui::app::start_tui(None, None).await?;
         }
     }
 

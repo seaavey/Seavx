@@ -49,3 +49,53 @@ pub fn frontmatter_value(md: &str, key: &str) -> Option<String> {
 pub fn unquote(s: &str) -> &str {
     s.trim().trim_matches('"').trim_matches('\'')
 }
+
+/// Create the directory and tighten an existing looser mode, so a legacy
+/// `0755` directory is repaired instead of trusted. One log line per repair.
+pub fn ensure_private_dir(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    tighten(path, mode)
+}
+
+/// Create the file (and its parent) and tighten an existing looser mode.
+pub fn ensure_private_file(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+    }
+    tighten(path, mode)
+}
+
+#[cfg(unix)]
+fn tighten(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let current = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if current != mode {
+        tracing::info!(
+            path = %path.display(),
+            from = format!("{current:o}"),
+            to = format!("{mode:o}"),
+            "tightened storage mode"
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// The debug log under `dir`, with the directory `0700` and the file `0600`.
+pub fn prepare_log_file(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    ensure_private_dir(dir, 0o700)?;
+    let path = dir.join("debug.log");
+    ensure_private_file(&path, 0o600)?;
+    Ok(path)
+}

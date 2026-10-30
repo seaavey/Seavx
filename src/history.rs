@@ -55,8 +55,10 @@ impl ChatHistory {
         if prompt.is_empty() {
             return;
         }
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Some(parent) = self.path.parent()
+            && let Err(error) = crate::util::ensure_private_dir(parent, 0o700)
+        {
+            tracing::warn!(%error, path = %parent.display(), "cannot prepare the history directory");
         }
 
         let mut entries = self.entries();
@@ -68,19 +70,31 @@ impl ChatHistory {
         if entries.len() > MAX_ENTRIES {
             let dropped = entries.len() - MAX_ENTRIES;
             self.write_all(&entries.into_iter().skip(dropped).collect::<Vec<_>>());
-        } else if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            // A hand-edited file may lack its trailing newline; without this the
-            // new prompt would merge into the previous line.
-            let unterminated = std::fs::read(&self.path)
-                .is_ok_and(|bytes| bytes.last().is_some_and(|byte| *byte != b'\n'));
-            if unterminated {
-                let _ = file.write_all(b"\n");
+        } else {
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+            {
+                Ok(mut file) => {
+                    if let Err(error) = crate::util::ensure_private_file(&self.path, 0o600) {
+                        tracing::warn!(%error, path = %self.path.display(), "cannot tighten the history file");
+                    }
+                    // A hand-edited file may lack its trailing newline; without
+                    // this the new prompt would merge into the previous line.
+                    let unterminated = std::fs::read(&self.path)
+                        .is_ok_and(|bytes| bytes.last().is_some_and(|byte| *byte != b'\n'));
+                    if unterminated {
+                        let _ = file.write_all(b"\n");
+                    }
+                    if let Err(error) = writeln!(file, "{}", escape(prompt)) {
+                        tracing::warn!(%error, path = %self.path.display(), "history write failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, path = %self.path.display(), "cannot open the history file");
+                }
             }
-            let _ = writeln!(file, "{}", escape(prompt));
         }
     }
 
@@ -93,7 +107,16 @@ impl ChatHistory {
             body.push('\n');
         }
         let tmp = self.path.with_extension("tmp");
-        if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &self.path).is_err() {
+        if let Err(error) = std::fs::write(&tmp, body) {
+            tracing::warn!(%error, path = %tmp.display(), "history rewrite failed");
+            return;
+        }
+        // The temp file is created with the umask, so it is tightened before it
+        // replaces the owner-only history file.
+        if let Err(error) = crate::util::ensure_private_file(&tmp, 0o600) {
+            tracing::warn!(%error, path = %tmp.display(), "cannot tighten the history file");
+        }
+        if std::fs::rename(&tmp, &self.path).is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
     }
@@ -139,5 +162,5 @@ fn unescape(text: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "../tests/core/history.rs"]
+#[path = "tests/core/history.rs"]
 mod tests;

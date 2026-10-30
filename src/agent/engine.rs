@@ -1,9 +1,14 @@
+use crate::agent::permissions::{
+    self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
+};
 use crate::agent::prompt::{PLAN_POLICY, load_system_prompt};
-use crate::agent::security::WorkspaceSecurity;
+use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
 use genai::Client;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort, ToolResponse};
+use genai::chat::{
+    ChatMessage, ChatOptions, ChatRequest, ChatResponse, ReasoningEffort, ToolResponse,
+};
 use genai::resolver::{AuthData, Endpoint};
 
 use serde::{Deserialize, Serialize};
@@ -52,13 +57,15 @@ pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
 
 /// Config keys that can appear in a config file, in display order.
-pub const CONFIG_KEYS: [&str; 6] = [
+pub const CONFIG_KEYS: [&str; 8] = [
     "model",
     "base_url",
     "api_key",
     "reasoning_effort",
     "max_turns",
     "system_prompt",
+    "tool_permissions",
+    "permitted_actions",
 ];
 
 /// Environment overrides that win over the file, paired with the key they set.
@@ -106,6 +113,17 @@ pub struct AgentConfig {
     pub api_key: Option<String>,
     pub reasoning_effort: Option<String>,
     pub system_prompt: Option<String>,
+    /// `deny` | `ask` | `allow`, kept raw so an invalid value is reported with
+    /// the file that holds it instead of being coerced to a silent default.
+    #[serde(default = "default_tool_permissions")]
+    pub tool_permissions: String,
+    /// Action kinds lifted from `ask` to `allow`; never `global-write`.
+    #[serde(default)]
+    pub permitted_actions: Vec<String>,
+}
+
+fn default_tool_permissions() -> String {
+    "ask".to_string()
 }
 
 impl Default for AgentConfig {
@@ -131,6 +149,8 @@ impl AgentConfig {
             api_key,
             reasoning_effort,
             system_prompt: None,
+            tool_permissions: default_tool_permissions(),
+            permitted_actions: Vec::new(),
         }
     }
 }
@@ -213,6 +233,16 @@ impl AgentConfig {
         let workspace_path = workspace_root.join(".seavx/config.toml");
         let global_path = home.map(|home| home.join(".seavx/config.toml"));
 
+        // A replace interrupted by a crash is resolved before the file is read.
+        for path in [Some(&workspace_path), global_path.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = crate::cli::config::recover_config(path) {
+                tracing::warn!(%error, "config recovery");
+            }
+        }
+
         let workspace_exists = workspace_path.exists();
         let global_exists = global_path.as_ref().is_some_and(|path| path.exists());
         let active_path = if workspace_exists {
@@ -278,20 +308,15 @@ impl AgentConfig {
         )
     }
 
-    /// Persist as pretty TOML under the workspace's `.seavx/config.toml`,
-    /// creating the directory when missing. TUI call-sites ignore errors.
+    /// Persist under the workspace's `.seavx/config.toml`. Call-sites that
+    /// cannot report an error ignore it.
     pub fn save(&self, workspace_root: &Path) -> std::io::Result<()> {
         self.write_to(&workspace_root.join(".seavx/config.toml"))
     }
 
-    /// Write the config as pretty TOML, creating parent directories if needed.
+    /// Write through the one validated config writer in `config.rs`.
     pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let toml_str =
-            toml::to_string_pretty(self).map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(path, toml_str)
+        crate::cli::config::write_agent_config(path, self).map_err(std::io::Error::other)
     }
 }
 
@@ -321,8 +346,37 @@ fn apply_env_overrides(
     }
 }
 
+/// One request, one response. The only place the engine talks to a provider, so
+/// a test can script turns without a network.
+#[async_trait::async_trait]
+pub trait ChatBackend: Send + Sync {
+    async fn send(
+        &self,
+        model: &str,
+        request: ChatRequest,
+        options: Option<&ChatOptions>,
+    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+struct GenaiBackend {
+    client: Client,
+}
+
+#[async_trait::async_trait]
+impl ChatBackend for GenaiBackend {
+    async fn send(
+        &self,
+        model: &str,
+        request: ChatRequest,
+        options: Option<&ChatOptions>,
+    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.client.exec_chat(model, request, options).await?)
+    }
+}
+
 pub struct AgentRuntime {
     client: Client,
+    backend: Box<dyn ChatBackend>,
     registry: ToolRegistry,
     security: WorkspaceSecurity,
     config: AgentConfig,
@@ -370,12 +424,28 @@ impl AgentRuntime {
         let client = builder
             .build()
             .unwrap_or_else(|_| Client::new().expect("Failed to initialize genai Client"));
+        let backend = Box::new(GenaiBackend {
+            client: client.clone(),
+        });
         Self {
             client,
+            backend,
             registry: ToolRegistry::with_default_tools(),
             security,
             config,
         }
+    }
+
+    /// Swap the provider seam; only tests use it, production always talks genai.
+    #[cfg(test)]
+    pub(crate) fn with_backend(
+        config: AgentConfig,
+        security: WorkspaceSecurity,
+        backend: Box<dyn ChatBackend>,
+    ) -> Self {
+        let mut runtime = Self::new(config, security);
+        runtime.backend = backend;
+        runtime
     }
 
     pub fn client(&self) -> &Client {
@@ -407,7 +477,10 @@ impl AgentRuntime {
         &self,
         task: &str,
         mode: AgentMode,
+        history: Vec<ChatMessage>,
+        confirm: &dyn Confirmer,
         mut event_sink: impl FnMut(&str) + Send,
+        mut on_message: impl FnMut(&ChatMessage),
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let system_prompt = self
             .config
@@ -419,8 +492,11 @@ impl AgentRuntime {
 
         let mut chat_req = ChatRequest::default()
             .with_tools(self.registry.to_genai_tools(mode))
-            .append_message(ChatMessage::system(&system_prompt))
-            .append_message(ChatMessage::user(task));
+            .append_message(ChatMessage::system(&system_prompt));
+        for message in history {
+            chat_req = chat_req.append_message(message);
+        }
+        chat_req = chat_req.append_message(ChatMessage::user(task));
 
         tracing::info!(model = %self.config.model, "Starting Seavx agent task");
 
@@ -443,8 +519,8 @@ impl AgentRuntime {
             );
 
             let response = self
-                .client
-                .exec_chat(&self.config.model, chat_req.clone(), Some(&chat_options))
+                .backend
+                .send(&self.config.model, chat_req.clone(), Some(&chat_options))
                 .await?;
 
             // Track real usage tokens from provider response
@@ -465,13 +541,22 @@ impl AgentRuntime {
             if tool_calls.is_empty() {
                 let final_text = response.clone().into_first_text().unwrap_or_default();
 
+                // The filler is not model output: only real text is reported.
+                if !final_text.trim().is_empty() {
+                    on_message(&ChatMessage::assistant(&final_text));
+                }
+
                 let return_text = if !final_text.trim().is_empty() {
                     final_text
                 } else {
                     "Task completed.".to_string()
                 };
 
-                tracing::info!(turns = turn + 1, final_output = %return_text, "Agent completed task");
+                tracing::info!(
+                    turns = turn + 1,
+                    final_output = %security::redact(&return_text),
+                    "Agent completed task"
+                );
 
                 // Auto-Skill Evaluation: a completed task that ran at least two tools is a
                 // candidate workflow (a single call is not), regardless of how many turns it took.
@@ -484,6 +569,7 @@ impl AgentRuntime {
 
             let assistant_msg = response.clone().into_assistant_message_for_tool_use();
             if let Some(msg) = assistant_msg {
+                on_message(&msg);
                 chat_req = chat_req.append_message(msg);
             }
 
@@ -516,22 +602,32 @@ impl AgentRuntime {
                     other => other.to_string(),
                 };
 
+                let args_summary = security::redact(&args_summary);
                 event_sink(&format!("Tool: {tool_name}({args_summary})"));
-                tracing::info!(tool = %tool_name, args = %args_summary, id = %call.call_id, "Executing agent tool");
+                Self::log_tool_call(tool_name, &args_summary, &call.call_id);
                 steps.push(format!("{tool_name}({args_summary})"));
 
                 let (result_str, is_err) = match self.registry.get_for_mode(tool_name, mode) {
                     Ok(tool) => {
                         let args = call.fn_arguments.clone();
-                        match tool.execute(args, &self.security).await {
-                            Ok(res) => (res, false),
-                            Err(err) => (format!("Error executing {tool_name}: {err}"), true),
+                        let kind = tool.classify(&args, &self.security);
+                        let detail = tool
+                            .destination(&args, &self.security)
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| args_summary.clone());
+                        match self.gate(confirm, kind, tool_name, &detail).await {
+                            Ok(()) => match tool.execute(args, &self.security).await {
+                                Ok(res) => (res, false),
+                                Err(err) => (format!("Error executing {tool_name}: {err}"), true),
+                            },
+                            Err(denied) => (denied, true),
                         }
                     }
                     Err(err) => (format!("Error executing {tool_name}: {err}"), true),
                 };
 
-                tracing::info!(tool = %tool_name, is_error = is_err, output = %result_str, "Agent tool completed");
+                let result_str = security::redact(&result_str);
+                Self::log_tool_result(tool_name, is_err, &result_str);
 
                 // Emit preview snippet of tool output (first 3 lines or 150 chars)
                 let preview = result_str.lines().take(3).collect::<Vec<_>>().join("\n");
@@ -543,10 +639,10 @@ impl AgentRuntime {
 
                 event_sink(&format!("Output:\n{truncated_preview}"));
 
-                chat_req = chat_req.append_message(ChatMessage::from(ToolResponse::new(
-                    call.call_id.clone(),
-                    result_str,
-                )));
+                let tool_message =
+                    ChatMessage::from(ToolResponse::new(call.call_id.clone(), result_str));
+                on_message(&tool_message);
+                chat_req = chat_req.append_message(tool_message);
             }
         }
 
@@ -558,12 +654,13 @@ impl AgentRuntime {
             .append_message(ChatMessage::user(final_prompt));
 
         let response = self
-            .client
-            .exec_chat(&self.config.model, forced_req, Some(&chat_options))
+            .backend
+            .send(&self.config.model, forced_req, Some(&chat_options))
             .await?;
 
         let final_text = response.into_first_text().unwrap_or_default();
         if !final_text.trim().is_empty() {
+            on_message(&ChatMessage::assistant(&final_text));
             Ok(final_text)
         } else {
             Ok(
@@ -573,7 +670,78 @@ impl AgentRuntime {
         }
     }
 
-    fn log_request_payload(
+    /// One place decides a tool call: the matrix, then the human, then the
+    /// answer's persistence. A denial is a tool result, never a turn failure.
+    pub(crate) async fn gate(
+        &self,
+        confirm: &dyn Confirmer,
+        kind: ActionKind,
+        tool: &str,
+        detail: &str,
+    ) -> Result<(), String> {
+        let denied = || format!("Permission denied: {}", kind.effect(detail));
+        match permissions::decide(self.permission_mode(), &self.permitted_kinds(), kind) {
+            Verdict::Allow => return Ok(()),
+            Verdict::Deny => return Err(denied()),
+            Verdict::Ask => {}
+        }
+
+        let answer = confirm
+            .confirm(PermissionRequest::new(kind, tool, detail))
+            .await;
+        let path = crate::cli::config::workspace_config_path(self.security.root());
+        match answer {
+            Answer::Once => Ok(()),
+            Answer::Category => match crate::cli::config::append_permitted(&path, kind) {
+                Ok(kinds) => {
+                    tracing::info!(action = %kind.name(), ?kinds, "permitted action recorded");
+                    Ok(())
+                }
+                // The user answered; a config that cannot record it must not
+                // turn an approval into a denial.
+                Err(error) => {
+                    tracing::warn!(%error, action = %kind.name(), "could not record permitted action");
+                    Ok(())
+                }
+            },
+            Answer::Unrestricted => {
+                if let Err(error) = crate::cli::config::set_value(
+                    &path,
+                    crate::cli::config::ConfigKey::ToolPermissions,
+                    "allow",
+                ) {
+                    tracing::warn!(%error, "could not persist tool_permissions");
+                }
+                Ok(())
+            }
+            Answer::Deny => Err(denied()),
+        }
+    }
+
+    /// An invalid mode asks rather than allowing: a broken config must not widen
+    /// permissions.
+    fn permission_mode(&self) -> PermissionMode {
+        permissions::parse_mode(&self.config.tool_permissions).unwrap_or_else(|error| {
+            tracing::warn!(%error, "tool_permissions is invalid; asking");
+            PermissionMode::Ask
+        })
+    }
+
+    fn permitted_kinds(&self) -> Vec<ActionKind> {
+        permissions::parse_permitted(&self.config.permitted_actions).unwrap_or_default()
+    }
+
+    /// The only place tool activity is logged, so redaction cannot be forgotten
+    /// by a new call site: the argument is masked here, not by the caller.
+    pub(crate) fn log_tool_call(tool: &str, args: &str, id: &str) {
+        tracing::info!(tool = %tool, args = %security::redact(args), id = %id, "Executing agent tool");
+    }
+
+    pub(crate) fn log_tool_result(tool: &str, is_error: bool, output: &str) {
+        tracing::info!(tool = %tool, is_error = is_error, output = %security::redact(output), "Agent tool completed");
+    }
+
+    pub(crate) fn log_request_payload(
         model: &str,
         turn: usize,
         chat_req: &ChatRequest,
@@ -626,7 +794,11 @@ impl AgentRuntime {
                         }
                     }
                 };
-                summary.push_str(&format!("  msg[{}][{role}]: {content_summary}\n", idx));
+                summary.push_str(&format!(
+                    "  msg[{}][{role}]: {}\n",
+                    idx,
+                    security::redact(&content_summary)
+                ));
             }
 
             // List tool names concisely instead of thousands of JSON schema lines

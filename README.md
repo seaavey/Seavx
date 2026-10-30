@@ -70,6 +70,49 @@ so recall survives restarts and picks up prompts written by another session.
 
 ---
 
+## 🗂️ Sessions
+
+A TUI conversation is stored in SQLite, so a session closed mid-conversation can
+be resumed with its message order, tool calls and results intact. `seavx exec`
+stays session-free and writes nothing.
+
+- Location: `~/.seavx/sessions.db`, or `.seavx/sessions.db` in the workspace in
+  debug mode. The file is `0600` and its directory `0700`; a looser mode left by
+  an older install is tightened on start.
+- `journal_mode=WAL` with `synchronous=NORMAL`: a final message lost in an
+  unclean shutdown is acceptable, a whole session is not. Move to `FULL` if that
+  trade ever matters.
+- Prompts and assistant text are stored verbatim — the database is conversation
+  history, not a log. Tool output is redacted before it is stored; checkpoint
+  backups stay byte-for-byte.
+- Resume replays stored messages, newest turns up to 80 000 bytes, cut at a user
+  row; anything older becomes one `System: N older messages omitted` line. No
+  summarisation and no network call on start.
+- `payload_format` records the writer (`genai-chat-v1`). A session written by
+  another format opens read-only: it renders, lists and exports, and new turns
+  are refused with the reason.
+- A turn that never finished reads `pending`, never `interrupted`. rc.3 has no
+  lease, so a live writer and a dead one look alike; `interrupted` means a
+  recovery pass already wrote the synthetic tool result.
+- An unanswered prompt is shown once, prefilled in the input, and excluded from
+  the next request by the replay rule; pressing Enter sends one new row, never a
+  duplicate.
+
+```bash
+seavx sessions list          # id, age, messages, state, title
+seavx sessions show 12       # full transcript
+seavx sessions export 12 > session.json
+seavx sessions resume 12     # open the TUI with that session
+```
+
+Retention: sessions are not pruned (roughly 1 KB per turn). To delete, stop
+Seavx and remove the database: `rm ~/.seavx/sessions.db*`. To back up, copy
+`sessions.db` with its `-wal` and `-shm` files while Seavx is closed, or run
+`PRAGMA wal_checkpoint(TRUNCATE)` first. `/clear` starts a new session; the old
+one stays listed and resumable.
+
+---
+
 ## ⚙️ Configuration
 
 Configure a provider once per machine (base URL, API key, model, reasoning effort):
@@ -120,7 +163,14 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/init` | Create `.seavx/config.toml` with defaults. |
 | `/doctor [--offline]` | Check config, key, endpoint, cache, workspace, memory, and skills. |
 | `/memory [show\|project\|user\|skills\|path]` | Inspect persistent memory and installed skills. |
+| `/undo` | Restore files from the newest checkpoint and remove it; repeat to walk back. |
 | `/exit` | Quit the TUI. |
+
+Permission keys, written by `/config set` and by the permission prompt itself:
+```toml
+tool_permissions = "ask"          # deny | ask | allow
+permitted_actions = ["execute"]   # execute, network — only these are liftable
+```
 
 `/config` never writes `api_key`; use `seavx setup providers` to change keys. Config writes preserve comments and unknown keys and are atomic.
 
@@ -128,18 +178,41 @@ Type `/` in the interactive prompt to list and run these commands:
 
 ## 🛡️ Built-in Capabilities & Security
 
-- **Safe Workspace Jail**: Canonical path verification preventing path traversal outside workspace.
-- **Credential Protection**: Hardened blacklist against sensitive patterns (`.env*`, SSH keys, `.git` metadata).
+- **Safe Workspace Jail**: Canonical path verification, plus a pre-open identity snapshot compared against the opened descriptor — a swapped symlink or an in-place edit between validation and open is refused.
+- **Credential Protection**: Names and locations are refused before a read or a write:
+  - directories: `.git`, `.ssh`, `.gnupg`, `.aws`
+  - prefixes: `.env*`, `id_rsa*`, `id_ed25519*`, `id_ecdsa*`, `.netrc*`
+  - names: `credentials`, `credentials.json`, `secrets.{json,yaml,yml,toml}`, `.npmrc`, `.pypirc`, `.htpasswd`
+  - suffixes: `.pem`, `.key`, `.p12`, `.pfx`, `.kdbx`, `.jks`, `.keystore`, `.ppk`
+  - and `config.toml` inside `.seavx`, plus the checkpoint store and session database. `.seavx/MEMORY.md`, `USER.md`, specs and the debug log stay readable.
+- **Permission Matrix**: every tool call is decided by one matrix. Writes inside the workspace are ungated because the path policy confines them and checkpoints make them reversible; anything that can leave the workspace asks.
+
+  | `tool_permissions` | read | write (in workspace) | global write | allowlisted command | other command | network | destructive |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `deny` | allow | deny | deny | allow | deny | deny | deny |
+  | `ask` (default) | allow | allow | **ask** | allow | ask | ask | deny |
+  | `allow` | allow | allow | **ask** | allow | allow | allow | deny |
+
+  - **Global writes ask in every mode**, `allow` included: memory files (`~/.seavx/MEMORY.md`, `~/.seavx/USER.md`) and skills under `~/.seavx/skills` or `~/.agents/skills`. They are checkpointed before the write, so `/undo` restores them. The shell reaches the same floor: a `cp`/`mv`/`tee`/`dd`/redirection destination inside those roots asks, and one inside the checkpoint store is refused.
+  - The **destructive floor** (`rm -rf`, `mkfs`, `dd of=/dev/…`, `shutdown`, `reboot`, fork bombs) is refused unconditionally; no key or config lifts it.
+  - `permitted_actions = ["execute", "network"]` lifts those two kinds from ask to allow in `ask` mode only. `global-write` and `destructive` are not accepted there — naming one is a config error.
+  - Answers: **once** (this call), **category** (appends to `permitted_actions`), **unrestricted** (`tool_permissions = "allow"`). Quitting while a question is pending counts as a denial; `seavx exec` always denies and says so in the tool result.
+  - Rule-of-thumb: a key command that cannot be proven read-only asks. Any `rg`/`grep` that walks a directory asks, and its output is filtered line by line afterwards (`[N lines withheld by policy]`).
+- **Redaction**: tool output, tool errors, permission prompts and log lines are masked (`api_key=…`, `Bearer …`, `sk-`/`ghp_`/`xoxb-`/`ntn_`/`AKIA…`, private-key bodies). User prompts and assistant text stay verbatim; checkpoint backups are byte-for-byte.
+- **Not prevented** (stated, not implied): deliberate shell obfuscation (`eval`, base64, `curl | sh`, a path assembled inside a script), exfiltration by an allowed command, timing channels, and any OS-level containment. This is a gate, not a sandbox; closing that gap needs `openat2(RESOLVE_BENEATH)`, namespaces or seccomp.
+- **Unix-only**: file-mode policy and hard-link refusal are enforced on Unix; on Windows the mode policy is a no-op and backup identity degrades to length plus checksum.
 - **Coding Tools**:
   - `read_file`: Line pagination (offset/limit) & truncation guards.
   - `write_file`: Safe directory creation and atomic file writing.
-  - `edit_file`: Precise search-and-replace patching.
+  - `edit_file`: Precise search-and-replace. A snippet that occurs more than once is refused with the count and up to three samples; pass `replace_all: true` to change every occurrence.
+  - `apply_patch`: Strict unified diff over one or more files, applied in memory first and committed as one unit. Exact context only — no fuzz, no 3-way merge.
   - `search_files`: Fast in-process grep & filename globbing (ignores `.git`, `target`, `node_modules`).
   - `run_command`: Bounded execution with 30s timeout.
   - `save_memory`: Singularity-gated persistence with confidence scoring.
   - `skill_view`: On-demand progressive disclosure skill loader.
   - `skill_write`: Create or fully rewrite a skill.
   - `skill_patch`: Exact string replacement inside an existing skill.
+- **Batched edits**: one `apply_patch` call writes all its files or none. Each file is capped at 16 MB, a batch at 64 files and 128 MB of staged bytes; the checkpoint store keeps the newest 200 batches and never evicts a live one. Batch atomicity holds while the process lives; a crash is reported at the next start (`batch interrupted: …`) and undone with `/undo`. Nothing is rolled back automatically.
 - **Autonomous Self-Improvement**: Post-task workflow evaluator with ≥ 75% confidence singularity gate, persisting reusable workflows to `.seavx/skills/`.
 
 ---
