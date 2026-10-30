@@ -19,7 +19,8 @@ pub const PAYLOAD_FORMAT: &str = "genai-chat-v1";
 /// ledger, which every older file gains in the same transaction. 4 added goals,
 /// criteria and tasks, and rebuilt that ledger so a goal can own its events.
 /// 5 added resumable clarification questions and the `question` event kind.
-pub const SCHEMA_VERSION: u32 = 5;
+/// 6 added fork/archive metadata: `parent_session_id`, `fork_seq`, `archived_at`.
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Total budget for one write: three attempts, 100 ms and 200 ms waits.
 pub const WRITE_BUDGET: Duration = Duration::from_secs(5);
@@ -783,6 +784,14 @@ fn new_slug() -> String {
 
 /// The one `INSERT` behind `create`; kept out of the closure so a slug
 /// collision can be retried without repeating the statement.
+/// `LIKE` treats `%` and `_` as patterns; a search for them is literal.
+fn escape_like(query: &str) -> String {
+    query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn insert_session(
     connection: &Connection,
     slug: &str,
@@ -908,7 +917,11 @@ CREATE TABLE IF NOT EXISTS sessions(
     total_tokens INTEGER NOT NULL DEFAULT 0,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    -- v6: where a fork came from, and when this session was archived.
+    parent_session_id INTEGER,
+    fork_seq INTEGER,
+    archived_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS messages(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1137,6 +1150,25 @@ impl SessionStore {
             transaction
                 .execute_batch("ALTER TABLE sessions ADD COLUMN slug TEXT NOT NULL DEFAULT ''")?;
         }
+        // v6 columns: nullable, so every existing row keeps its meaning.
+        for (column, sql) in [
+            (
+                "parent_session_id",
+                "ALTER TABLE sessions ADD COLUMN parent_session_id INTEGER",
+            ),
+            (
+                "fork_seq",
+                "ALTER TABLE sessions ADD COLUMN fork_seq INTEGER",
+            ),
+            (
+                "archived_at",
+                "ALTER TABLE sessions ADD COLUMN archived_at INTEGER",
+            ),
+        ] {
+            if !names.iter().any(|name| name == column) {
+                transaction.execute_batch(sql)?;
+            }
+        }
         // After the column, never in `SCHEMA`: an index on a column the v1
         // table does not have yet would fail the whole batch.
         transaction.execute_batch(
@@ -1244,6 +1276,217 @@ impl SessionStore {
         })
     }
 
+    // ---- fork, archive, search --------------------------------------------
+
+    /// Copy the source session's prefix into a new independent session.
+    ///
+    /// `boundary` is the last message `seq` to copy; `None` means the newest
+    /// complete turn. The source is only read: its rows, slug and timestamps are
+    /// untouched, and a refusal happens before anything is written.
+    pub fn fork(
+        &self,
+        workspace: &str,
+        source: i64,
+        boundary: Option<i64>,
+    ) -> Result<i64, SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let forked = (|| {
+                let (owner, title, model): (String, Option<String>, Option<String>) = connection
+                    .query_row(
+                        "SELECT workspace, title, model FROM sessions WHERE id = ?1",
+                        [source],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?
+                    .ok_or(SessionError::Unknown(source))?;
+                if owner != workspace {
+                    return Err(SessionError::Unknown(source));
+                }
+
+                let newest: Option<i64> = connection
+                    .query_row(
+                        "SELECT MAX(seq) FROM messages WHERE session_id = ?1",
+                        [source],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let boundary = boundary.or(newest).ok_or_else(|| {
+                    SessionError::Refused(format!("session {source} has nothing to fork"))
+                })?;
+                let status: Option<String> = connection
+                    .query_row(
+                        "SELECT status FROM messages WHERE session_id = ?1 AND seq = ?2",
+                        params![source, boundary],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match status.as_deref() {
+                    None => {
+                        return Err(SessionError::Refused(format!(
+                            "session {source} has no message {boundary}"
+                        )));
+                    }
+                    Some("complete") => {}
+                    Some(_) => {
+                        return Err(SessionError::Refused(format!(
+                            "message {boundary} is not a completed turn; fork only at a finished boundary"
+                        )));
+                    }
+                }
+
+                let mut slug = new_slug();
+                let mut row = connection.execute(
+                    "INSERT INTO sessions(slug, workspace, title, model, payload_format, status,
+                                         created_at, updated_at, parent_session_id, fork_seq)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7, ?8)",
+                    params![slug, workspace, title, model, PAYLOAD_FORMAT, now, source, boundary],
+                );
+                if let Err(rusqlite::Error::SqliteFailure(error, _)) = &row
+                    && error.code == rusqlite::ErrorCode::ConstraintViolation
+                {
+                    slug = new_slug();
+                    row = connection.execute(
+                        "INSERT INTO sessions(slug, workspace, title, model, payload_format, status,
+                                             created_at, updated_at, parent_session_id, fork_seq)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7, ?8)",
+                        params![slug, workspace, title, model, PAYLOAD_FORMAT, now, source, boundary],
+                    );
+                }
+                row?;
+                let copy = connection.last_insert_rowid();
+                connection.execute(
+                    "INSERT INTO messages(session_id, seq, role, payload, status, created_at)
+                     SELECT ?1, seq, role, payload, status, created_at
+                     FROM messages WHERE session_id = ?2 AND seq <= ?3 ORDER BY seq",
+                    params![copy, source, boundary],
+                )?;
+                Ok(copy)
+            })();
+            finish(connection, forked)
+        })?
+    }
+
+    /// Hide a session from the default list without deleting a single row.
+    pub fn archive(&self, workspace: &str, id: i64, archived: bool) -> Result<(), SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let written = (|| {
+                let owner: String = connection
+                    .query_row(
+                        "SELECT workspace FROM sessions WHERE id = ?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or(SessionError::Unknown(id))?;
+                if owner != workspace {
+                    return Err(SessionError::Unknown(id));
+                }
+                connection.execute(
+                    "UPDATE sessions SET archived_at = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![id, archived.then_some(now), now],
+                )?;
+                Ok(())
+            })();
+            finish(connection, written)
+        })?
+    }
+
+    /// The session rows this workspace has, newest first. Archived sessions are
+    /// left out unless `include_archived` asks for them.
+    pub fn list_with_archived(
+        &self,
+        workspace: &str,
+        include_archived: bool,
+    ) -> Result<Vec<SessionSummary>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.slug, s.title, s.updated_at, COUNT(m.id)
+             FROM sessions s JOIN messages m ON m.session_id = s.id
+             WHERE s.workspace = ?1 AND (?2 OR s.archived_at IS NULL)
+             GROUP BY s.id
+             HAVING COUNT(m.id) > 0
+             ORDER BY s.updated_at DESC, s.id DESC",
+        )?;
+        let rows: Vec<(i64, String, Option<String>, i64, i64)> = statement
+            .query_map(params![workspace, include_archived], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+        Ok(rows
+            .into_iter()
+            .map(|(id, slug, title, updated_at, messages)| SessionSummary {
+                id,
+                slug,
+                title: title.unwrap_or_else(|| format!("session {id}")),
+                updated_at,
+                messages: messages as usize,
+                state: TurnState::Idle,
+            })
+            .collect())
+    }
+
+    /// Literal title and message-content search inside one workspace. The query
+    /// is bound as a value, never spliced into SQL, and the result is capped.
+    pub fn search(
+        &self,
+        workspace: &str,
+        query: &str,
+        include_archived: bool,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>, SessionError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", escape_like(query));
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.slug, s.title, s.updated_at, COUNT(m.id)
+             FROM sessions s JOIN messages m ON m.session_id = s.id
+             WHERE s.workspace = ?1 AND (?2 OR s.archived_at IS NULL)
+               AND (COALESCE(s.title, '') LIKE ?3 ESCAPE '\\'
+                    OR m.payload LIKE ?3 ESCAPE '\\')
+             GROUP BY s.id
+             ORDER BY s.updated_at DESC, s.id DESC
+             LIMIT ?4",
+        )?;
+        let rows: Vec<(i64, String, Option<String>, i64, i64)> = statement
+            .query_map(
+                params![workspace, include_archived, pattern, limit as i64],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?
+            .collect::<Result<_, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, slug, title, updated_at, messages)| SessionSummary {
+                id,
+                slug,
+                title: title.unwrap_or_else(|| format!("session {id}")),
+                updated_at,
+                messages: messages as usize,
+                state: TurnState::Idle,
+            })
+            .collect())
+    }
+
     /// Resolve the id a user typed: the `svx-…` slug, or a bare number from a
     /// build that had no slugs.
     pub fn id_for(&self, key: &str) -> Result<i64, SessionError> {
@@ -1320,7 +1563,7 @@ impl SessionStore {
         let mut statement = self.connection.prepare(
             "SELECT s.id, s.slug, s.title, s.updated_at, COUNT(m.id)
              FROM sessions s JOIN messages m ON m.session_id = s.id
-             WHERE s.workspace = ?1
+             WHERE s.workspace = ?1 AND s.archived_at IS NULL
              GROUP BY s.id
              HAVING COUNT(m.id) > 0
              ORDER BY s.updated_at DESC, s.id DESC",

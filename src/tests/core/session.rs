@@ -2108,3 +2108,147 @@ fn a_pending_question_is_not_repaired_as_interrupted() {
         "a question waiting on the user is not an interruption: {repaired:?}"
     );
 }
+
+#[test]
+fn a_session_forks_its_prefix_and_leaves_the_source_alone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let source = store.create("ws", None, Some("original")).unwrap();
+    for (index, text) in ["first", "second", "third"].iter().enumerate() {
+        let message = ChatMessage::user(*text);
+        store
+            .record_message(source, &message, MessageStatus::Complete)
+            .unwrap();
+        assert_eq!(index + 1, store.load(source).unwrap().messages.len());
+    }
+
+    // Default boundary: the newest complete message.
+    let fork = store.fork("ws", source, None).unwrap();
+    let forked = store.load(fork).unwrap();
+    assert_eq!(forked.messages.len(), 3);
+    assert_ne!(
+        forked.slug,
+        store.load(source).unwrap().slug,
+        "its own slug"
+    );
+    let (parent, seq): (Option<i64>, Option<i64>) = store
+        .connection
+        .query_row(
+            "SELECT parent_session_id, fork_seq FROM sessions WHERE id = ?1",
+            [fork],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((parent, seq), (Some(source), Some(3)));
+
+    // An explicit boundary copies exactly that prefix.
+    let half = store.fork("ws", source, Some(2)).unwrap();
+    assert_eq!(store.load(half).unwrap().messages.len(), 2);
+
+    // The source is untouched.
+    assert_eq!(store.load(source).unwrap().messages.len(), 3);
+    let (parent, seq): (Option<i64>, Option<i64>) = store
+        .connection
+        .query_row(
+            "SELECT parent_session_id, fork_seq FROM sessions WHERE id = ?1",
+            [source],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((parent, seq), (None, None));
+
+    // Another workspace cannot fork it, and a bad boundary is refused.
+    assert!(store.fork("/other", source, None).is_err());
+    assert!(store.fork("ws", source, Some(99)).is_err());
+}
+
+#[test]
+fn archive_hides_a_session_without_deleting_anything() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let kept = store.create("ws", None, Some("kept")).unwrap();
+    let hidden = store.create("ws", None, Some("hidden")).unwrap();
+    for id in [kept, hidden] {
+        store
+            .record_message(id, &ChatMessage::user("hello"), MessageStatus::Complete)
+            .unwrap();
+    }
+
+    store.archive("ws", hidden, true).unwrap();
+    let visible: Vec<i64> = store.list("ws").unwrap().iter().map(|s| s.id).collect();
+    assert_eq!(visible, vec![kept]);
+    let all: Vec<i64> = store
+        .list_with_archived("ws", true)
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(all.len(), 2);
+
+    // Archived is hidden, not gone: it still loads, and answering it works.
+    assert_eq!(store.load(hidden).unwrap().messages.len(), 1);
+    assert!(store.fork("ws", hidden, None).is_ok());
+
+    store.archive("ws", hidden, false).unwrap();
+    let visible: Vec<i64> = store.list("ws").unwrap().iter().map(|s| s.id).collect();
+    assert!(
+        visible.contains(&hidden),
+        "unarchive brings it back: {visible:?}"
+    );
+    assert!(store.archive("/other", hidden, true).is_err());
+}
+
+#[test]
+fn search_is_literal_bounded_and_workspace_scoped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let hit = store.create("ws", None, Some("parser work")).unwrap();
+    let other = store.create("ws", None, Some("unrelated")).unwrap();
+    let elsewhere = store.create("/other", None, Some("parser work")).unwrap();
+    store
+        .record_message(
+            hit,
+            &ChatMessage::user("100% done"),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+    store
+        .record_message(
+            other,
+            &ChatMessage::user("nothing here"),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+    store
+        .record_message(
+            elsewhere,
+            &ChatMessage::user("parser work"),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+
+    let by_title: Vec<i64> = store
+        .search("ws", "parser", false, 10)
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(by_title, vec![hit], "other workspace stays out");
+
+    // `%` is a literal, not a wildcard.
+    let literal: Vec<i64> = store
+        .search("ws", "100%", false, 10)
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(literal, vec![hit]);
+    assert!(store.search("ws", "%", false, 10).unwrap().len() == 1);
+
+    // Bounded, and archived excluded unless asked for.
+    assert_eq!(store.search("ws", "e", false, 1).unwrap().len(), 1);
+    store.archive("ws", hit, true).unwrap();
+    assert!(store.search("ws", "parser", false, 10).unwrap().is_empty());
+    assert_eq!(store.search("ws", "parser", true, 10).unwrap().len(), 1);
+    assert!(store.search("ws", "   ", false, 10).unwrap().is_empty());
+}
