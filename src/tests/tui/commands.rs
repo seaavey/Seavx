@@ -113,6 +113,7 @@ fn every_registry_entry_parses_to_a_handled_command() {
                 action: SkillsAction::List,
             },
         ),
+        ("/test", SlashCommand::Test),
         (
             "/steer",
             SlashCommand::Steer {
@@ -258,6 +259,7 @@ fn the_palette_is_the_table() {
             "/plan",
             "/ask",
             "/review",
+            "/test",
             "/steer",
             "/queue",
             "/clear",
@@ -1075,4 +1077,57 @@ fn steering_and_queuing_parse_their_text_and_refuse_while_idle() {
     // The engine takes it exactly once.
     assert_eq!(app.steer.lock().unwrap().take().as_deref(), Some("hurry"));
     assert!(!app.steer_waiting());
+}
+
+#[test]
+fn a_test_is_only_proposed_when_a_manifest_declares_one() {
+    // No manifest: no command, no guess.
+    assert_eq!(propose_test(&["src/main.rs".to_string()], false), None);
+    assert_eq!(
+        propose_test(&["package.json".to_string()], false),
+        Some((
+            "npm test --silent".to_string(),
+            "package.json declares the test script".to_string()
+        ))
+    );
+    // A root manifest is enough, and Cargo wins when both are around.
+    assert_eq!(
+        propose_test(&["src/lib.rs".to_string()], true).map(|(command, _)| command),
+        Some("cargo test".to_string())
+    );
+}
+
+#[test]
+fn test_counts_come_from_cargos_summary_or_are_unavailable() {
+    let output = "running 12 tests\ntest result: ok. 9 passed; 1 failed; 2 ignored; 0 measured; 3 filtered out\n";
+    assert_eq!(
+        summarize_test_output(output, false),
+        (Some(9), Some(1), Some(2), Some(3))
+    );
+
+    // Truncated or unrecognised output claims no counts at all.
+    assert_eq!(
+        summarize_test_output(output, true),
+        (None, None, None, None)
+    );
+    assert_eq!(
+        summarize_test_output("everything is fine, trust me", false),
+        (None, None, None, None)
+    );
+
+    // The process status decides the verdict, never the text.
+    let passed = test_report("cargo test", Some(0), output, false);
+    assert!(
+        passed.contains("passed") && passed.contains("passed 9"),
+        "{passed}"
+    );
+    let failed = test_report(
+        "cargo test",
+        Some(101),
+        "test result: ok. 1 passed; 0 failed",
+        false,
+    );
+    assert!(failed.contains("failed"), "{failed}");
+    let unknown = test_report("cargo test", Some(0), output, true);
+    assert!(unknown.contains("counts unavailable"), "{unknown}");
 }

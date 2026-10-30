@@ -50,6 +50,7 @@ pub enum CommandId {
     Resume,
     Goal,
     Tasks,
+    Test,
     Steer,
     Queue,
     Status,
@@ -102,6 +103,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "/review [working-tree|staged|commit <ref>|base <ref>]",
         summary: "Review a git target and report findings, read-only",
         id: CommandId::Review,
+    },
+    CommandSpec {
+        name: "/test",
+        usage: "/test",
+        summary: "Propose the test command for the changed files, then run it",
+        id: CommandId::Test,
     },
     CommandSpec {
         name: "/steer",
@@ -216,6 +223,8 @@ pub enum SlashCommand {
         effort: Option<String>,
     },
     Clear,
+    /// Propose and, once permitted, run the workspace's test command.
+    Test,
     /// Talk to the turn that is running; delivered at its next safe boundary.
     Steer {
         text: String,
@@ -319,6 +328,7 @@ pub enum CommandEffect {
     RunGoal {
         action: GoalAction,
     },
+    RunTest,
     /// Read the current goal's tasks.
     RunTasks,
     OpenSessionPicker,
@@ -436,6 +446,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         CommandId::Ask => SlashCommand::Ask {
             question: args.join(" "),
         },
+        CommandId::Test => SlashCommand::Test,
         CommandId::Steer => SlashCommand::Steer {
             text: args.join(" "),
         },
@@ -616,6 +627,103 @@ pub fn status_text(app: &App) -> String {
     lines.join("\n")
 }
 
+// ---- /test: propose, then verify ---------------------------------------
+
+/// The command a test run would use, with the evidence that justifies it.
+///
+/// A guess is not a proposal: the command is only offered when a manifest in
+/// the changed set (or at the root) actually declares tests.
+pub(crate) fn propose_test(changed: &[String], root_has_cargo: bool) -> Option<(String, String)> {
+    let cargo = root_has_cargo
+        || changed
+            .iter()
+            .any(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
+    if cargo {
+        return Some((
+            "cargo test".to_string(),
+            "Cargo.toml declares the Rust test targets".to_string(),
+        ));
+    }
+    let package = changed
+        .iter()
+        .any(|path| path == "package.json" || path.ends_with("/package.json"));
+    if package {
+        return Some((
+            "npm test --silent".to_string(),
+            "package.json declares the test script".to_string(),
+        ));
+    }
+    None
+}
+
+/// Cargo's own summary, when it is there to read: passed, failed, ignored,
+/// not-run. Anything unrecognised or truncated answers `None` for every count;
+/// success is never inferred from text.
+pub(crate) fn summarize_test_output(
+    output: &str,
+    truncated: bool,
+) -> (Option<usize>, Option<usize>, Option<usize>, Option<usize>) {
+    if truncated {
+        return (None, None, None, None);
+    }
+    let Some(line) = output
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with("test result:"))
+    else {
+        return (None, None, None, None);
+    };
+    let number = |label: &str| -> Option<usize> {
+        let at = line.find(label)?;
+        line[..at]
+            .split_whitespace()
+            .last()
+            .and_then(|value| value.parse().ok())
+    };
+    let passed = number(" passed");
+    let failed = number(" failed");
+    let ignored = number(" ignored");
+    let not_run = number(" filtered out");
+    if passed.is_none() && failed.is_none() {
+        return (None, None, None, None);
+    }
+    (passed, failed, ignored, not_run)
+}
+
+/// The line the user reads after a `/test`.
+pub(crate) fn test_report(
+    command: &str,
+    status: Option<i32>,
+    output: &str,
+    truncated: bool,
+) -> String {
+    let (passed, failed, ignored, not_run) = summarize_test_output(output, truncated);
+    let verdict = match status {
+        Some(0) => "passed",
+        Some(_) => "failed",
+        None => "did not finish",
+    };
+    let counts = if passed.is_none() && failed.is_none() {
+        "counts unavailable (output truncated or unrecognised)".to_string()
+    } else {
+        format!(
+            "passed {}{} ignored {}{}",
+            passed.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+            failed.map(|n| format!(", failed {n}")).unwrap_or_default(),
+            ignored.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+            not_run
+                .map(|n| format!(", filtered out {n}"))
+                .unwrap_or_default()
+        )
+    };
+    format!(
+        "`{command}` {verdict} (exit {})\n{counts}",
+        status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
+}
+
 /// Apply a parsed command. Anything that needs the async event loop is
 /// returned as an effect instead of being performed here.
 pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
@@ -749,6 +857,7 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         // Handled above the busy gate; unreachable here, but the match must
         // still say so.
         SlashCommand::Steer { .. } | SlashCommand::Queue { .. } => CommandEffect::Handled,
+        SlashCommand::Test => CommandEffect::RunTest,
         SlashCommand::Sessions { index } => match index {
             // The picker is the list: no number means "let me choose".
             None => CommandEffect::OpenSessionPicker,

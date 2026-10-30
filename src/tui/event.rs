@@ -69,6 +69,14 @@ pub enum Action {
         options: Vec<String>,
         reply: tokio::sync::oneshot::Sender<(crate::session::QuestionState, String)>,
     },
+    /// A `/test` proposal is on screen and waiting for the user's permission.
+    TestProposed {
+        command: String,
+        evidence: String,
+        changed: usize,
+    },
+    /// The result of a `/test` run, or the reason it did not run.
+    TestDone(String),
     PermissionAsk {
         request: crate::agent::permissions::PermissionRequest,
         reply: tokio::sync::oneshot::Sender<crate::agent::permissions::Answer>,

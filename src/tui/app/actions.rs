@@ -263,6 +263,68 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                 Err(error) => app.push_notice(error),
             }
         }
+        Action::TestProposed {
+            command,
+            evidence,
+            changed,
+        } => {
+            app.status = AgentState::Idle;
+            app.push_notice(format!(
+                "Proposed: {command}\n{evidence} ({changed} changed file(s)). Press y to run it."
+            ));
+            // The same permission prompt the agent uses: `/test` never runs a
+            // command the user did not approve.
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            app.pending_permission = Some(PendingPermission {
+                request: crate::agent::permissions::PermissionRequest::new(
+                    crate::agent::permissions::ActionKind::Write,
+                    "run_command",
+                    &command,
+                ),
+                reply,
+            });
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                use crate::agent::permissions::Answer;
+                let allowed = matches!(
+                    answer.await,
+                    Ok(Answer::Once | Answer::Category | Answer::Unrestricted)
+                );
+                if !allowed {
+                    let _ = tx.send(Action::TestDone(format!(
+                        "`{command}` not run: permission denied."
+                    )));
+                    return;
+                }
+                let security = crate::agent::security::WorkspaceSecurity::new(".");
+                let cancel = crate::agent::cancel::CancelToken::new();
+                use crate::agent::tools::AgentTool;
+                let run = crate::agent::tools::RunCommandTool
+                    .execute(
+                        serde_json::json!({ "command": command }),
+                        &security,
+                        &cancel,
+                    )
+                    .await;
+                let text = match run {
+                    Ok(text) => {
+                        let status = text
+                            .lines()
+                            .next()
+                            .and_then(|line| line.strip_prefix("exit: "))
+                            .and_then(|value| value.trim().parse::<i32>().ok());
+                        let truncated = text.contains(" chars omitted]");
+                        crate::tui::commands::test_report(&command, status, &text, truncated)
+                    }
+                    Err(error) => format!("`{command}` not run: {error}"),
+                };
+                let _ = tx.send(Action::TestDone(text));
+            });
+        }
+        Action::TestDone(report) => {
+            app.status = AgentState::Idle;
+            app.push_notice(report);
+        }
         Action::UndoDone(result) => {
             app.status = AgentState::Idle;
             match result {

@@ -24,7 +24,20 @@ fn slash_menu_lists_every_match_inside_its_border() {
     assert!(filtered.contains("/model"), "{filtered}");
     assert!(filtered.contains("/memory"), "{filtered}");
 
-    let all = screen("/");
+    // The whole table is taller than a 24-row terminal, so the menu scrolls
+    // instead of drawing past the last row: the selected entry stays visible.
+    let mut app = test_app();
+    app.input.insert_str("/");
+    app.slash_selected = crate::tui::commands::COMMANDS.len() - 1;
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let all: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
     assert!(all.contains("/exit"), "{all}");
 }
 

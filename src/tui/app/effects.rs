@@ -309,6 +309,43 @@ pub(super) fn apply_command_effect(
                 });
             });
         }
+        CommandEffect::RunTest => {
+            // Discovery is Git + filesystem work: off the event loop. The
+            // command is shown and permitted before anything runs.
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let security = crate::agent::security::WorkspaceSecurity::new(".");
+                let changed = match crate::agent::git_review::resolve(
+                    security.root(),
+                    &crate::agent::git_review::ReviewTarget::WorkingTree,
+                    &security,
+                ) {
+                    Ok(input) => input.changed_paths,
+                    Err(error) => {
+                        let _ = tx.send(Action::TestDone(format!(
+                            "Could not read the working tree: {error}"
+                        )));
+                        return;
+                    }
+                };
+                let root_has_cargo = security.root().join("Cargo.toml").is_file();
+                let Some((command, evidence)) =
+                    crate::tui::commands::propose_test(&changed, root_has_cargo)
+                else {
+                    let _ = tx.send(Action::TestDone(format!(
+                        "No manifest in the {} changed file(s) declares tests, so no command is proposed. Run one explicitly with the agent.",
+                        changed.len()
+                    )));
+                    return;
+                };
+                let _ = tx.send(Action::TestProposed {
+                    command,
+                    evidence,
+                    changed: changed.len(),
+                });
+            });
+        }
         CommandEffect::RunTasks => {
             let tx = tx.clone();
             let workspace = crate::session::workspace_key();
