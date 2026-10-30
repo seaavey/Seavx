@@ -22,6 +22,7 @@ mod effects;
 mod input;
 mod keys;
 mod modal;
+mod mouse;
 mod references;
 mod store;
 mod transcript;
@@ -508,67 +509,9 @@ pub async fn start_tui(
             match action {
                 Action::Tick => {}
                 Action::Mouse(mouse) => {
-                    let at_matches = app.at_matches();
-
-                    // Handle mouse click/scroll on `@` popup if active
-                    if !app.popups_dismissed() && !at_matches.is_empty() {
-                        let size = terminal.size().unwrap_or_default();
-                        let screen = Rect::new(0, 0, size.width, size.height);
-                        let layout = app.at_popup_layout(screen, at_matches.len());
-                        let area = layout.area;
-
-                        let in_menu_x =
-                            mouse.column >= area.x && mouse.column < area.x + area.width;
-                        let in_menu_y = mouse.row >= area.y && mouse.row < area.y + area.height;
-
-                        if in_menu_x && in_menu_y {
-                            match mouse.kind {
-                                crossterm::event::MouseEventKind::ScrollUp => {
-                                    app.at_selected = prev_index(app.at_selected, at_matches.len());
-                                    continue;
-                                }
-                                crossterm::event::MouseEventKind::ScrollDown => {
-                                    app.at_selected = next_index(app.at_selected, at_matches.len());
-                                    continue;
-                                }
-                                crossterm::event::MouseEventKind::Down(
-                                    crossterm::event::MouseButton::Left,
-                                ) => {
-                                    let relative_row = mouse.row.saturating_sub(area.y + 1);
-                                    let clicked_idx = layout.window_start + relative_row as usize;
-                                    if clicked_idx < at_matches.len() {
-                                        let (is_dir, path) = &at_matches[clicked_idx];
-                                        app.insert_at_tag(*is_dir, path);
-                                        app.at_selected = 0;
-                                        continue;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    // An open picker owns the wheel: the transcript behind it
-                    // is not what the pointer is aiming at.
-                    if matches!(app.modal, Some(ModalSelection::Model { .. })) {
-                        match mouse.kind {
-                            crossterm::event::MouseEventKind::ScrollUp => {
-                                app.step_model_picker(false);
-                                continue;
-                            }
-                            crossterm::event::MouseEventKind::ScrollDown => {
-                                app.step_model_picker(true);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    match mouse.kind {
-                        crossterm::event::MouseEventKind::ScrollUp => app.scroll_up(3),
-                        crossterm::event::MouseEventKind::ScrollDown => app.scroll_down(3),
-                        _ => {}
-                    }
+                    let size = terminal.size().unwrap_or_default();
+                    let screen = Rect::new(0, 0, size.width, size.height);
+                    mouse::handle(&mut app, mouse, screen);
                 }
                 Action::Key(key) => keys::handle(&mut app, key, &tx).await,
                 Action::AgentToken(token) => {
