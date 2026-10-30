@@ -66,11 +66,32 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             app.persistence_error = Some(message.clone());
             app.push_notice(message);
         }
-        Action::GoalDone { result, goal } => {
+        Action::GoalDone {
+            result,
+            goal,
+            start,
+        } => {
             app.goal = goal;
             match result {
                 Ok(text) => app.push_notice(text),
                 Err(error) => app.push_notice(error),
+            }
+            if let Some(task) = start
+                && let Some(request) = app.submit_turn(&task)
+            {
+                let is_first_turn = app.session_title.is_none();
+                let context = app.session_context.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    crate::tui::app::worker::run_agent_worker(
+                        request,
+                        tx,
+                        is_first_turn,
+                        crate::agent::engine::AgentMode::Build,
+                        context,
+                    )
+                    .await;
+                });
             }
         }
         Action::ReviewResolved(result) => {
@@ -135,7 +156,47 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             status,
             cleanup,
             pid,
-        } => app.finish_turn(status, cleanup, pid),
+        } => {
+            app.finish_turn(status, cleanup, pid);
+            // A goal turn is done when its turn is: the tasks it ran are
+            // recorded as completed with what actually happened, never with a
+            // claim the turn did not make.
+            if let Some(goal) = app
+                .goal
+                .as_deref()
+                .and_then(|line| line.split_whitespace().next())
+                && let Ok(id) = goal.parse::<i64>()
+            {
+                let session = app.session_id;
+                let evidence = format!(
+                    "turn {}; session {}",
+                    status.as_str(),
+                    session
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                let store = app.store.clone();
+                if let Some(store) = store {
+                    tokio::task::spawn_blocking(move || {
+                        let guard = lock_store(&store);
+                        let Ok(goal) = guard.goal(&crate::session::workspace_key(), id) else {
+                            return;
+                        };
+                        for task in goal.tasks {
+                            if task.state == crate::session::TaskState::Running {
+                                let _ = guard.set_task_state(
+                                    &crate::session::workspace_key(),
+                                    id,
+                                    task.position,
+                                    crate::session::TaskState::Completed,
+                                    &evidence,
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
         Action::AgentDone => {
             app.status = AgentState::Idle;
         }

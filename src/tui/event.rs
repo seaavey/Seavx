@@ -13,6 +13,8 @@ pub enum Action {
     GoalDone {
         result: Result<String, String>,
         goal: Option<String>,
+        /// Set when the approved plan should start one Build turn.
+        start: Option<String>,
     },
     /// `/review` finished resolving a Git target off the UI thread.
     ReviewResolved(Result<crate::agent::git_review::ReviewInput, String>),

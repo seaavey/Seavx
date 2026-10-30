@@ -27,7 +27,11 @@ pub(super) fn spawn_session_resume(app: &mut App, tx: &mpsc::UnboundedSender<Act
 
 /// Apply one `/goal` operation. Every refusal names what to do next; nothing
 /// here switches a goal behind the user's back.
-fn run_goal(workspace: &str, action: crate::tui::commands::GoalAction) -> Result<String, String> {
+fn run_goal(
+    workspace: &str,
+    action: crate::tui::commands::GoalAction,
+    start: &mut Option<String>,
+) -> Result<String, String> {
     use crate::tui::commands::GoalAction;
     let store = crate::session::SessionStore::open().map_err(|error| error.to_string())?;
 
@@ -71,7 +75,31 @@ fn run_goal(workspace: &str, action: crate::tui::commands::GoalAction) -> Result
             store
                 .set_goal_state(workspace, id, crate::session::GoalState::Active)
                 .map_err(|error| error.to_string())?;
-            Ok(format!("Goal {id} approved and active."))
+            // The approved plan runs as one Build turn: same permissions, same
+            // checkpoint, same cancellation as a typed prompt.
+            let goal = store
+                .goal(workspace, id)
+                .map_err(|error| error.to_string())?;
+            // The tasks are marked running before the turn starts, so a finish
+            // that arrives first cannot leave them pending for ever.
+            for task in &goal.tasks {
+                if task.state == crate::session::TaskState::Pending {
+                    store
+                        .set_task_state(
+                            workspace,
+                            id,
+                            task.position,
+                            crate::session::TaskState::Running,
+                            "",
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            *start = Some(crate::session::goal_task_text(&goal));
+            Ok(format!(
+                "Goal {id} approved; running {} task(s) under Build permissions.",
+                goal.tasks.len()
+            ))
         }
         GoalAction::Show(id) => {
             let goal = store
@@ -201,9 +229,14 @@ pub(super) fn apply_command_effect(
             let tx = tx.clone();
             let workspace = crate::session::workspace_key();
             tokio::task::spawn_blocking(move || {
-                let result = run_goal(&workspace, action);
+                let mut start = None;
+                let result = run_goal(&workspace, action, &mut start);
                 let goal = live_goal_line(&workspace);
-                let _ = tx.send(Action::GoalDone { result, goal });
+                let _ = tx.send(Action::GoalDone {
+                    result,
+                    goal,
+                    start,
+                });
             });
         }
         CommandEffect::RunTasks => {
@@ -212,7 +245,11 @@ pub(super) fn apply_command_effect(
             tokio::task::spawn_blocking(move || {
                 let result = read_tasks(&workspace);
                 let goal = live_goal_line(&workspace);
-                let _ = tx.send(Action::GoalDone { result, goal });
+                let _ = tx.send(Action::GoalDone {
+                    result,
+                    goal,
+                    start: None,
+                });
             });
         }
         CommandEffect::RunReview { target } => {

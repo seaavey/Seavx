@@ -271,18 +271,8 @@ impl Goal {
                 _ => {}
             }
         }
-        for task in &self.tasks {
-            if matches!(
-                task.state,
-                TaskState::Pending | TaskState::Running | TaskState::Blocked
-            ) {
-                return Some(format!(
-                    "task {} is still {}",
-                    task.position + 1,
-                    task.state.as_str()
-                ));
-            }
-        }
+        // Tasks are the ordered plan, not the gate: the spec ties completion to
+        // criteria, which carry evidence or a user waiver.
         None
     }
 }
@@ -362,6 +352,26 @@ fn finish<T, E>(connection: &Connection, outcome: Result<T, E>) -> rusqlite::Res
             Ok(Err(error))
         }
     }
+}
+
+/// The task text one approved goal becomes: the objective, its criteria and the
+/// ordered tasks, so a single Build turn works through the plan.
+pub fn goal_task_text(goal: &Goal) -> String {
+    let mut text = format!(
+        "Goal {}: {}\n\nWork through these tasks in order:\n",
+        goal.id, goal.objective
+    );
+    for task in &goal.tasks {
+        text.push_str(&format!("{}. {}\n", task.position + 1, task.title));
+    }
+    if !goal.criteria.is_empty() {
+        text.push_str("\nDone when:\n");
+        for criterion in &goal.criteria {
+            text.push_str(&format!("- {}\n", criterion.text));
+        }
+    }
+    text.push_str("\nUse the tools as needed. Report what you changed and what you verified; do not claim a test you did not run.");
+    text
 }
 
 /// One row of the execution trace, before it is stored. Only the lifecycle

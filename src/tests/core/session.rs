@@ -1837,12 +1837,8 @@ fn a_goal_completes_only_with_evidence_or_a_user_waiver() {
         )
         .unwrap();
 
-    // The task is still open, so completion is still refused.
-    assert!(
-        store
-            .set_goal_state("ws", id, GoalState::Completed)
-            .is_err()
-    );
+    // Tasks are the ordered plan, not the gate: completion follows the
+    // criteria. A task still needs evidence before it can be marked complete.
     assert!(
         store
             .set_task_state("ws", id, 0, TaskState::Completed, "")
@@ -1861,5 +1857,53 @@ fn a_goal_completes_only_with_evidence_or_a_user_waiver() {
     assert_eq!(
         goal.criteria[1].waiver_reason.as_deref(),
         Some("no docs in this repo")
+    );
+}
+
+#[test]
+fn a_goal_task_text_carries_the_objective_its_tasks_and_its_criteria() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create_goal("ws", None, "ship v0.1.3").unwrap();
+    store
+        .set_goal_plan(
+            "ws",
+            id,
+            &["tests pass".to_string()],
+            &["write code".to_string(), "run tests".to_string()],
+        )
+        .unwrap();
+
+    let goal = store.goal("ws", id).unwrap();
+    let text = crate::session::goal_task_text(&goal);
+    assert!(text.contains("ship v0.1.3"), "{text}");
+    assert!(text.contains("1. write code"), "{text}");
+    assert!(text.contains("2. run tests"), "{text}");
+    assert!(text.contains("- tests pass"), "{text}");
+    assert!(
+        text.contains("do not claim a test you did not run"),
+        "{text}"
+    );
+}
+
+#[test]
+fn tasks_are_the_plan_and_never_the_completion_gate() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create_goal("ws", None, "g").unwrap();
+    store
+        .set_goal_plan("ws", id, &["c".to_string()], &["t".to_string()])
+        .unwrap();
+    store.set_goal_state("ws", id, GoalState::Active).unwrap();
+
+    let goal = store.goal("ws", id).unwrap();
+    assert_eq!(goal.tasks[0].state, TaskState::Pending);
+    let blocker = goal
+        .completion_blocker()
+        .expect("the criterion is still open");
+    assert!(blocker.contains("criterion"), "{blocker}");
+    assert!(
+        !blocker.contains("task"),
+        "tasks never gate completion: {blocker}"
     );
 }
