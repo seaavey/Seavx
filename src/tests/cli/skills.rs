@@ -281,3 +281,153 @@ fn remove_of_an_unknown_name_is_an_error() {
     let error = remove_with_home(&workspace, Some(&home), "nope").unwrap_err();
     assert!(error.contains("No skill named nope"), "{error}");
 }
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A committed repository at `<temp>/remote` holding `skills/<name>/SKILL.md`.
+fn repository(temp: &Path, skills: &[(&str, &str)]) -> PathBuf {
+    let repo = temp.join("remote");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init"]);
+    std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+    for (name, description) in skills {
+        write_skill(&repo.join("skills"), name, description);
+    }
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    repo
+}
+
+fn repo_url(repo: &Path) -> String {
+    format!("file://{}", repo.display())
+}
+
+#[test]
+fn fetch_lists_every_skill_in_the_repository() {
+    if !git_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(
+        temp.path(),
+        &[("beta", "The second one."), ("alpha", "The first one.")],
+    );
+
+    let fetched = fetch(&repo_url(&repo)).unwrap();
+
+    let rows: Vec<(&str, &str)> = fetched
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.name.as_str(), candidate.description.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("alpha", "The first one."), ("beta", "The second one.")]
+    );
+    assert!(
+        fetched.candidates[0].source.join("SKILL.md").is_file(),
+        "a candidate's source outlives the scan"
+    );
+}
+
+#[test]
+fn fetch_of_a_repository_without_skills_is_empty() {
+    if !git_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(temp.path(), &[]);
+
+    let fetched = fetch(&repo_url(&repo)).unwrap();
+
+    assert!(fetched.candidates.is_empty());
+}
+
+#[test]
+fn fetch_of_a_directory_that_is_not_a_repository_is_an_error() {
+    if !git_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let plain = temp.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+
+    let error = fetch(&repo_url(&plain)).err().expect("an error");
+
+    assert!(
+        error.contains(&repo_url(&plain)),
+        "the error names it: {error}"
+    );
+}
+
+#[test]
+fn a_refused_candidate_leaves_the_others_installable() {
+    if !git_available() {
+        return;
+    }
+    let (temp, workspace, _home) = fixture();
+    let repo = repository(
+        temp.path(),
+        &[("demo", "The remote one."), ("fresh", "New.")],
+    );
+    write_skill(&workspace.join(".seavx/skills"), "demo", "Mine.");
+    let fetched = fetch(&repo_url(&repo)).unwrap();
+    let position = |name: &str| {
+        fetched
+            .candidates
+            .iter()
+            .position(|candidate| candidate.name == name)
+            .unwrap()
+    };
+
+    let error = fetched.install(&workspace, position("demo")).unwrap_err();
+    assert!(error.contains("already exists"), "{error}");
+
+    let source = fetched.candidates[position("fresh")].source.clone();
+    let destination = fetched.install(&workspace, position("fresh")).unwrap();
+    assert_eq!(destination, workspace.join(".seavx/skills/fresh"));
+    assert!(
+        destination.join("SKILL.md").is_file(),
+        "the other candidate installs"
+    );
+    let kept = std::fs::read_to_string(workspace.join(".seavx/skills/demo/SKILL.md")).unwrap();
+    assert!(
+        kept.contains("Mine."),
+        "the existing copy is untouched: {kept}"
+    );
+
+    drop(fetched);
+    assert!(
+        !source.exists(),
+        "the checkout deletes itself after the pick"
+    );
+}

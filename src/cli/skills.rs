@@ -4,9 +4,16 @@
 //! shadow it, `show` prints one body, `path` reports the roots in precedence
 //! order.
 
-use std::path::{Path, PathBuf};
+// The fetch side is wired to `/skills install` in the next task; until then
+// nothing outside the tests constructs it. `expect` turns into a build error
+// the moment the last item here is used, so this cannot rot.
+#![cfg_attr(not(test), expect(dead_code, reason = "wired by /skills install next"))]
 
-use crate::agent::skills::SkillManager;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use crate::agent::skills::{SkillManager, scan_dir};
 use crate::cli::memory;
 
 /// One skill, as `list` shows it: the winning copy and the roots behind it.
@@ -205,6 +212,115 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// One skill found in a fetched repository, before the owner picks it.
+pub struct Candidate {
+    pub name: String,
+    pub description: String,
+    pub source: PathBuf,
+}
+
+/// A fetched repository and the skills inside it. The checkout lives as long
+/// as this value, so a candidate can still be copied after the scan.
+pub struct Fetched {
+    // Held only for its `Drop`: the candidates' sources live inside it.
+    _checkout: Checkout,
+    pub candidates: Vec<Candidate>,
+}
+
+impl Fetched {
+    /// Copy candidate `index` in, under [`install`]'s rules.
+    pub fn install(&self, workspace: &Path, index: usize) -> Result<PathBuf, String> {
+        let candidate = self
+            .candidates
+            .get(index)
+            .ok_or_else(|| format!("There is no skill at position {}.", index + 1))?;
+        install(workspace, &candidate.source)
+    }
+}
+
+/// A clone that deletes itself, so a fetched SKILL.md never outlives the pick.
+struct Checkout {
+    dir: PathBuf,
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Clone `url` shallowly and list every `SKILL.md` inside it.
+///
+/// `git` does the fetch: one feature does not buy a dependency. A URL that is
+/// not a repository is an error; a repository with no skill is an empty list.
+pub fn fetch(url: &str) -> Result<Fetched, String> {
+    let checkout = Checkout {
+        dir: std::env::temp_dir().join(format!(
+            "seavx-skills-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )),
+    };
+
+    let mut child = std::process::Command::new("git")
+        .args(["clone", "--depth", "1", url])
+        .arg(&checkout.dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Cannot run git for {url}: {error}"))?;
+
+    // A hung clone must not hang the picker: 60 s, then kill it.
+    // shortcut: stderr is drained only after exit, so a clone that floods the
+    // pipe waits out the budget and reports a timeout; read it on a thread if
+    // that ever happens.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Fetching {url} timed out after 60 s."));
+            }
+            Err(error) => return Err(format!("Cannot wait for git: {error}")),
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Cannot read git's output: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git clone {url} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let mut found = Vec::new();
+    scan_dir(&checkout.dir, &mut found, 0);
+    let mut candidates: Vec<Candidate> = found
+        .into_iter()
+        .filter_map(|skill| {
+            Some(Candidate {
+                name: skill.name,
+                description: skill.description,
+                source: skill.path.parent()?.to_path_buf(),
+            })
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Fetched {
+        _checkout: checkout,
+        candidates,
+    })
 }
 
 /// Remove the winning copy of a skill.

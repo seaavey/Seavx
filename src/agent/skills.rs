@@ -106,7 +106,8 @@ impl SkillManager {
     }
 }
 
-fn scan_dir(base: &Path, list: &mut Vec<SkillMetadata>, depth: usize) {
+/// Every skill under `base`, at most two categories deep, in directory order.
+pub(crate) fn scan_dir(base: &Path, list: &mut Vec<SkillMetadata>, depth: usize) {
     // Shared skill dirs group entries by category one level deeper (<category>/<name>/SKILL.md).
     if depth > 2 {
         return;
