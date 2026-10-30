@@ -276,8 +276,9 @@ impl<'a> App<'a> {
         true
     }
 
-    /// Switch modes for the user's `/plan` or shortcut, explaining a refusal so
-    /// a switch that cannot happen is never silent.
+    /// Switch modes for the user's `/plan` or shortcut. A successful switch is
+    /// silent: the header and footer already show the active mode, so the only
+    /// lines worth printing are a refusal or a repeat.
     pub fn request_mode(&mut self, mode: AgentMode) {
         if self.mode == mode {
             // A repeat is information, not a refusal: say what is already true.
@@ -290,13 +291,7 @@ impl<'a> App<'a> {
         }
         if !self.set_mode(mode) {
             self.push_mode_notice("Cannot switch mode while a task is running");
-            return;
         }
-        let label = match mode {
-            AgentMode::Plan => "Plan mode enabled — writes are disabled",
-            AgentMode::Build => "Build mode enabled",
-        };
-        self.push_mode_notice(label);
     }
 
     pub fn toggle_mode(&mut self) {

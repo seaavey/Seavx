@@ -345,31 +345,36 @@ fn mode_change_is_rejected_while_busy_and_says_so() {
 }
 
 #[test]
-fn switching_modes_prints_one_line() {
+fn switching_modes_stays_silent() {
+    // The header and footer already show the active mode; a switch must not add
+    // a transcript row of its own.
     let mut app = test_app();
     app.toggle_mode();
-    assert!(transcript(&app).contains("Plan mode enabled — writes are disabled"));
-    // BackTab is the same call, so the shortcut cannot go silent again.
+    assert_eq!(app.mode, AgentMode::Plan);
+    assert!(transcript(&app).is_empty(), "{}", transcript(&app));
+
     app.toggle_mode();
-    assert!(transcript(&app).contains("Build mode enabled"));
+    assert_eq!(app.mode, AgentMode::Build);
+    assert!(transcript(&app).is_empty(), "{}", transcript(&app));
 
     let mut plan = test_app();
     plan.mode = AgentMode::Plan;
     run_command(&mut plan, "/plan off");
-    assert!(transcript(&plan).contains("Build mode enabled"));
+    assert_eq!(plan.mode, AgentMode::Build);
+    assert!(transcript(&plan).is_empty(), "{}", transcript(&plan));
 }
 
 #[test]
 fn repeating_the_mode_command_says_it_is_already_active() {
     let mut app = test_app();
     run_command(&mut app, "/plan");
-    assert!(transcript(&app).contains("Plan mode enabled — writes are disabled"));
+    assert_eq!(app.mode, AgentMode::Plan);
     run_command(&mut app, "/plan");
     assert_eq!(app.mode, AgentMode::Plan);
     assert!(transcript(&app).contains("Plan mode is already active"));
 
     run_command(&mut app, "/plan off");
-    assert!(transcript(&app).contains("Build mode enabled"));
+    assert_eq!(app.mode, AgentMode::Build);
     run_command(&mut app, "/plan off");
     assert_eq!(app.mode, AgentMode::Build);
     assert!(transcript(&app).contains("Build mode is already active"));
