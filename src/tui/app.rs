@@ -144,6 +144,9 @@ pub struct App<'a> {
     pub store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
     /// Session this transcript belongs to, `None` until the first prompt.
     pub session_id: Option<i64>,
+    /// 1-based number of the last submitted turn; the worker tags every stored
+    /// event with the turn it belongs to.
+    pub turn_id: u64,
     /// One notice text when the store failed and the run continued unpersisted.
     pub persistence_error: Option<String>,
     /// Set when the loaded session cannot be appended to.
@@ -155,6 +158,8 @@ pub struct App<'a> {
 pub struct TurnRequest {
     pub prompt: String,
     pub session_id: Option<i64>,
+    /// The turn this request runs, so its events can be correlated.
+    pub turn_id: u64,
     pub store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
     /// This turn's cancel handle, shared with the UI thread.
     pub cancel: crate::agent::cancel::CancelToken,
@@ -271,6 +276,7 @@ impl<'a> App<'a> {
             pending_skills: None,
             store: None,
             session_id: None,
+            turn_id: 0,
             persistence_error: None,
             read_only: None,
         }

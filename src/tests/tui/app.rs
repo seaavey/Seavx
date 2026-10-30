@@ -1233,3 +1233,100 @@ async fn escape_closes_the_skill_picker_without_installing() {
     assert!(app.pending_skills.is_none(), "and drops the checkout");
     assert!(rx.try_recv().is_err(), "Esc installs nothing");
 }
+
+#[test]
+fn submit_turn_assigns_monotonic_turn_ids() {
+    let mut app = test_app();
+
+    let first = app
+        .submit_turn("first prompt")
+        .expect("an idle app accepts");
+    assert_eq!(first.turn_id, 1);
+
+    // Busy: the refusal happens before a number is taken.
+    let refused = app.submit_turn("while busy");
+    assert!(refused.is_none());
+    assert_eq!(app.turn_id, 1, "a refused turn takes no number");
+
+    app.status = AgentState::Idle;
+    let second = app.submit_turn("second prompt").expect("idle again");
+    assert_eq!(second.turn_id, 2);
+}
+
+#[test]
+fn a_tool_event_renders_its_outcome_and_never_completes_a_cancelled_call() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    let tool = |status, elapsed, failure| crate::agent::events::ToolEvent {
+        call_id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        summary: "path=\"note.txt\"".to_string(),
+        status,
+        failure,
+        started_at: 1,
+        elapsed,
+    };
+
+    super::actions::apply(
+        &mut app,
+        Action::AgentTool(tool(crate::agent::events::ToolStatus::Queued, None, None)),
+        &tx,
+    );
+    let queued = crate::tui::compact::transcript_from_segments(&app.segments);
+    assert!(
+        queued.contains("⚡ read_file(path=\"note.txt\")"),
+        "{queued}"
+    );
+
+    super::actions::apply(
+        &mut app,
+        Action::AgentTool(tool(
+            crate::agent::events::ToolStatus::Completed,
+            Some(std::time::Duration::from_millis(430)),
+            None,
+        )),
+        &tx,
+    );
+    let done = crate::tui::compact::transcript_from_segments(&app.segments);
+    assert!(done.contains("completed"), "{done}");
+    assert!(done.contains("0.4s"), "{done}");
+
+    super::actions::apply(
+        &mut app,
+        Action::AgentTool(tool(
+            crate::agent::events::ToolStatus::Cancelled,
+            Some(std::time::Duration::from_millis(2100)),
+            None,
+        )),
+        &tx,
+    );
+    let cancelled = crate::tui::compact::transcript_from_segments(&app.segments);
+    assert!(cancelled.contains("cancelled"), "{cancelled}");
+    assert_eq!(
+        cancelled.matches("completed").count(),
+        1,
+        "the cancelled call adds no second completion: {cancelled}"
+    );
+}
+
+#[test]
+fn a_failed_tool_event_names_its_failure() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    super::actions::apply(
+        &mut app,
+        Action::AgentTool(crate::agent::events::ToolEvent {
+            call_id: "call-2".to_string(),
+            name: "write_file".to_string(),
+            summary: "path=\"made.txt\"".to_string(),
+            status: crate::agent::events::ToolStatus::Failed,
+            failure: Some(crate::agent::events::FailureKind::PermissionDenied),
+            started_at: 1,
+            elapsed: Some(std::time::Duration::from_millis(4)),
+        }),
+        &tx,
+    );
+    let text = crate::tui::compact::transcript_from_segments(&app.segments);
+    assert!(text.contains("failed"), "{text}");
+    assert!(text.contains("permission_denied"), "{text}");
+}

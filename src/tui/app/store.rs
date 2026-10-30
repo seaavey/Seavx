@@ -111,10 +111,14 @@ impl App<'_> {
         self.reset_history_nav();
         // A cancelled turn must not poison the next one.
         self.cancel = crate::agent::cancel::CancelToken::new();
+        // Only an accepted turn takes a number, so a refusal above cannot leave
+        // a gap between the transcript and the stored trace.
+        self.turn_id += 1;
 
         Some(TurnRequest {
             prompt,
             session_id: self.session_id,
+            turn_id: self.turn_id,
             store: self.store.clone(),
             cancel: self.cancel.clone(),
         })

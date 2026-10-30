@@ -79,6 +79,7 @@ pub async fn run_agent_worker(
         let TurnRequest {
             prompt,
             session_id,
+            turn_id,
             mut store,
             cancel,
         } = request;
@@ -144,6 +145,8 @@ pub async fn run_agent_worker(
         let tx_clone = tx.clone();
         let row_store = store.clone();
         let row_tx = tx.clone();
+        let event_store = store.clone();
+        let event_tx = tx.clone();
         // Set by the first streamed token: the answer is already on screen, so
         // the turn must not append it a second time.
         let streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -157,6 +160,18 @@ pub async fn run_agent_worker(
                 &TuiConfirmer::new(tx.clone()),
                 &cancel,
                 move |event| {
+                    // The durable subset is written here, on the worker task:
+                    // the database is never touched by the render thread.
+                    if let (Some(handle), Some(id)) = (&event_store, session_id)
+                        && let Some(row) = crate::session::NewEvent::from_event(turn_id, &event)
+                    {
+                        let guard = lock_store(handle);
+                        if let Err(error) = guard.record_event(id, row) {
+                            let _ = event_tx.send(Action::SessionFailed(format!(
+                                "Session history disabled: {error}"
+                            )));
+                        }
+                    }
                     let action = match event {
                         AgentEvent::Token(token) => {
                             let first =
