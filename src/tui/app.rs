@@ -70,6 +70,14 @@ pub enum ModalSelection {
     },
     /// One row per stored session, newest first: the order `/sessions <n>` reads.
     Session { rows: Vec<String>, selected: usize },
+    /// The skills a fetched repository offers; `marked` is what Enter installs.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired by /skills install next"))]
+    Skills {
+        names: Vec<String>,
+        descriptions: Vec<String>,
+        selected: usize,
+        marked: Vec<bool>,
+    },
 }
 
 /// Cached markdown render of the whole transcript, invalidated by `revision`.

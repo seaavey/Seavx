@@ -190,6 +190,8 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                 }
                 _ => {}
             },
+            // The picker's keys arrive with the install batch, so it renders only.
+            ModalSelection::Skills { .. } => {}
         }
         return;
     }

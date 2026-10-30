@@ -10,6 +10,7 @@ use crate::tui::app::{App, ModalSelection};
 mod effort;
 mod model;
 mod session;
+mod skills;
 
 /// Cursor look for a selectable list: a background, not just a colour, so it
 /// survives a terminal font that has no `❯` glyph.
@@ -39,6 +40,12 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame, millis: u128) {
             selected,
         } => effort::render(area, frame, model, options, *selected, millis),
         ModalSelection::Session { rows, selected } => session::render(area, frame, rows, *selected),
+        ModalSelection::Skills {
+            names,
+            descriptions,
+            selected,
+            marked,
+        } => skills::render(area, frame, names, descriptions, *selected, marked),
     }
 }
 

@@ -134,7 +134,7 @@ fn render_roots(roots: &[PathBuf]) -> String {
 }
 
 /// First sentence of a description, capped, so one skill is one row.
-fn one_line(description: &str) -> String {
+pub(crate) fn one_line(description: &str) -> String {
     let first = description.split(". ").next().unwrap_or(description).trim();
     match first.char_indices().nth(100) {
         Some((cut, _)) => format!("{}…", first[..cut].trim_end()),
