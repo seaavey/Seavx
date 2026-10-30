@@ -930,6 +930,137 @@ mod engine_seam {
             "a cancelled call never completes: {tool:?}"
         );
     }
+
+    /// One Ask turn: answer, reported rows, and every event the sink saw.
+    async fn run_ask(
+        runtime: &AgentRuntime,
+        question: &str,
+    ) -> (String, Vec<ChatMessage>, Vec<AgentEvent>) {
+        let mut events = Vec::new();
+        let mut reported: Vec<ChatMessage> = Vec::new();
+        let answer = runtime
+            .execute_task(
+                question,
+                AgentMode::Ask,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |message, _| reported.push(message.clone()),
+            )
+            .await
+            .result
+            .unwrap();
+        (answer, reported, events)
+    }
+
+    #[tokio::test]
+    async fn ask_keeps_only_the_citations_the_turn_actually_read() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(temp.path().join(".env"), "SECRET=1\n").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "read_file", json!({ "path": "note.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text(
+            "Line one is `note.txt:1`.\n\
+             Out of range: `note.txt:99`.\n\
+             Never read: `other.txt:2`.\n\
+             Protected: `.env:1`.",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, reported, events) = run_ask(&runtime, "explain the file").await;
+
+        assert!(
+            answer.contains("`note.txt:1`"),
+            "a line this turn read stays untouched: {answer}"
+        );
+        for unverified in ["note.txt:99", "other.txt:2", ".env:1"] {
+            assert!(
+                answer.contains(&format!("{unverified} (unverified")),
+                "{unverified} must be marked: {answer}"
+            );
+        }
+        let row = reported.last().expect("the answer row is persisted");
+        assert_eq!(
+            row.content.first_text(),
+            Some(answer.as_str()),
+            "the stored answer is the validated one"
+        );
+        let tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Token(token) => Some(token.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![answer.as_str()],
+            "Ask emits the validated answer once, not the raw deltas"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_listing_does_not_authorize_a_citation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "one\ntwo\n").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "list_directory", json!({ "path": "." })),
+        ])));
+        fake.push(response(MessageContent::from_text(
+            "The file is `note.txt:1`.",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, _, _) = run_ask(&runtime, "what is in note.txt").await;
+
+        assert!(
+            answer.contains("note.txt:1 (unverified"),
+            "a name in a listing is not content: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conceptual_answer_needs_no_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_text(
+            "The tool loop lives in run_turn, one turn at a time.",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, _, _) = run_ask(&runtime, "how does the loop work").await;
+
+        assert_eq!(
+            answer, "The tool loop lives in run_turn, one turn at a time.",
+            "no citation to validate, nothing to change"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_does_not_cross_ask_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "one\ntwo\n").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "read_file", json!({ "path": "note.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text("First: `note.txt:2`.")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let (first, _, _) = run_ask(&runtime, "read it").await;
+        assert!(first.contains("`note.txt:2`"), "{first}");
+
+        fake.push(response(MessageContent::from_text(
+            "Second turn, no reads: `note.txt:2`.",
+        )));
+        let (second, _, _) = run_ask(&runtime, "and again").await;
+        assert!(
+            second.contains("note.txt:2 (unverified"),
+            "the previous turn's reads do not authorize this one: {second}"
+        );
+    }
 }
 
 #[cfg(test)]

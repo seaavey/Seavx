@@ -862,6 +862,9 @@ impl AgentRuntime {
             // The same reporting path every other cancel uses.
             return Err(cancelled(turn_state));
         }
+        // What this one Ask turn actually read. Not persisted, not shared with
+        // the next turn: an answer may only cite its own turn's reads.
+        let mut evidence = Evidence::new();
         let summarizer: std::sync::Arc<dyn crate::tui::compact::Summarizer> = match &self.summarizer
         {
             Some(summarizer) => summarizer.clone(),
@@ -915,7 +918,12 @@ impl AgentRuntime {
                         match delta {
                             StreamDelta::Token(token) => {
                                 received.push_str(&token);
-                                event_sink(AgentEvent::Token(token));
+                                // Ask answers are shown once, after their
+                                // citations are validated; a delta would show
+                                // an unverified reference.
+                                if mode != AgentMode::Ask {
+                                    event_sink(AgentEvent::Token(token));
+                                }
                             }
                             StreamDelta::Thinking(thoughts) => {
                                 streamed_thinking = true;
@@ -1018,6 +1026,15 @@ impl AgentRuntime {
             let tool_calls = response.tool_calls();
             if tool_calls.is_empty() {
                 let final_text = response.clone().into_first_text().unwrap_or_default();
+                let final_text = if mode == AgentMode::Ask {
+                    let validated = sanitize_citations(&final_text, &evidence, &self.security);
+                    if !validated.trim().is_empty() {
+                        event_sink(AgentEvent::Token(validated.clone()));
+                    }
+                    validated
+                } else {
+                    final_text
+                };
 
                 // The filler is not model output: only real text is reported.
                 if !final_text.trim().is_empty() {
@@ -1188,6 +1205,16 @@ impl AgentRuntime {
                 }
 
                 Self::log_tool_result(tool_name, is_err, &result_str);
+
+                if mode == AgentMode::Ask && !is_err {
+                    record_evidence(
+                        &mut evidence,
+                        tool_name,
+                        &call.fn_arguments,
+                        &result_str,
+                        &self.security,
+                    );
+                }
 
                 if is_err {
                     if last_failure.as_deref() == Some(result_str.as_str()) {
@@ -1608,6 +1635,164 @@ impl AgentRuntime {
             }
         }
     }
+}
+
+/// Lines one Ask turn actually observed: canonical path -> 1-based lines.
+///
+/// Only `read_file` content and `search_files` content hits feed it. A directory
+/// listing names files without showing them, so it authorizes nothing.
+type Evidence = std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<usize>>;
+
+/// Record what a successful read or content search returned, keyed by the
+/// canonical path the security check produced.
+fn record_evidence(
+    evidence: &mut Evidence,
+    tool: &str,
+    args: &serde_json::Value,
+    output: &str,
+    security: &WorkspaceSecurity,
+) {
+    match tool {
+        "read_file" => {
+            let Some(requested) = args.get("path").and_then(|value| value.as_str()) else {
+                return;
+            };
+            let Ok(path) = security.validate_path(requested) else {
+                return;
+            };
+            let lines = evidence.entry(path).or_default();
+            for line in output.lines() {
+                // `N|text`; only the row number is evidence.
+                if let Some((number, _)) = line.split_once('|')
+                    && let Ok(number) = number.parse::<usize>()
+                {
+                    lines.insert(number);
+                }
+            }
+        }
+        "search_files" => {
+            for line in output.lines() {
+                let Some((requested, number)) = split_search_hit(line) else {
+                    continue;
+                };
+                let Ok(path) = security.validate_path(requested) else {
+                    continue;
+                };
+                evidence.entry(path).or_default().insert(number);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `path:line: text` as a content search prints it. The path may carry a colon
+/// (a Windows drive), so the first `:<digits>: ` run splits it.
+fn split_search_hit(line: &str) -> Option<(&str, usize)> {
+    let bytes = line.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes[index] != b':' {
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > start && line[end..].starts_with(": ") {
+            return Some((&line[..index], line[start..end].parse().ok()?));
+        }
+    }
+    None
+}
+
+/// Mark every citation whose path or line this turn did not observe. The text is
+/// left intact otherwise: no line number is ever rewritten or invented.
+fn sanitize_citations(answer: &str, evidence: &Evidence, security: &WorkspaceSecurity) -> String {
+    let bytes = answer.as_bytes();
+    let mut out = String::with_capacity(answer.len());
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b':' {
+            index += 1;
+            continue;
+        }
+        let low_start = index + 1;
+        let mut low_end = low_start;
+        while low_end < bytes.len() && bytes[low_end].is_ascii_digit() {
+            low_end += 1;
+        }
+        if low_end == low_start {
+            index += 1;
+            continue;
+        }
+        let Ok(low) = answer[low_start..low_end].parse::<usize>() else {
+            index += 1;
+            continue;
+        };
+        // `path:3-9` cites a range; every line in it must have been read.
+        let mut high = low;
+        let mut after = low_end;
+        if bytes.get(low_end) == Some(&b'-') {
+            let mut range_end = low_end + 1;
+            while range_end < bytes.len() && bytes[range_end].is_ascii_digit() {
+                range_end += 1;
+            }
+            if let Ok(parsed) = answer[low_end + 1..range_end].parse::<usize>() {
+                high = parsed;
+                after = range_end;
+            }
+        }
+        // The path token runs back to the nearest separator.
+        let mut start = index;
+        while start > 0 {
+            let previous = bytes[start - 1];
+            if previous.is_ascii_whitespace()
+                || matches!(
+                    previous,
+                    b'`' | b'(' | b'[' | b'"' | b'\'' | b',' | b'*' | b'<' | b'|'
+                )
+            {
+                break;
+            }
+            start -= 1;
+        }
+        if start == index {
+            index = after;
+            continue;
+        }
+        let path = &answer[start..index];
+        let verified = citation_is_verified(path, low, high, evidence, security);
+        out.push_str(&answer[copied..after]);
+        if !verified {
+            out.push_str(" (unverified)");
+        }
+        copied = after;
+        index = after;
+    }
+    out.push_str(&answer[copied..]);
+    out
+}
+
+/// A citation is verified only when its path resolves inside the workspace, is
+/// not protected, and every cited line came back from this turn's tools.
+fn citation_is_verified(
+    path: &str,
+    low: usize,
+    high: usize,
+    evidence: &Evidence,
+    security: &WorkspaceSecurity,
+) -> bool {
+    if low == 0 || high < low {
+        return false;
+    }
+    let Ok(canonical) = security.validate_path(path) else {
+        return false;
+    };
+    let Some(lines) = evidence.get(&canonical) else {
+        return false;
+    };
+    (low..=high).all(|line| lines.contains(&line))
 }
 
 /// Confidence percentage declared in a synthesized skill's frontmatter.
