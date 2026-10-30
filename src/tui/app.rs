@@ -304,6 +304,7 @@ impl<'a> App<'a> {
                 AgentMode::Build => "Build mode is already active",
                 // Never reachable: `App.mode` only ever holds Build or Plan.
                 AgentMode::Ask => "Ask is one turn at a time",
+                AgentMode::Review => "Review is one turn at a time",
             };
             self.push_mode_notice(label);
             return;
@@ -317,7 +318,7 @@ impl<'a> App<'a> {
         let next = match self.mode {
             AgentMode::Build => AgentMode::Plan,
             // The standing mode is never Ask: it lasts one turn.
-            AgentMode::Plan | AgentMode::Ask => AgentMode::Build,
+            AgentMode::Plan | AgentMode::Ask | AgentMode::Review => AgentMode::Build,
         };
         self.request_mode(next);
     }

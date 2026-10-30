@@ -6,7 +6,7 @@ use crate::agent::events::{
 use crate::agent::permissions::{
     self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
 };
-use crate::agent::prompt::{ASK_POLICY, PLAN_POLICY, load_system_prompt};
+use crate::agent::prompt::{ASK_POLICY, PLAN_POLICY, REVIEW_POLICY, load_system_prompt};
 use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
 use crate::session::MessageStatus;
@@ -34,6 +34,8 @@ pub enum AgentMode {
     /// One-shot codebase Q&A. Ephemeral: never persisted in the config and never
     /// the user's standing selection.
     Ask,
+    /// One-shot code review of a resolved Git target. Ephemeral too.
+    Review,
 }
 
 impl AgentMode {
@@ -42,6 +44,7 @@ impl AgentMode {
             Self::Build => "build",
             Self::Plan => "plan",
             Self::Ask => "ask",
+            Self::Review => "review",
         }
     }
 }
@@ -57,6 +60,7 @@ pub(crate) fn with_mode_policy(mut prompt: String, mode: AgentMode) -> String {
         AgentMode::Build => None,
         AgentMode::Plan => Some(PLAN_POLICY),
         AgentMode::Ask => Some(ASK_POLICY),
+        AgentMode::Review => Some(REVIEW_POLICY),
     };
     if let Some(policy) = policy {
         prompt.push_str("\n\n");
@@ -1818,6 +1822,21 @@ mod mode_policy_tests {
     fn build_mode_leaves_the_prompt_unchanged() {
         let prompt = "base prompt".to_string();
         assert_eq!(with_mode_policy(prompt.clone(), AgentMode::Build), prompt);
+    }
+
+    #[test]
+    fn review_mode_appends_the_review_policy() {
+        let prompt = with_mode_policy("base prompt".to_string(), AgentMode::Review);
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("# REVIEW MODE ACTIVE"), "{prompt}");
+        for part in ["severity", "confirmed", "hypothesis", "remediation"] {
+            assert!(prompt.contains(part), "{part} must be named: {prompt}");
+        }
+        assert!(
+            prompt.to_lowercase().contains("never claim"),
+            "a review must not claim a test it did not run: {prompt}"
+        );
+        assert!(!prompt.contains("# PLAN MODE ACTIVE"), "{prompt}");
     }
 
     #[test]

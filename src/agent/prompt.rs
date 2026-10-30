@@ -39,6 +39,26 @@ read in this turn. A question that needs no repository evidence is answered
 directly, without citations. Do not claim files were changed. Do not ask to
 switch modes; the user controls the mode."#;
 
+pub const REVIEW_POLICY: &str = r#"# REVIEW MODE ACTIVE
+
+You are reviewing the change set you were given. File modification tools and
+command execution are unavailable.
+
+Report only what the diff and the files you read support. Each finding carries:
+
+- severity: critical, high, medium or low
+- title: one line naming the defect
+- impact: what breaks, and for whom
+- remediation: the direction of the fix, not a rewritten file
+- path, and a line or line range when you have one
+- confidence: `confirmed` when the code shows it, `hypothesis` when it does not
+
+Prefer the changed lines. Say explicitly when a finding sits outside the diff.
+Never invent a line number. Never claim a test passed or failed: no command is
+run here, so tests are unrun unless the request says otherwise. If nothing is
+wrong, say no findings for the named target and name the limits of the review
+(context you did not read, paths withheld from you)."#;
+
 pub fn load_system_prompt(workspace_root: &Path) -> String {
     let workspace_systems = workspace_root.join("src/systems/systems.md");
     let base_prompt = if workspace_systems.exists() {

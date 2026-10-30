@@ -7,6 +7,9 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::agent::security::WorkspaceSecurity;
@@ -25,18 +28,6 @@ pub enum ReviewTarget {
     Base(String),
 }
 
-impl ReviewTarget {
-    /// How the target is named in a report.
-    pub fn label(&self) -> String {
-        match self {
-            Self::WorkingTree => "working-tree".to_string(),
-            Self::Staged => "staged".to_string(),
-            Self::Commit(reference) => format!("commit {reference}"),
-            Self::Base(reference) => format!("base {reference}"),
-        }
-    }
-}
-
 /// Only the documented forms; anything else is refused before Git runs.
 pub fn parse_target(args: &[&str]) -> Result<ReviewTarget, String> {
     match args {
@@ -52,7 +43,7 @@ pub fn parse_target(args: &[&str]) -> Result<ReviewTarget, String> {
 /// and the bodies fit the cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewInput {
-    pub target: String,
+    pub target: ReviewTarget,
     pub diff: String,
     pub changed_paths: Vec<String>,
     pub withheld_paths: usize,
@@ -68,7 +59,7 @@ pub fn resolve(
     // Fail fast when the directory is not a repository at all.
     run(root, &["rev-parse", "--git-dir"])?;
 
-    let mut withheld = 0;
+    // Names first: every body below is fetched only for a path security allowed.
     let (names, patch_args): (Vec<String>, Vec<String>) = match target {
         ReviewTarget::WorkingTree => (
             split_nul(&run(
@@ -110,7 +101,6 @@ pub fn resolve(
                     root,
                     &[
                         "diff-tree",
-                        "--root",
                         "--no-commit-id",
                         "--name-only",
                         "-r",
@@ -120,7 +110,6 @@ pub fn resolve(
                 )?),
                 vec![
                     "diff-tree".to_string(),
-                    "--root".to_string(),
                     "--no-commit-id".to_string(),
                     "-p".to_string(),
                     "--no-ext-diff".to_string(),
@@ -131,7 +120,7 @@ pub fn resolve(
         }
         ReviewTarget::Base(reference) => {
             let commit = verify_commit(root, reference)?;
-            let merge_base = run_text(root, &["merge-base", "HEAD", &commit])?
+            let merge_base = String::from_utf8_lossy(&run(root, &["merge-base", "HEAD", &commit])?)
                 .trim()
                 .to_string();
             if merge_base.is_empty() {
@@ -163,7 +152,7 @@ pub fn resolve(
 
     // Paths first: nothing below reads a body the security check refused.
     let (mut visible, refused) = filter_paths(&names, security);
-    withheld += refused;
+    let mut withheld = refused;
 
     let mut diff = String::new();
     if !visible.is_empty() {
@@ -174,14 +163,13 @@ pub fn resolve(
         diff = String::from_utf8_lossy(&run(root, &args)?).to_string();
     }
 
-    // Untracked files are not in any diff; their body is the whole change.
+    // Untracked files are in no diff; their whole body is the change.
     if matches!(target, ReviewTarget::WorkingTree) {
         let untracked = split_nul(&run(
             root,
             &["ls-files", "-z", "--others", "--exclude-standard"],
         )?);
-        eprintln!("DEBUG untracked={untracked:?} cap={DIFF_LIMIT}");
-        let (files, refused) = filter_untracked(root, &untracked, security)?;
+        let (files, refused) = filter_untracked(&untracked, security)?;
         withheld += refused;
         for path in files {
             diff.push_str(&untracked_block(root, &path)?);
@@ -196,11 +184,11 @@ pub fn resolve(
     }
 
     Ok(ReviewInput {
-        target: target.label(),
         is_empty: diff.trim().is_empty(),
         diff,
         changed_paths: visible,
         withheld_paths: withheld,
+        target: target.clone(),
     })
 }
 
@@ -208,17 +196,12 @@ pub fn resolve(
 /// from being read as a flag.
 fn verify_commit(root: &Path, reference: &str) -> Result<String, String> {
     let spec = format!("{reference}^{{commit}}");
-    let commit = run_text(
+    let commit = String::from_utf8_lossy(&run(
         root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "--end-of-options",
-            &spec,
-        ],
-    )?;
-    let commit = commit.trim().to_string();
+        &["rev-parse", "--verify", "--end-of-options", &spec],
+    )?)
+    .trim()
+    .to_string();
     if commit.is_empty() {
         return Err(format!("'{reference}' does not name a commit"));
     }
@@ -233,6 +216,7 @@ fn filter_paths(names: &[String], security: &WorkspaceSecurity) -> (Vec<String>,
         if name.is_empty() {
             continue;
         }
+        // `validate_path` also runs the credential and internal-store policy.
         if security.validate_path(name).is_ok() {
             visible.push(name.clone());
         } else {
@@ -244,7 +228,6 @@ fn filter_paths(names: &[String], security: &WorkspaceSecurity) -> (Vec<String>,
 
 /// Untracked files must be regular, inside the workspace, and policy-clean.
 fn filter_untracked(
-    root: &Path,
     names: &[String],
     security: &WorkspaceSecurity,
 ) -> Result<(Vec<String>, usize), String> {
@@ -263,7 +246,7 @@ fn filter_untracked(
             refused += 1;
             continue;
         };
-        if !metadata.file_type().is_file() || !path.starts_with(root) {
+        if !metadata.file_type().is_file() || !path.starts_with(security.root()) {
             refused += 1;
             continue;
         }
@@ -281,10 +264,12 @@ fn filter_untracked(
 
 /// Untracked content, shaped like the diff hunk a reviewer would see.
 fn untracked_block(root: &Path, name: &str) -> Result<String, String> {
-    let path = root.join(name);
-    let bytes = std::fs::read(&path).map_err(|error| format!("cannot read {name}: {error}"))?;
+    let bytes =
+        std::fs::read(root.join(name)).map_err(|error| format!("cannot read {name}: {error}"))?;
     if bytes.len() > DIFF_LIMIT {
-        return Err(format!("{name} exceeds {DIFF_LIMIT} bytes"));
+        return Err(format!(
+            "{name} exceeds {DIFF_LIMIT} bytes; the review is incomplete"
+        ));
     }
     let body = String::from_utf8_lossy(&bytes);
     let mut block = format!("--- /dev/null\n+++ b/{name}\n");
@@ -307,10 +292,6 @@ fn split_nul(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn run_text(root: &Path, args: &[&str]) -> Result<String, String> {
-    Ok(String::from_utf8_lossy(&run(root, args)?).to_string())
-}
-
 /// One Git process: fixed arguments, no shell, no lock writes, no external diff,
 /// no text conversion, bounded output and bounded wall clock.
 fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -329,14 +310,23 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         .spawn()
         .map_err(|error| format!("git {}: {error}", args.first().unwrap_or(&"")))?;
 
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let out = std::thread::spawn(move || read_capped(stdout));
-    let err = std::thread::spawn(move || read_capped(stderr));
+    // A reader that stops at the cap would leave Git blocked on a full pipe, so
+    // the overflow rides a flag this loop can see and kill on.
+    let overflow = Arc::new(AtomicBool::new(false));
+    let out = drain(
+        child.stdout.take().expect("piped stdout"),
+        Arc::clone(&overflow),
+    );
+    let err = drain(child.stderr.take().expect("piped stderr"), overflow.clone());
 
     // Poll rather than wait, so a wedged process cannot outlive the budget.
     let deadline = Instant::now() + GIT_TIMEOUT;
     let status = loop {
+        if overflow.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(cap_error(args));
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
@@ -358,10 +348,7 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let (out, out_overflow) = out.join().unwrap_or((Vec::new(), false));
     let (err, err_overflow) = err.join().unwrap_or((Vec::new(), false));
     if out_overflow || err_overflow {
-        return Err(format!(
-            "git {} produced more than {DIFF_LIMIT} bytes; the review is incomplete",
-            args.first().unwrap_or(&"")
-        ));
+        return Err(cap_error(args));
     }
     if !status.success() {
         let message = String::from_utf8_lossy(&err).trim().to_string();
@@ -374,8 +361,22 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn drain(
+    stream: impl Read + Send + 'static,
+    overflow: Arc<AtomicBool>,
+) -> JoinHandle<(Vec<u8>, bool)> {
+    std::thread::spawn(move || read_capped(stream, &overflow))
+}
+
+fn cap_error(args: &[&str]) -> String {
+    format!(
+        "git {} produced more than {DIFF_LIMIT} bytes (1 MiB); the review is incomplete",
+        args.first().unwrap_or(&"")
+    )
+}
+
 /// Read at most `DIFF_LIMIT` bytes, and say whether more arrived.
-fn read_capped(mut stream: impl Read) -> (Vec<u8>, bool) {
+fn read_capped(mut stream: impl Read, overflow: &AtomicBool) -> (Vec<u8>, bool) {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
@@ -385,6 +386,7 @@ fn read_capped(mut stream: impl Read) -> (Vec<u8>, bool) {
                 let room = DIFF_LIMIT.saturating_sub(buffer.len());
                 if read > room {
                     buffer.extend_from_slice(&chunk[..room]);
+                    overflow.store(true, Ordering::Relaxed);
                     return (buffer, true);
                 }
                 buffer.extend_from_slice(&chunk[..read]);

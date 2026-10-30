@@ -441,6 +441,10 @@ struct RunCommandArgs {
 /// dispatch so the two cannot drift.
 pub const ASK_TOOLS: &[&str] = &["read_file", "list_directory", "search_files"];
 
+/// Review reads context through the same three workspace readers. Kept as its
+/// own list so a later Ask-only tool cannot silently widen a review.
+pub const REVIEW_TOOLS: &[&str] = &["read_file", "list_directory", "search_files"];
+
 pub struct RunCommandTool;
 
 #[async_trait]
@@ -1333,6 +1337,7 @@ impl ToolRegistry {
                 // outside the workspace, and every Ask citation must be
                 // workspace-validated.
                 AgentMode::Ask => ASK_TOOLS.contains(&tool.name()),
+                AgentMode::Review => REVIEW_TOOLS.contains(&tool.name()),
             })
             .cloned()
             .collect();
@@ -1364,7 +1369,10 @@ impl ToolRegistry {
             AgentMode::Ask if !ASK_TOOLS.contains(&name) => {
                 return Err(format!("Tool '{name}' is disabled in Ask Mode."));
             }
-            AgentMode::Plan | AgentMode::Ask => {}
+            AgentMode::Review if !REVIEW_TOOLS.contains(&name) => {
+                return Err(format!("Tool '{name}' is disabled in Review Mode."));
+            }
+            AgentMode::Plan | AgentMode::Ask | AgentMode::Review => {}
         }
 
         Ok(tool)
