@@ -114,12 +114,26 @@ fn database_and_directory_are_owner_only() {
     std::fs::write(&path, b"").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    let _store = SessionStore::open_at(&path).unwrap();
+    let store = SessionStore::open_at(&path).unwrap();
+    // A write is what makes SQLite create the WAL and its shared-memory index.
+    store.create("/tmp/ws", Some("model"), None).unwrap();
 
     let mode =
         |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&seavx), 0o700);
     assert_eq!(mode(&path), 0o600);
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let sidecar = std::path::PathBuf::from(name);
+        // The WAL exists after the write; the index may already be gone.
+        if suffix == "-wal" {
+            assert!(sidecar.exists(), "the write created a WAL");
+        }
+        if sidecar.exists() {
+            assert_eq!(mode(&sidecar), 0o600, "{suffix} is owner-only");
+        }
+    }
 }
 
 #[test]
@@ -392,6 +406,7 @@ fn stored(seq: i64, role: &str, status: MessageStatus, message: &ChatMessage) ->
 fn loaded(messages: Vec<StoredMessage>) -> LoadedSession {
     LoadedSession {
         id: 1,
+        slug: "svx-00000001".to_string(),
         workspace: "/ws".to_string(),
         title: None,
         model: None,
@@ -955,7 +970,9 @@ fn an_unparseable_payload_opens_the_session_read_only() {
         .segments
         .iter()
         .map(|segment| match segment {
-            crate::tui::app::Segment::Text(text) => text.clone(),
+            crate::tui::app::Segment::Text(text) | crate::tui::app::Segment::Notice(text) => {
+                text.clone()
+            }
             crate::tui::app::Segment::Thinking(text) => text.clone(),
         })
         .collect::<String>();
@@ -1068,4 +1085,209 @@ fn creators_tighten_existing_loose_modes() {
     std::fs::write(&blocker, b"").unwrap();
     let error = crate::util::ensure_private_dir(&blocker.join("nested"), 0o700).unwrap_err();
     assert!(!error.to_string().is_empty(), "{error}");
+}
+
+#[test]
+fn a_v1_database_fixture_opens_and_migrates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+
+    // The file a released 0.1.1-rc.2 wrote: the v1 tables, a version stamp, and
+    // one stored turn. No `.db` blob is committed.
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(super::SCHEMA).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 1;")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(workspace, title, model, payload_format, status, created_at, updated_at)
+                 VALUES ('ws', 'old session', 'm', ?1, 'active', 1, 1)",
+                [PAYLOAD_FORMAT],
+            )
+            .unwrap();
+        let user = serde_json::to_string(&ChatMessage::user("old prompt")).unwrap();
+        let answer = serde_json::to_string(&ChatMessage::assistant("old answer")).unwrap();
+        for (seq, role, payload) in [(1, "user", user), (2, "assistant", answer)] {
+            connection
+                .execute(
+                    "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+                     VALUES (1, ?1, ?2, 'complete', ?3, 1)",
+                    rusqlite::params![seq, role, payload],
+                )
+                .unwrap();
+        }
+    }
+
+    let store = SessionStore::open_at(&path).expect("a v1 file opens");
+    let version: u32 = store
+        .connection()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+
+    let loaded = store.load(1).expect("the stored turn is readable");
+    assert_eq!(loaded.title.as_deref(), Some("old session"));
+    assert!(loaded.read_only.is_none(), "{:?}", loaded.read_only);
+    let outcome = replay(&loaded);
+    let texts: Vec<&str> = outcome
+        .history
+        .iter()
+        .filter_map(|message| message.content.first_text())
+        .collect();
+    assert_eq!(texts, vec!["old prompt", "old answer"]);
+}
+
+#[test]
+fn stored_payloads_round_trip_every_message_shape() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create("ws", Some("m"), Some("shapes")).unwrap();
+
+    let shapes = vec![
+        ChatMessage::user("plain prompt"),
+        ChatMessage::assistant("plain answer"),
+        call_message(vec![
+            tool_call("call_a", "read_file"),
+            tool_call("call_b", "list_directory"),
+        ]),
+        result_message("call_a", "file body"),
+        result_message("call_b", "listing"),
+        ChatMessage::assistant("with reasoning")
+            .with_reasoning_content(Some("a thought".to_string())),
+    ];
+    for message in &shapes {
+        store
+            .record_message(id, message, MessageStatus::Complete)
+            .unwrap();
+    }
+
+    // Re-serialisation is stable, shape by shape.
+    for original in &shapes {
+        let payload = serde_json::to_string(original).unwrap();
+        let parsed: ChatMessage = serde_json::from_str(&payload).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), payload);
+    }
+
+    let loaded = store.load(id).unwrap();
+    let outcome = replay(&loaded);
+    let calls: Vec<String> = outcome
+        .history
+        .iter()
+        .flat_map(|message| message.content.tool_calls())
+        .map(|call| call.call_id.clone())
+        .collect();
+    assert_eq!(
+        calls,
+        vec!["call_a", "call_b"],
+        "the replayed call ids keep their order"
+    );
+    let answered: Vec<String> = outcome
+        .history
+        .iter()
+        .flat_map(|message| message.content.tool_responses())
+        .map(|response| response.call_id.clone())
+        .collect();
+    assert_eq!(answered, vec!["call_a", "call_b"]);
+    assert!(
+        outcome
+            .history
+            .iter()
+            .any(|message| !message.content.reasoning_contents().is_empty()),
+        "the reasoning part survives the round trip"
+    );
+    assert_eq!(
+        outcome.omitted, 0,
+        "nothing was dropped by the resume window"
+    );
+}
+
+#[test]
+fn every_session_gets_a_short_svx_slug() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let first = store.create("/ws", None, None).unwrap();
+    let second = store.create("/ws", None, None).unwrap();
+
+    let mut slugs = Vec::new();
+    for id in [first, second] {
+        let slug = store.load(id).unwrap().slug;
+        assert_eq!(slug.len(), 12, "svx- plus eight hex digits: {slug}");
+        assert!(slug.starts_with("svx-"), "{slug}");
+        assert!(
+            slug[4..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "lowercase hex only: {slug}"
+        );
+        slugs.push(slug);
+    }
+    assert_ne!(slugs[0], slugs[1], "two sessions never share a name");
+}
+
+#[test]
+fn a_slug_and_a_bare_number_both_resolve_to_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create("/ws", None, None).unwrap();
+    let slug = store.load(id).unwrap().slug;
+
+    assert_eq!(store.id_for(&slug).unwrap(), id);
+    assert_eq!(
+        store.id_for(&id.to_string()).unwrap(),
+        id,
+        "a number typed out of habit still resolves"
+    );
+    assert!(matches!(
+        store.id_for("svx-00000000"),
+        Err(SessionError::UnknownKey(_))
+    ));
+    assert!(matches!(
+        store.id_for("999999"),
+        Err(SessionError::UnknownKey(_))
+    ));
+}
+
+#[test]
+fn a_v1_file_gains_a_slug_for_every_existing_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace TEXT NOT NULL,
+                    title TEXT,
+                    model TEXT,
+                    payload_format TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO sessions(workspace, payload_format, status, created_at, updated_at)
+                VALUES ('/ws', 'genai-chat-v1', 'active', 1, 1);
+                PRAGMA user_version = 1;",
+            )
+            .unwrap();
+    }
+
+    let store = SessionStore::open_at(&path).unwrap();
+    let slug: String = store
+        .connection()
+        .query_row("SELECT slug FROM sessions WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(slug.starts_with("svx-"), "the row is named: {slug}");
+
+    let version: u32 = store
+        .connection()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
 }

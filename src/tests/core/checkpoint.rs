@@ -549,3 +549,93 @@ fn a_journal_line_for_an_unknown_target_is_rejected() {
 
     assert!(read_manifest(&directory, ws.path(), None).is_err());
 }
+
+// ---- Audit regressions ------------------------------------------------------
+
+#[test]
+fn undo_refuses_a_file_edited_after_the_agent_wrote_it() {
+    use crate::checkpoint::append_written;
+
+    let ws = workspace_with(&[("notes.txt", "v1\n")]);
+    let directory =
+        CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
+
+    // The agent writes v2 and the journal records those bytes.
+    fs::write(ws.path().join("notes.txt"), "v2\n").unwrap();
+    append_written(&directory, Path::new("notes.txt"), b"v2\n").unwrap();
+    // The user edits afterwards: v3 is newer than anything the agent wrote.
+    fs::write(ws.path().join("notes.txt"), "v3\n").unwrap();
+
+    let error = CheckpointStore::undo_latest(ws.path()).unwrap_err();
+    assert!(
+        error.to_string().contains("changed since it was written"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read_to_string(ws.path().join("notes.txt")).unwrap(),
+        "v3\n",
+        "undo must not overwrite newer work"
+    );
+    assert!(
+        directory.exists(),
+        "the checkpoint stays on disk so the undo can be retried"
+    );
+}
+
+#[test]
+fn undo_restores_when_the_bytes_are_still_the_agents() {
+    use crate::checkpoint::append_written;
+
+    let ws = workspace_with(&[("notes.txt", "v1\n")]);
+    let directory =
+        CheckpointStore::create(ws.path(), &[modified_input(ws.path(), "notes.txt")]).unwrap();
+    fs::write(ws.path().join("notes.txt"), "v2\n").unwrap();
+    append_written(&directory, Path::new("notes.txt"), b"v2\n").unwrap();
+
+    let restored = CheckpointStore::undo_latest(ws.path()).unwrap();
+    assert_eq!(restored, vec![ws.path().join("notes.txt")]);
+    assert_eq!(
+        fs::read_to_string(ws.path().join("notes.txt")).unwrap(),
+        "v1\n"
+    );
+    assert!(
+        !directory.exists(),
+        "a complete restore removes the checkpoint"
+    );
+}
+
+#[test]
+fn recover_pending_reports_a_manifest_it_cannot_read() {
+    use crate::checkpoint::{BatchState, create_batch, recover_pending, set_state};
+
+    let ws = workspace_with(&[("a.txt", "one\n")]);
+    let directory = create_batch(ws.path(), &[modified_input(ws.path(), "a.txt")]).unwrap();
+    set_state(&directory, BatchState::Committing).unwrap();
+    // The backup no longer matches the manifest: the batch may be half applied
+    // and the directory must be reported, not skipped.
+    fs::write(directory.join("backup-0"), "tampered").unwrap();
+
+    let batches = recover_pending(ws.path()).unwrap();
+    assert_eq!(
+        batches.len(),
+        1,
+        "an unreadable checkpoint is still reported"
+    );
+    let rendered = batches[0].render();
+    assert!(rendered.contains("unreadable"), "{rendered}");
+    assert!(
+        rendered.contains("restore them by hand"),
+        "the notice must say what to do: {rendered}"
+    );
+}
+
+#[test]
+fn recover_pending_leaves_a_finished_batch_alone() {
+    use crate::checkpoint::{BatchState, create_batch, recover_pending, set_state};
+
+    let ws = workspace_with(&[("a.txt", "one\n")]);
+    let directory = create_batch(ws.path(), &[modified_input(ws.path(), "a.txt")]).unwrap();
+    set_state(&directory, BatchState::Committed).unwrap();
+
+    assert!(recover_pending(ws.path()).unwrap().is_empty());
+}

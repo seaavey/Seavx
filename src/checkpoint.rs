@@ -63,6 +63,9 @@ pub(crate) struct RestoreEntry {
     pub relpath: String,
     pub state: EntryState,
     pub backup: Option<PathBuf>,
+    /// Length and checksum of the bytes the agent wrote, when the writer
+    /// recorded them. Undo refuses to overwrite anything that differs.
+    pub written: Option<(u64, u64)>,
 }
 
 /// Lifecycle of one batch: written before the first rename, updated after each.
@@ -226,11 +229,20 @@ impl CheckpointStore {
 pub(crate) struct InterruptedBatch {
     pub checkpoint: PathBuf,
     pub entries: Vec<(PathBuf, bool)>,
+    /// Set when the manifest exists but cannot be read: the batch may be half
+    /// applied and `/undo` cannot repair it.
+    pub error: Option<String>,
 }
 
 impl InterruptedBatch {
     /// The notice a human reads: every manifest target, confirmed or not.
     pub(crate) fn render(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!(
+                "batch checkpoint {} is unreadable: {error}\n  files in that batch may differ; restore them by hand",
+                self.checkpoint.display()
+            );
+        }
         let mut text = format!(
             "batch interrupted: {} file(s) may differ; checkpoint {}",
             self.entries.len(),
@@ -267,8 +279,20 @@ pub(crate) fn recover_pending(workspace: &Path) -> Result<Vec<InterruptedBatch>,
 
     let mut interrupted = Vec::new();
     for directory in directories {
-        let Ok(manifest) = read_manifest(&directory, workspace, home.as_deref()) else {
-            continue;
+        let manifest = match read_manifest(&directory, workspace, home.as_deref()) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                // A directory that cannot be read is not a directory to ignore:
+                // a crash may have left it half applied, and silence would hide
+                // files that differ from their backups.
+                let _ = set_state(&directory, BatchState::Partial);
+                interrupted.push(InterruptedBatch {
+                    checkpoint: directory,
+                    entries: Vec::new(),
+                    error: Some(error.to_string()),
+                });
+                continue;
+            }
         };
         if manifest.state != BatchState::Committing {
             continue;
@@ -285,6 +309,7 @@ pub(crate) fn recover_pending(workspace: &Path) -> Result<Vec<InterruptedBatch>,
         interrupted.push(InterruptedBatch {
             checkpoint: directory,
             entries,
+            error: None,
         });
     }
     Ok(interrupted)
@@ -403,14 +428,35 @@ pub(crate) fn set_state(directory: &Path, state: BatchState) -> Result<(), Check
 /// Append one confirmed rename. Append-only and synced: the journal is a lower
 /// bound on what changed, never an upper one.
 pub(crate) fn append_renamed(directory: &Path, relative: &Path) -> Result<(), CheckpointError> {
+    append_line(directory, &format!("renamed\t{}", relative.display()))
+}
+
+/// Record the bytes this writer put on disk. Undo compares the file against
+/// them before restoring, so a later edit is never thrown away.
+pub(crate) fn append_written(
+    directory: &Path,
+    relative: &Path,
+    bytes: &[u8],
+) -> Result<(), CheckpointError> {
+    append_line(
+        directory,
+        &format!(
+            "written\t{}\t{}\t{}",
+            relative.display(),
+            bytes.len(),
+            fnv1a64(bytes)
+        ),
+    )
+}
+
+fn append_line(directory: &Path, line: &str) -> Result<(), CheckpointError> {
     use std::io::Write;
     let path = directory.join(MANIFEST);
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .map_err(|error| reject(format!("journal: {error}")))?;
-    writeln!(file, "renamed\t{}", relative.display())
-        .map_err(|error| reject(format!("journal: {error}")))?;
+    writeln!(file, "{line}").map_err(|error| reject(format!("journal: {error}")))?;
     file.sync_all()
         .map_err(|error| reject(format!("journal: {error}")))
 }
@@ -428,6 +474,7 @@ pub(crate) fn read_manifest(
     let mut state = BatchState::Committed;
     let mut entries: Vec<RestoreEntry> = Vec::new();
     let mut renamed: Vec<String> = Vec::new();
+    let mut written: Vec<(String, u64, u64)> = Vec::new();
 
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let fields: Vec<&str> = line.split('\t').collect();
@@ -437,6 +484,15 @@ pub(crate) fn read_manifest(
                     .ok_or_else(|| reject(format!("unknown batch state: {value}")))?;
             }
             ["renamed", path] => renamed.push((*path).to_string()),
+            ["written", path, len, sum] => {
+                let len: u64 = len
+                    .parse()
+                    .map_err(|_| reject(format!("malformed written length: {len}")))?;
+                let sum: u64 = sum
+                    .parse()
+                    .map_err(|_| reject(format!("malformed written checksum: {sum}")))?;
+                written.push(((*path).to_string(), len, sum));
+            }
             _ if fields.len() == 7 => {
                 let entry_state = EntryState::parse(fields[2])
                     .ok_or_else(|| reject(format!("unknown entry state: {}", fields[2])))?;
@@ -447,6 +503,7 @@ pub(crate) fn read_manifest(
                     relpath: fields[0].to_string(),
                     state: entry_state,
                     backup,
+                    written: None,
                 });
             }
             _ => return Err(reject(format!("malformed manifest line: {line}"))),
@@ -459,6 +516,17 @@ pub(crate) fn read_manifest(
                 "journal names a target the manifest does not record: {path}"
             )));
         }
+    }
+
+    // The journal says which bytes were ours. An entry with no record was
+    // written by an older build, so undo cannot tell our bytes from the user's.
+    for (path, len, sum) in written {
+        let Some(entry) = entries.iter_mut().find(|entry| entry.relpath == path) else {
+            return Err(reject(format!(
+                "journal names a target the manifest does not record: {path}"
+            )));
+        };
+        entry.written = Some((len, sum));
     }
 
     Ok(Manifest {
@@ -489,6 +557,19 @@ fn restore(checkpoint: &Path, entries: Vec<RestoreEntry>) -> Result<Vec<PathBuf>
 }
 
 fn restore_entry(entry: &RestoreEntry) -> Result<(), CheckpointError> {
+    // Undo only takes back the bytes this agent wrote. A file edited afterwards
+    // holds the user's newer work, and overwriting it is the data loss undo is
+    // meant to prevent. A file that is gone has nothing to lose.
+    if let Some((len, sum)) = entry.written
+        && let Ok(current) = std::fs::read(&entry.target)
+        && (current.len() as u64 != len || fnv1a64(&current) != sum)
+    {
+        return Err(reject(format!(
+            "{}: changed since it was written; left as it is",
+            entry.target.display()
+        )));
+    }
+
     match entry.state {
         EntryState::Created => {
             if entry.target.exists() {
@@ -612,6 +693,15 @@ fn write_checkpoint(
         ModePolicy::Force(0o600),
     )
     .map_err(|error| reject(format!("manifest: {error}")))
+}
+
+/// The name the manifest uses for a target: workspace-relative inside the
+/// workspace, absolute for a global write.
+pub(crate) fn relative_name(workspace: &Path, path: &Path) -> String {
+    match path.strip_prefix(workspace) {
+        Ok(relative) => relative.to_string_lossy().to_string(),
+        Err(_) => path.to_string_lossy().to_string(),
+    }
 }
 
 fn describe_target(

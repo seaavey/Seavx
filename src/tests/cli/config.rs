@@ -22,6 +22,77 @@ fn set_preserves_comments_and_unknown_keys() {
 }
 
 #[test]
+fn the_model_picker_keeps_comments_and_unknown_keys() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    fs::write(
+        &path,
+        "# keep me\nmodel = \"old\"\nreasoning_effort = \"low\"\ncustom = 1\n",
+    )
+    .unwrap();
+
+    // The `/model` picker and `seavx model` both land here.
+    set_model_and_effort(&path, "new-model", Some("high")).unwrap();
+
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# keep me"), "{text}");
+    assert!(text.contains("custom = 1"), "{text}");
+    assert!(text.contains("model = \"new-model\""), "{text}");
+    assert!(text.contains("reasoning_effort = \"high\""), "{text}");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the config stays owner-only");
+    }
+}
+
+#[test]
+fn model_with_an_invalid_effort_changes_nothing() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    let before = "# keep me\nmodel = \"old\"\nreasoning_effort = \"low\"\n";
+    fs::write(&path, before).unwrap();
+
+    let error = set_model_and_effort(&path, "new-model", Some("turbo")).unwrap_err();
+    assert!(error.contains("reasoning_effort"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        before,
+        "no partial write"
+    );
+
+    // The model alone is still writable, and the effort is untouched.
+    set_model_and_effort(&path, "new-model", None).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("model = \"new-model\""), "{text}");
+    assert!(text.contains("reasoning_effort = \"low\""), "{text}");
+}
+
+#[test]
+fn config_set_base_url_prints_no_userinfo_or_query() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+
+    let printed = set_value(
+        &path,
+        ConfigKey::BaseUrl,
+        "https://user:pass@host/v1?token=secret",
+    )
+    .unwrap();
+
+    assert!(printed.contains("host"), "{printed}");
+    assert!(printed.contains("(userinfo/query redacted)"), "{printed}");
+    assert!(!printed.contains("user:pass"), "{printed}");
+    assert!(!printed.contains("secret"), "{printed}");
+
+    // The file keeps the value the user typed; only the output is redacted.
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("user:pass@host"), "{text}");
+}
+
+#[test]
 fn rejects_invalid_values() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("config.toml");
@@ -53,7 +124,27 @@ fn set_on_missing_file_writes_a_loadable_config() {
     let (config, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
     assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
     assert_eq!(config.model, "new-model");
-    assert_eq!(config.max_turns, 1000);
+    assert_eq!(config.max_turns, 100, "new files default to 100 turns");
+}
+
+#[test]
+fn a_partial_config_file_is_merged_with_defaults() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join(".seavx/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // One key only: the runtime must keep the file instead of discarding it.
+    fs::write(&path, "api_key = \"sr-live-12345678\"\n").unwrap();
+
+    let (config, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
+    assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
+    assert_eq!(config.api_key.as_deref(), Some("sr-live-12345678"));
+    assert_eq!(config.model, crate::agent::engine::DEFAULT_MODEL);
+    assert_eq!(
+        config.max_turns,
+        crate::agent::engine::DEFAULT_MAX_TURNS,
+        "a missing key takes the built-in default"
+    );
+    assert_eq!(config.tool_permissions, "ask");
 }
 
 #[test]
@@ -181,6 +272,7 @@ fn config_writer_preserves_comments_and_unknown_keys() {
         permitted_actions: Vec::new(),
         reasoning_effort: None,
         system_prompt: None,
+        stream: true,
     };
     write_agent_config(&path, &config).unwrap();
     let text = stash_written_config(&path);
@@ -275,6 +367,31 @@ fn config_writer_tightens_0644_to_0600() {
 }
 
 #[test]
+fn a_refused_write_leaves_the_previous_config_in_place() {
+    let temp = tempdir().unwrap();
+    let path = config_file(temp.path());
+    set_value(&path, ConfigKey::Model, "keep-me").unwrap();
+    let before = fs::read(&path).unwrap();
+
+    // Over the atomic writer's ceiling: the write is refused before any rename.
+    let too_big = vec![b'x'; crate::atomic_file::MAX_ATOMIC_BYTES as usize + 1];
+    let error = replace_config(&path, &too_big).unwrap_err();
+
+    assert!(error.contains("16 MB"), "{error}");
+    assert_eq!(fs::read(&path).unwrap(), before, "the old config survives");
+    let leftovers: Vec<String> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains("seavx-tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a refused write stages nothing: {leftovers:?}"
+    );
+}
+
+#[test]
 fn config_writer_never_echoes_url_userinfo_or_query() {
     let temp = tempdir().unwrap();
     let path = config_file(temp.path());
@@ -296,24 +413,6 @@ fn config_writer_never_echoes_url_userinfo_or_query() {
         set_value(&path, ConfigKey::BaseUrl, "https://user:pass@?token=abc123").unwrap_err();
     assert!(!error.contains("user:pass"), "{error}");
     assert!(!error.contains("abc123"), "{error}");
-}
-
-#[test]
-fn config_writer_rechecks_target_before_remove() {
-    let temp = tempdir().unwrap();
-    let path = config_file(temp.path());
-    fs::write(&path, "model = \"old\"\n").unwrap();
-
-    let error = replace_config_with(
-        &path,
-        b"model = \"new\"\n",
-        Some(Fault::ChangeTargetDuringWrite),
-    )
-    .unwrap_err();
-
-    assert!(error.contains("config changed during write"), "{error}");
-    let text = fs::read_to_string(&path).unwrap();
-    assert!(text.contains("concurrent = true"), "{text}");
 }
 
 #[test]
@@ -372,73 +471,6 @@ fn config_recovery_keeps_third_state_and_backup() {
     );
 }
 
-#[test]
-fn config_writer_conflicts_if_target_changes_after_final_recheck() {
-    let temp = tempdir().unwrap();
-    let path = config_file(temp.path());
-    fs::write(&path, "model = \"old\"\n").unwrap();
-
-    let error = replace_config_with(
-        &path,
-        b"model = \"new\"\n",
-        Some(Fault::ThirdStateAfterRemove),
-    )
-    .unwrap_err();
-
-    assert!(error.contains("config recovery conflict"), "{error}");
-    assert_eq!(fs::read_to_string(&path).unwrap(), "third = 3\n");
-    let backups: Vec<_> = fs::read_dir(path.parent().unwrap())
-        .unwrap()
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            name.contains(".bak-") && !name.ends_with(".new")
-        })
-        .collect();
-    assert_eq!(backups.len(), 1, "the backup is kept");
-}
-
-#[test]
-fn config_writer_faults_leave_old_or_new() {
-    let temp = tempdir().unwrap();
-    let old = b"model = \"old\"\n";
-    let new = b"model = \"new\"\n";
-
-    for fault in [Fault::BackupCreate, Fault::TargetRemove, Fault::Rename] {
-        let path = config_file(&temp.path().join(format!("{fault:?}")));
-        fs::write(&path, old).unwrap();
-
-        let result = replace_config_with(&path, new, Some(fault));
-
-        let text = fs::read(&path).unwrap();
-        assert!(
-            text == old || text == new,
-            "{fault:?} left neither the old nor the new config: {text:?}"
-        );
-        assert!(result.is_err(), "{fault:?} must not report success");
-        assert!(
-            fs::read_dir(path.parent().unwrap())
-                .unwrap()
-                .flatten()
-                .all(|entry| !entry.file_name().to_string_lossy().contains("seavx-tmp")),
-            "{fault:?} left a staging temp behind"
-        );
-    }
-
-    // A failing backup cleanup keeps the new config and the stale backup.
-    let path = config_file(&temp.path().join("cleanup"));
-    fs::write(&path, old).unwrap();
-    replace_config_with(&path, new, Some(Fault::BackupCleanup)).unwrap();
-    assert_eq!(fs::read(&path).unwrap(), new);
-    assert!(
-        fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains(".bak-")),
-        "the backup survives a failed cleanup"
-    );
-}
-
 fn backup_names(dir: &Path) -> Vec<String> {
     fs::read_dir(dir)
         .unwrap()
@@ -446,32 +478,6 @@ fn backup_names(dir: &Path) -> Vec<String> {
         .map(|entry| entry.file_name().to_string_lossy().to_string())
         .filter(|name| name.contains(".bak-") && !name.ends_with(".new"))
         .collect()
-}
-
-#[test]
-fn config_writer_keeps_a_concurrent_third_state_after_rename() {
-    let temp = tempdir().unwrap();
-    let path = config_file(temp.path());
-    fs::write(&path, "model = \"old\"\n").unwrap();
-
-    let error = replace_config_with(
-        &path,
-        b"model = \"new\"\n",
-        Some(Fault::ThirdStateAfterRename),
-    )
-    .unwrap_err();
-
-    assert!(error.contains("config recovery conflict"), "{error}");
-    assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        "third = 3\n",
-        "a write that landed after the rename is never overwritten"
-    );
-    assert_eq!(
-        backup_names(path.parent().unwrap()).len(),
-        1,
-        "the previous bytes stay available"
-    );
 }
 
 #[test]
@@ -491,24 +497,6 @@ fn config_recovery_prunes_older_backups() {
     );
 }
 
-/// Pins name uniqueness only: `.bak` and `.new` are two writes, not one atomic pair.
-#[test]
-fn config_backup_names_are_unique_within_one_millisecond() {
-    let temp = tempdir().unwrap();
-    let path = config_file(temp.path());
-    fs::write(&path, "model = \"old\"\n").unwrap();
-
-    for _ in 0..50 {
-        write_backup(&path, b"model = \"old\"\n", b"model = \"new\"\n").unwrap();
-    }
-
-    assert_eq!(
-        backup_names(path.parent().unwrap()).len(),
-        50,
-        "every write keeps its own backup, even in the same millisecond"
-    );
-}
-
 // ---- Task 6: phase 0.5 review findings (A1-A4, B2, B4, B5) -----------------
 
 const MALFORMED: &str = "model = \"unterminated\n";
@@ -523,6 +511,7 @@ fn agent_config(model: &str) -> AgentConfig {
         system_prompt: None,
         tool_permissions: "ask".to_string(),
         permitted_actions: Vec::new(),
+        stream: true,
     }
 }
 
@@ -745,4 +734,40 @@ fn permissions_keys_survive_an_unrelated_write() {
     assert!(text.contains("tool_permissions = \"allow\""), "{text}");
     assert!(text.contains("permitted_actions = [\"execute\"]"), "{text}");
     assert!(text.contains("# keep"), "{text}");
+}
+
+#[test]
+fn a_new_config_writes_one_hundred_turns() {
+    let temp = tempdir().unwrap();
+    let (path, created) = init_workspace(temp.path()).unwrap();
+    assert!(created);
+
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("max_turns = 100"),
+        "a new config defaults to 100 turns: {text}"
+    );
+    let config = AgentConfig::load(temp.path());
+    assert_eq!(config.max_turns, 100);
+}
+
+#[test]
+fn an_existing_value_of_one_thousand_is_kept() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join(".seavx/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        "model = \"old\"\nmax_turns = 1000\ntool_permissions = \"ask\"\npermitted_actions = []\n",
+    )
+    .unwrap();
+
+    set_value(&path, ConfigKey::Model, "new-model").unwrap();
+
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("max_turns = 1000"),
+        "the user's value is never rewritten: {text}"
+    );
+    assert_eq!(AgentConfig::load(temp.path()).max_turns, 1000);
 }

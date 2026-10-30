@@ -2,11 +2,11 @@
 
 Serves Seavx build artifacts out of the private R2 bucket `seavx`.
 
-| Path | Behaviour |
-|---|---|
-| `GET /builds/<sha>/<file>` | streams the object with `cache-control: immutable` |
-| `GET /latest/<os>/<arch>` | `302` to the newest build (`linux/x86_64`, `windows/x86_64`) |
-| anything else | `404` |
+| Path                       | Behaviour                                                    |
+| -------------------------- | ------------------------------------------------------------ |
+| `GET /builds/<sha>/<file>` | streams the object with `cache-control: immutable`           |
+| `GET /latest/<os>/<arch>`  | `302` to the newest build (`linux/x86_64`, `windows/x86_64`) |
+| anything else              | `404`                                                        |
 
 CI writes `builds/<sha>/seavx-<os>-<arch>` plus the pointer `latest-<os>-<arch>.json` on every
 push to master, so `/latest/...` is a cheap lookup and every artifact URL is immutable.

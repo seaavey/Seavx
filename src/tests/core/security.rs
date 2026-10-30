@@ -208,7 +208,11 @@ async fn search_skips_protected_files_and_counts_them() {
     let output = crate::agent::tools::ToolRegistry::with_default_tools()
         .get("search_files")
         .unwrap()
-        .execute(serde_json::json!({ "pattern": "PRIVATE_KEY" }), &security)
+        .execute(
+            serde_json::json!({ "pattern": "PRIVATE_KEY" }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await
         .unwrap();
 
@@ -235,7 +239,11 @@ async fn search_over_only_protected_files_returns_no_lines() {
     let output = crate::agent::tools::ToolRegistry::with_default_tools()
         .get("search_files")
         .unwrap()
-        .execute(serde_json::json!({ "pattern": "PRIVATE_KEY" }), &security)
+        .execute(
+            serde_json::json!({ "pattern": "PRIVATE_KEY" }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await
         .unwrap();
 
@@ -262,7 +270,9 @@ fn the_matrix_answers_every_cell() {
         (PermissionMode::Deny, ActionKind::Execute, Verdict::Deny),
         (PermissionMode::Deny, ActionKind::Network, Verdict::Deny),
         (PermissionMode::Ask, ActionKind::Read, Verdict::Allow),
-        (PermissionMode::Ask, ActionKind::Write, Verdict::Allow),
+        // A workspace write asks like a command: nothing is written before the
+        // human answers, so the default mode never edits a file silently.
+        (PermissionMode::Ask, ActionKind::Write, Verdict::Ask),
         (PermissionMode::Ask, ActionKind::GlobalWrite, Verdict::Ask),
         (PermissionMode::Ask, ActionKind::Execute, Verdict::Ask),
         (PermissionMode::Ask, ActionKind::Network, Verdict::Ask),
@@ -282,7 +292,7 @@ fn the_matrix_answers_every_cell() {
         assert_eq!(decide(mode, &[], kind), expected, "{mode:?}/{kind:?}");
     }
 
-    // `permitted_actions` lifts execute and network in `ask` mode only …
+    // `permitted_actions` lifts write, execute and network in `ask` mode only …
     assert_eq!(
         decide(
             PermissionMode::Ask,
@@ -382,7 +392,11 @@ fn whole_command_classification_table() {
         ("git diff HEAD", ActionKind::Read),
         ("git reset --hard", ActionKind::Execute),
         ("git push", ActionKind::Network),
-        ("cargo test", ActionKind::Read),
+        // `cargo test` runs the workspace's own code and build scripts, so it
+        // asks like any other command that executes what it is given.
+        ("cargo test", ActionKind::Execute),
+        ("cargo build", ActionKind::Execute),
+        ("cargo fmt", ActionKind::Write),
         ("sudo ls", ActionKind::Execute),
         ("K=V curl x", ActionKind::Network),
         ("rg PRIVATE_KEY .", ActionKind::Execute),
@@ -668,4 +682,206 @@ fn exec_denies_an_ask_action_with_an_explanation() {
             "/tmp/x",
         )));
     assert_eq!(answer, Answer::Deny);
+}
+
+// ---- Audit regressions ------------------------------------------------------
+
+#[test]
+fn a_read_operand_outside_the_workspace_asks() {
+    use crate::agent::permissions::ActionKind;
+    use crate::agent::shell::classify_with_home;
+
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("victim.txt"), "x").unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("notes.md"), "x").unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let security = WorkspaceSecurity::new(dir.path());
+    let check = |command: &str| classify_with_home(Some(home.path()), command, &security);
+
+    // The shell follows the path, so a name check is not containment: each of
+    // these reads bytes the read policy never saw.
+    for command in [
+        "cat ../victim.txt",
+        "cat /etc/passwd",
+        "head -n 1 ~/.bashrc",
+        "grep x ../../etc/hosts",
+        "mv ../victim.txt ./moved.txt",
+        "ln -s /etc/passwd key",
+    ] {
+        let class = check(command);
+        assert!(
+            class.kind == ActionKind::Execute && class.unanalysable,
+            "{command} must ask (got {:?})",
+            class.kind
+        );
+    }
+
+    // A workspace operand keeps the cheap classification.
+    assert_eq!(check("cat notes.md").kind, ActionKind::Read);
+    assert_eq!(check("cat sub/notes.md").kind, ActionKind::Read);
+}
+
+#[test]
+fn a_quoted_substitution_is_not_inert() {
+    use crate::agent::permissions::ActionKind;
+    use crate::agent::shell::classify_with_home;
+
+    let dir = search_workspace();
+    let home = tempfile::TempDir::new().unwrap();
+    let security = WorkspaceSecurity::new(dir.path());
+    let check = |command: &str| classify_with_home(Some(home.path()), command, &security);
+
+    // Single quotes stay inert; a double-quoted body is still expanded.
+    let class = check("echo \"$(cat .env)\"");
+    assert!(
+        matches!(class.kind, ActionKind::Destructive | ActionKind::Execute),
+        "a quoted substitution reads a protected file: {:?}",
+        class.kind
+    );
+    let class = check("echo \"`cat .env`\"");
+    assert!(
+        matches!(class.kind, ActionKind::Destructive | ActionKind::Execute),
+        "a quoted backtick reads a protected file: {:?}",
+        class.kind
+    );
+    assert_eq!(check("echo '$(cat .env)'").kind, ActionKind::Read);
+}
+
+#[test]
+fn a_git_or_cargo_command_naming_a_protected_path_asks() {
+    use crate::agent::permissions::ActionKind;
+    use crate::agent::shell::classify_with_home;
+
+    let dir = search_workspace();
+    let home = tempfile::TempDir::new().unwrap();
+    let security = WorkspaceSecurity::new(dir.path());
+    let check = |command: &str| classify_with_home(Some(home.path()), command, &security);
+
+    // `git show HEAD:.env` prints the file the read policy refuses.
+    assert_eq!(check("git show HEAD:.env").kind, ActionKind::Execute);
+    assert_eq!(check("git status").kind, ActionKind::Read);
+}
+
+#[test]
+fn an_output_prefix_is_anchored_on_the_line_number() {
+    use crate::agent::shell::output_prefix;
+
+    assert_eq!(output_prefix("notes.md:12: hello"), "notes.md");
+    assert_eq!(output_prefix("dir/notes.md:12: hello"), "dir/notes.md");
+    // A colon inside the path is part of the path, not the separator.
+    assert_eq!(output_prefix("C:\\ws\\.env:3: API_KEY=1"), "C:\\ws\\.env");
+    assert_eq!(output_prefix("C:/ws/.env:3: API_KEY=1"), "C:/ws/.env");
+    assert_eq!(output_prefix("no prefix here"), "no prefix here");
+}
+
+#[test]
+fn the_prompt_file_is_protected() {
+    let dir = workspace();
+    std::fs::write(dir.path().join(".seavx/SOUL.md"), "x").unwrap();
+    assert!(
+        check_file(&dir.path().join(".seavx/SOUL.md")).is_err(),
+        "SOUL.md is injected into the system prompt, so a tool may not rewrite it"
+    );
+}
+
+#[test]
+fn redaction_covers_a_quoted_key_and_a_bare_scheme() {
+    for (line, secret) in [
+        ("{\"token\": \"abcdef123456\"}", "abcdef123456"),
+        ("{\"api_key\": \"abcdef123456\"}", "abcdef123456"),
+        (
+            "curl -H \"Authorization: Bearer abc123def456\"",
+            "abc123def456",
+        ),
+        ("Bearer abc123def456", "abc123def456"),
+    ] {
+        let redacted = crate::agent::security::redact(line);
+        assert!(!redacted.contains(secret), "{line} leaked as {redacted}");
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_file_is_refused_before_it_is_read() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("huge.txt");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(crate::atomic_file::MAX_ATOMIC_BYTES + 1)
+        .unwrap();
+
+    let error = crate::agent::security::read_verified(&path)
+        .await
+        .unwrap_err();
+    assert!(error.contains("read limit"), "{error}");
+}
+
+#[test]
+fn a_symlinked_directory_is_not_inside_the_workspace() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let security = WorkspaceSecurity::new(dir.path());
+
+    assert!(security.contains(&dir.path().join("notes.md")));
+    assert!(!security.contains(outside.path()));
+    assert!(!security.contains(&dir.path().join("../escape.txt")));
+}
+
+#[tokio::test]
+async fn a_workspace_write_asks_before_anything_is_written() {
+    use crate::agent::permissions::{ActionKind, Answer};
+
+    let (_dir, runtime) = runtime_with("ask", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Once);
+    runtime
+        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .await
+        .expect("an approval lets the write through");
+    let seen = confirmer.seen();
+    assert_eq!(seen.len(), 1, "the default mode asks for a write");
+    assert_eq!(seen[0].kind, ActionKind::Write);
+    assert!(
+        seen[0].effect.contains("inside the workspace"),
+        "{:?}",
+        seen[0]
+    );
+
+    // A refusal stops the tool before it runs.
+    let (_dir, runtime) = runtime_with("ask", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    let error = runtime
+        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .await
+        .unwrap_err();
+    assert!(error.contains("Permission denied"), "{error}");
+
+    // `permitted_actions = ["write"]` is the way to stop being asked.
+    let (_dir, runtime) = runtime_with("ask", &["write"]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    runtime
+        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .await
+        .expect("a lifted kind does not ask");
+    assert!(confirmer.seen().is_empty());
+
+    // `allow` mode never asks for a workspace write.
+    let (_dir, runtime) = runtime_with("allow", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    runtime
+        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .await
+        .expect("allow mode writes without a question");
+    assert!(confirmer.seen().is_empty());
+}
+
+#[test]
+fn write_is_liftable_into_permitted_actions() {
+    use crate::agent::permissions::{ActionKind, parse_permitted};
+
+    assert_eq!(
+        parse_permitted(&["write".to_string()]).unwrap(),
+        vec![ActionKind::Write]
+    );
+    let error = parse_permitted(&["global-write".to_string()]).unwrap_err();
+    assert!(error.contains("not liftable"), "{error}");
 }

@@ -159,7 +159,10 @@ pub async fn providers() -> anyhow::Result<()> {
         &config_path,
         &[
             ("saved", "yes".to_string()),
-            ("base_url", config.base_url.clone().unwrap_or_default()),
+            (
+                "base_url",
+                crate::cli::config::redact_url(config.base_url.as_deref().unwrap_or_default()),
+            ),
             ("protocols", protocols),
             ("model", config.model.clone()),
             (

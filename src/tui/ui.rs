@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::agent::engine::AgentMode;
@@ -13,16 +13,30 @@ use crate::tui::markdown;
 
 pub fn render(app: &App, frame: &mut Frame) {
     let input_height = app.input_height();
+    // The permission box takes rows only while a question is on screen, so the
+    // transcript keeps the height it had before the agent asked.
+    let permission_height = if app.pending_permission.is_some() {
+        4
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),            // Header: name, workspace, version
-            Constraint::Min(3),               // Conversation
-            Constraint::Length(1),            // Session title and agent state
-            Constraint::Length(input_height), // Prompt box
-            Constraint::Length(1),            // Footer: model, tokens, keys
+            Constraint::Length(1),                 // Header: name, workspace, version
+            Constraint::Min(3),                    // Conversation
+            Constraint::Length(1),                 // Session title and agent state
+            Constraint::Length(permission_height), // Permission question, when asked
+            Constraint::Length(input_height),      // Prompt box
+            Constraint::Length(1),                 // Footer: model, tokens, keys
         ])
         .split(frame.area());
+    let header = chunks[0];
+    let conversation = chunks[1];
+    let status_bar = chunks[2];
+    let permission_bar = chunks[3];
+    let input_area = chunks[4];
+    let footer = chunks[5];
 
     let dim = Style::default().fg(Color::DarkGray);
     let (mode_style, mode_tag) = match app.mode {
@@ -43,19 +57,19 @@ pub fn render(app: &App, frame: &mut Frame) {
             Span::styled("  ", dim),
             Span::styled(app.workspace.as_str(), dim),
         ])),
-        chunks[0],
+        header,
     );
     frame.render_widget(
         Paragraph::new(Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), dim))
             .alignment(Alignment::Right),
-        chunks[0],
+        header,
     );
 
     let millis = crate::util::epoch_millis();
 
     // 2. Conversation
-    let lines = transcript_lines(app, chunks[1].width);
-    let visible_height = chunks[1].height.saturating_sub(1);
+    let lines = transcript_lines(app, conversation.width);
+    let visible_height = conversation.height.saturating_sub(1);
     let max_scroll = (lines.len() as u16).saturating_sub(visible_height);
 
     let scroll_offset = if app.auto_scroll {
@@ -68,11 +82,11 @@ pub fn render(app: &App, frame: &mut Frame) {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll_offset, 0)),
-        chunks[1],
+        conversation,
     );
 
     if app.segments.is_empty() {
-        render_splash(chunks[1], frame);
+        render_splash(conversation, frame);
     }
 
     // 3. Session title on the left, agent state on the right
@@ -87,7 +101,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     };
     let orb = Orb::for_state(&app.status);
     let used = title.chars().count() + state.chars().count() + 8;
-    let fill = "─".repeat((chunks[2].width as usize).saturating_sub(used));
+    let fill = "─".repeat((status_bar.width as usize).saturating_sub(used));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("─ ", dim),
@@ -97,34 +111,66 @@ pub fn render(app: &App, frame: &mut Frame) {
             Span::styled(format!(" {state}"), state_style),
             Span::styled(" ─", dim),
         ])),
-        chunks[2],
+        status_bar,
     );
 
-    // 4. Prompt box, with any pending permission question directly above it
+    // 4. Permission question: its own box above the composer, the tool and its
+    // effect on one row, the four answers on the next.
     if let Some(pending) = app.pending_permission.as_ref() {
-        let question = format!(
-            "permission: {} — {}  [y once · a category · u unrestricted · n deny]",
-            pending.request.tool, pending.request.effect
-        );
-        let line = Paragraph::new(question).style(Style::default().fg(Color::Yellow));
-        let area = Rect {
-            height: 1,
-            y: chunks[3].y.saturating_sub(1),
-            ..chunks[3]
+        let request = &pending.request;
+        let key = |label: &'static str, color: Color| {
+            Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
         };
-        frame.render_widget(Clear, area);
-        frame.render_widget(line, area);
+        let hint = |text: &'static str| Span::styled(text, Style::default().fg(Color::DarkGray));
+
+        let body = vec![
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    request.tool.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ", dim),
+                Span::styled(request.effect.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::raw(" "),
+                key("y", Color::Green),
+                hint(" once   "),
+                key("a", Color::Green),
+                hint(" this category   "),
+                key("u", Color::Yellow),
+                hint(" unrestricted   "),
+                key("n", Color::Red),
+                hint(" deny"),
+            ]),
+        ];
+        let block = Block::default()
+            .title(Span::styled(
+                " permission ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+        frame.render_widget(Paragraph::new(body).block(block), permission_bar);
     }
-    frame.render_widget(&app.input, chunks[3]);
+    frame.render_widget(&app.input, input_area);
 
     // 4b. Inline Slash Command Auto-complete Menu
     let matches = app.slash_matches();
     if !matches.is_empty() && !app.popups_dismissed() {
-        // Two border rows plus one row per command; SLASH_COMMANDS is short enough to fit.
+        // Two border rows plus one row per command; the table is short enough to fit.
         let menu_height = matches.len() as u16 + 2;
         let menu_width = 62.min(frame.area().width.saturating_sub(4));
-        let menu_y = chunks[3].y.saturating_sub(menu_height);
-        let menu_area = Rect::new(chunks[3].x + 2, menu_y, menu_width, menu_height);
+        let menu_y = input_area.y.saturating_sub(menu_height);
+        let menu_area = Rect::new(input_area.x + 2, menu_y, menu_width, menu_height);
 
         frame.render_widget(Clear, menu_area);
 
@@ -225,15 +271,10 @@ pub fn render(app: &App, frame: &mut Frame) {
     let config = &app.config;
     let effort_label = config.reasoning_effort.as_deref().unwrap_or("none");
 
-    // Dynamic model context window limit detection
-    let max_context_limit: i32 = if config.model.contains("claude")
-        || config.model.contains("nemotron")
-        || config.model.contains("gemini")
-    {
-        1_000_000 // 1M context
-    } else {
-        128_000 // default 128k context (deepseek, glm, gpt-4o, etc)
-    };
+    // One table, shared with the budget and `doctor`.
+    let limit = crate::agent::engine::model_context_limit(&config.model);
+    let max_context_limit = limit.tokens;
+    let assumed = if limit.assumed { " (assumed)" } else { "" };
 
     let total = app.total_tokens.max(app.prompt_tokens);
 
@@ -252,10 +293,10 @@ pub fn render(app: &App, frame: &mut Frame) {
     const HINTS: &str = "↑↓ history  ·  tab complete  ·  ⏎ send  ·  ctrl+c exit";
     let separator = Span::styled("  ·  ", dim);
     let left_area = Rect {
-        width: chunks[4]
+        width: footer
             .width
             .saturating_sub(HINTS.chars().count() as u16 + 2),
-        ..chunks[4]
+        ..footer
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -268,7 +309,10 @@ pub fn render(app: &App, frame: &mut Frame) {
                     .add_modifier(Modifier::BOLD),
             ),
             separator.clone(),
-            Span::styled(token_display, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{token_display}{assumed}"),
+                Style::default().fg(Color::Cyan),
+            ),
             separator,
             Span::styled(format!("effort {effort_label}"), dim),
         ])),
@@ -276,7 +320,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     );
     frame.render_widget(
         Paragraph::new(Span::styled(HINTS, dim)).alignment(Alignment::Right),
-        chunks[4],
+        footer,
     );
 
     // 6. Modal Selection Overlay (Model / Effort)
@@ -285,34 +329,71 @@ pub fn render(app: &App, frame: &mut Frame) {
         frame.render_widget(Clear, area);
 
         match modal {
-            ModalSelection::Model { models, selected } => {
-                let items: Vec<ListItem> = models
+            ModalSelection::Model {
+                models,
+                query,
+                selected,
+            } => {
+                // The list is longer than the box: the items are plain text and
+                // the stateful render scrolls the window to the selected row.
+                // Without it the window stayed pinned to the first rows and the
+                // cursor walked off the bottom, so the picker looked frozen.
+                let visible = crate::tui::app::visible_models(models, query);
+                let items: Vec<ListItem> = visible
                     .iter()
-                    .enumerate()
-                    .map(|(i, m)| {
-                        let is_active = *m == app.config.model;
-                        let prefix = if i == *selected { "❯ " } else { "  " };
-                        let suffix = if is_active { " [active]" } else { "" };
-                        let style = if i == *selected {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
-                        } else if is_active {
+                    .map(|model| {
+                        let suffix = if model.as_str() == app.config.model {
+                            " [active]"
+                        } else {
+                            ""
+                        };
+                        let style = if model.as_str() == app.config.model {
                             Style::default().fg(Color::Cyan)
                         } else {
                             Style::default().fg(Color::White)
                         };
-                        ListItem::new(format!("{prefix}{m}{suffix}")).style(style)
+                        ListItem::new(format!("{model}{suffix}")).style(style)
                     })
                     .collect();
 
-                let list = List::new(items).block(
-                    Block::default()
-                        .title(" Select Model (↑/↓: move, Enter: choose, 'r': refresh /models, Esc: cancel) ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
-                );
-                frame.render_widget(list, area);
+                let title = if app.refreshing_models {
+                    // A spinner is the only sign of life while the gateway is
+                    // slow; without it the frozen picker reads as a hang.
+                    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                    let frame = FRAMES[(millis / 80) as usize % FRAMES.len()];
+                    format!(" Refreshing /models {frame} (Esc: close) ")
+                } else {
+                    // The filter is the picker's search box: type to narrow,
+                    // Backspace to widen.
+                    let filter = if query.is_empty() {
+                        "type to filter".to_string()
+                    } else {
+                        format!("filter: {query}")
+                    };
+                    format!(
+                        " Select Model {}/{} · {filter} · ↑/↓ move · ctrl+r refresh · Esc ",
+                        visible.len(),
+                        models.len()
+                    )
+                };
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .title(title)
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    )
+                    // A background, not just a color: the cursor must survive a
+                    // font that has no ❯ glyph.
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("❯ ");
+                let mut state = ListState::default().with_selected(Some(*selected));
+                frame.render_stateful_widget(list, area, &mut state);
             }
             ModalSelection::Effort {
                 model,
@@ -346,6 +427,30 @@ pub fn render(app: &App, frame: &mut Frame) {
                 );
                 frame.render_widget(list, area);
             }
+            ModalSelection::Session { rows, selected } => {
+                // Same as the model picker: a long list scrolls with the cursor.
+                let items: Vec<ListItem> = rows
+                    .iter()
+                    .map(|row| ListItem::new(row.clone()).style(Style::default().fg(Color::White)))
+                    .collect();
+
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .title(" Select Session (↑/↓: move, Enter: open, Esc: cancel) ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("❯ ");
+                let mut state = ListState::default().with_selected(Some(*selected));
+                frame.render_stateful_widget(list, area, &mut state);
+            }
         }
     }
 
@@ -356,7 +461,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         let toast_width = (msg.len() as u16 + 4).min(frame.area().width.saturating_sub(2));
         let toast_area = Rect::new(
             frame.area().width.saturating_sub(toast_width + 2),
-            chunks[3].y.saturating_sub(3),
+            input_area.y.saturating_sub(3),
             toast_width,
             3,
         );
@@ -468,6 +573,11 @@ fn build_transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     for segment in &app.segments {
         match segment {
             Segment::Text(text) => lines.extend(markdown::render(text, width)),
+            // A report keeps the shape it was printed in: markdown would fold
+            // every row into one re-wrapped paragraph.
+            Segment::Notice(text) => {
+                lines.extend(text.lines().map(|line| Line::from(line.to_string())));
+            }
             Segment::Thinking(text) => {
                 // Transcript blocks are history: only the status line animates.
                 lines.push(Line::from(vec![
@@ -480,8 +590,11 @@ fn build_transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
+                // Four columns, not six bytes: `│` is three bytes wide.
                 let prefix = "  │ ";
-                let content_width = (width as usize).saturating_sub(prefix.len()).max(10);
+                let content_width = (width as usize)
+                    .saturating_sub(unicode_width::UnicodeWidthStr::width(prefix))
+                    .max(10);
                 for raw_line in text.lines() {
                     let mut current = String::new();
                     let mut current_len = 0;

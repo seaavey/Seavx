@@ -66,7 +66,9 @@ pub fn check_file(path: &Path) -> Result<(), String> {
 
     let file_name = names.last().map(String::as_str).unwrap_or_default();
     let in_seavx = names.len() >= 2 && names[names.len() - 2] == ".seavx";
-    if in_seavx && file_name == "config.toml" {
+    // config.toml holds the key; SOUL.md is injected into the system prompt
+    // ahead of the security policy, so a tool must never rewrite it.
+    if in_seavx && matches!(file_name, "config.toml" | "soul.md") {
         return Err(format!(
             "Access denied to protected sensitive file: {file_name}"
         ));
@@ -101,7 +103,7 @@ const SECRET_KEYS: &[&str] = &[
 /// Token shapes masked wherever they appear. Heuristic, not a secret scanner:
 /// a determined format change slips through until it is added here.
 const TOKEN_PREFIXES: &[&str] = &[
-    "sk-", "ghp_", "gho_", "xoxb-", "xoxa-", "xoxp-", "ntn_", "AKIA",
+    "sk-", "ghp_", "gho_", "xoxb-", "xoxa-", "xoxp-", "ntn_", "AKIA", "Bearer ", "bearer ",
 ];
 
 /// Mask every documented secret shape so tool text can reach a log, an error or
@@ -156,24 +158,50 @@ fn secret_value_start(line: &str) -> Option<usize> {
         while let Some(found) = lower[from..].find(key) {
             let start = from + found;
             let rest = &line[start + key.len()..];
-            let separator = rest
-                .char_indices()
-                .find(|(_, ch)| !matches!(ch, ' ' | '\t'));
-            if let Some((offset, ch)) = separator
-                && matches!(ch, '=' | ':')
-            {
-                let value = line[start + key.len() + offset + ch.len_utf8()..].trim_start();
-                if !value.is_empty() {
-                    let value_start = line.len() - value.len();
-                    earliest =
-                        Some(earliest.map_or(value_start, |current| current.min(value_start)));
-                    break;
-                }
+            if let Some(value_start) = value_offset(rest, start + key.len()) {
+                earliest = Some(earliest.map_or(value_start, |current| current.min(value_start)));
+                break;
             }
             from = start + key.len();
         }
     }
     earliest
+}
+
+/// Offset of the value after `rest` (the text following a key), or `None` when
+/// no separator follows. Covers `key=value`, `key: value` and the quoted form
+/// `"key": "value"`. `base` is `rest`'s offset in the line.
+fn value_offset(rest: &str, base: usize) -> Option<usize> {
+    let mut cursor = skip_blanks(rest, 0);
+    // The key was quoted: this quote closes it.
+    if let Some(quote) = rest[cursor..]
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '"' | '\''))
+    {
+        cursor = skip_blanks(rest, cursor + quote.len_utf8());
+    }
+    let separator = rest[cursor..].chars().next()?;
+    if !matches!(separator, '=' | ':') {
+        return None;
+    }
+    cursor = skip_blanks(rest, cursor + separator.len_utf8());
+    // The value itself may be quoted.
+    if let Some(quote) = rest[cursor..]
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '"' | '\''))
+    {
+        cursor += quote.len_utf8();
+    }
+    if rest[cursor..].trim().is_empty() {
+        return None;
+    }
+    Some(base + cursor)
+}
+
+fn skip_blanks(text: &str, from: usize) -> usize {
+    from + text[from..].len() - text[from..].trim_start_matches([' ', '\t']).len()
 }
 
 fn mask_tokens(line: &str) -> String {
@@ -229,6 +257,9 @@ pub struct PathSnapshot {
     pub ino: u64,
     pub mode: u32,
     pub len: u64,
+    /// Modification time: catches an in-place edit that keeps the length, which
+    /// `(dev, ino, len)` alone cannot see.
+    pub modified: Option<std::time::SystemTime>,
 }
 
 /// Snapshot without following symlinks, so a link is described as a link.
@@ -245,15 +276,19 @@ fn snapshot_of(meta: &std::fs::Metadata) -> std::io::Result<PathSnapshot> {
             ino: meta.ino(),
             mode: meta.mode(),
             len: meta.len(),
+            modified: meta.modified().ok(),
         })
     }
     #[cfg(not(unix))]
     {
+        // Windows has no stable file id in `std`: identity degrades to length,
+        // mode and modification time, which the README states.
         Ok(PathSnapshot {
             dev: 0,
             ino: 0,
             mode: 0,
             len: meta.len(),
+            modified: meta.modified().ok(),
         })
     }
 }
@@ -292,6 +327,15 @@ pub async fn open_verified(
 /// Read a path through the validated-and-verified sequence in one step.
 pub async fn read_verified(path: &Path) -> Result<String, String> {
     let before = snapshot(path).map_err(|e| format!("Failed to read file: {e}"))?;
+    // A line limit does not bound memory: refuse an oversized file before the
+    // whole thing is read into the process.
+    if before.len > crate::atomic_file::MAX_ATOMIC_BYTES {
+        return Err(format!(
+            "Failed to read file: {} bytes is over the {} byte read limit",
+            before.len,
+            crate::atomic_file::MAX_ATOMIC_BYTES
+        ));
+    }
     let mut file = open_verified(path, &before)
         .await
         .map_err(|e| format!("Failed to read file: {e}"))?;
@@ -386,6 +430,14 @@ impl WorkspaceSecurity {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Whether `path` (which may not exist yet) resolves inside the workspace.
+    /// Symlinks are resolved, so a link that points out is outside.
+    pub fn contains(&self, path: &Path) -> bool {
+        self.canonicalize_with_new_tail(path)
+            .map(|canonical| canonical.starts_with(&self.root))
+            .unwrap_or(false)
     }
 }
 

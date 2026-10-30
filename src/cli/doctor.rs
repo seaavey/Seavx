@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::agent::engine::{
-    AgentConfig, ConfigOrigin, ConfigReport, DEFAULT_BASE_URL, normalize_base_url,
+    AgentConfig, ConfigOrigin, ConfigReport, DEFAULT_BASE_URL, model_context_limit,
+    normalize_base_url,
 };
 use crate::agent::models::{ModelCache, ModelManager};
 use crate::agent::skills::SkillManager;
@@ -72,10 +73,15 @@ pub async fn run_with_probe(options: DoctorOptions, probe: &dyn EndpointProbe) -
     let checks = vec![
         binary_check(),
         config_check(&config_report),
+        config_recovery_check(&config_report),
         secret_check(&config),
+        context_check(&config),
+        permissions_check(&config),
+        stream_check(&config, options.offline),
         endpoint_check(&options, &config, &base_url, probe).await,
         cache_check(&options.workspace_root, &base_url),
         workspace_check(&options.workspace_root),
+        session_check(&options),
         memory_check(&options),
         skills_check(&options.workspace_root),
     ];
@@ -122,6 +128,17 @@ fn config_check(report: &ConfigReport) -> CheckResult {
         ),
         None => ok("config", "no file; using defaults"),
     }
+}
+
+/// The limit the budget uses, and whether it is this build's conservative guess.
+fn context_check(config: &AgentConfig) -> CheckResult {
+    let limit = model_context_limit(&config.model);
+    let source = if limit.assumed {
+        "assumed".to_string()
+    } else {
+        config.model.clone()
+    };
+    ok("context", format!("{} tokens ({source})", limit.tokens))
 }
 
 fn secret_check(config: &AgentConfig) -> CheckResult {
@@ -196,17 +213,246 @@ fn workspace_check(workspace_root: &Path) -> CheckResult {
         );
     }
 
-    let probe = directory.join(format!(".doctor-{}", std::process::id()));
-    if let Err(error) = std::fs::write(&probe, b"ok") {
-        let _ = std::fs::remove_file(&probe);
-        return fail("workspace", format!("not writable: {error}"));
+    let probe = match create_probe(&directory, &probe_name()) {
+        Ok(probe) => probe,
+        Err(ProbeError::InUse) => return warn("workspace", "probe name in use; not overwritten"),
+        Err(ProbeError::Failed(detail)) => {
+            return fail("workspace", format!("not writable: {detail}"));
+        }
+    };
+    if let Err(error) = remove_probe(probe) {
+        return fail("workspace", error);
     }
-    let _ = std::fs::remove_file(&probe);
 
     if existed {
         ok("workspace", "writable")
     } else {
         warn("workspace", "created `.seavx` during check")
+    }
+}
+
+/// A name no other run can hold: this process, this instant.
+pub(crate) fn probe_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!(".{}-{nanos}", std::process::id())
+}
+
+/// A probe file this run created, identified by the filesystem's own handle.
+#[derive(Debug)]
+pub(crate) struct Probe {
+    path: PathBuf,
+    id: FileId,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileId(u64, u64);
+
+fn file_id(metadata: &std::fs::Metadata) -> FileId {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        FileId(metadata.dev(), metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        FileId(metadata.len(), 0)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ProbeError {
+    /// Something is already at that name: never followed, never overwritten.
+    InUse,
+    Failed(String),
+}
+
+/// Create the probe exclusively and owner-only. `create_new` is what makes a
+/// planted symlink or file a `WARN` instead of a write through it.
+pub(crate) fn create_probe(directory: &Path, name: &str) -> Result<Probe, ProbeError> {
+    let path = directory.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ProbeError::InUse);
+        }
+        Err(error) => return Err(ProbeError::Failed(error.to_string())),
+    };
+    let id = file
+        .metadata()
+        .map(|metadata| file_id(&metadata))
+        .map_err(|error| ProbeError::Failed(error.to_string()))?;
+    use std::io::Write;
+    file.write_all(b"ok")
+        .map_err(|error| ProbeError::Failed(error.to_string()))?;
+    drop(file);
+
+    Ok(Probe { path, id })
+}
+
+/// Remove exactly the file this run created: a same-named replacement is left
+/// alone, and a failed cleanup is reported instead of hidden.
+pub(crate) fn remove_probe(probe: Probe) -> Result<(), String> {
+    let current = std::fs::metadata(&probe.path)
+        .map(|metadata| file_id(&metadata))
+        .map_err(|error| format!("probe cleanup failed: {error}"))?;
+    if current != probe.id {
+        return Err(format!(
+            "probe cleanup refused: {} is no longer the file this check created",
+            display_path(&probe.path)
+        ));
+    }
+    std::fs::remove_file(&probe.path).map_err(|error| format!("probe cleanup failed: {error}"))
+}
+
+/// A `.bak` the loader could not resolve: name it instead of leaving it in a
+/// `tracing::warn!`. Load already succeeded with whatever file is readable.
+fn config_recovery_check(report: &ConfigReport) -> CheckResult {
+    let path = report
+        .active_path
+        .as_deref()
+        .unwrap_or(&report.workspace_path);
+    match crate::cli::config::recover_config(path) {
+        Ok(()) => ok("config-recovery", "no pending backup conflict"),
+        Err(conflict) => warn("config-recovery", conflict),
+    }
+}
+
+/// The permission mode and the categories lifted out of it; never a secret.
+fn permissions_check(config: &AgentConfig) -> CheckResult {
+    let persisted = if config.permitted_actions.is_empty() {
+        "none".to_string()
+    } else {
+        config.permitted_actions.join(" ")
+    };
+    match config.tool_permissions.as_str() {
+        "deny" | "ask" | "allow" => ok(
+            "permissions",
+            format!("{} (persisted: {persisted})", config.tool_permissions),
+        ),
+        other => fail("permissions", format!("invalid tool_permissions: {other}")),
+    }
+}
+
+/// A capability probe would spend a provider request; this reports the setting
+/// and what a failure falls back to, unless `--offline` hides the endpoint.
+fn stream_check(config: &AgentConfig, offline: bool) -> CheckResult {
+    let suffix = if offline { " (not probed)" } else { "" };
+    if config.stream {
+        ok(
+            "stream",
+            format!("enabled{suffix}; a failed stream falls back to one plain request"),
+        )
+    } else {
+        ok(
+            "stream",
+            format!("disabled{suffix}; every turn sends one plain request"),
+        )
+    }
+}
+
+/// Where this run's session database lives, derived from the report's paths so a
+/// test never opens the checkout's own file.
+fn session_path(options: &DoctorOptions) -> Option<PathBuf> {
+    if crate::util::is_debug() {
+        return Some(options.workspace_root.join(".seavx").join("sessions.db"));
+    }
+    options
+        .home
+        .as_ref()
+        .map(|home| home.join(".seavx").join("sessions.db"))
+}
+
+/// Path, schema version, payload format and writability. The database is opened
+/// read-only; writability is proven by a probe file, and only in a directory
+/// that already exists, so a check never creates the store it inspects.
+fn session_check(options: &DoctorOptions) -> CheckResult {
+    let Some(path) = session_path(options) else {
+        return warn("session", "home directory is not set");
+    };
+    let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let exists = directory.is_dir();
+    let writable = exists
+        && create_probe(&directory, &probe_name())
+            .ok()
+            .is_some_and(|probe| remove_probe(probe).is_ok());
+
+    if !path.exists() {
+        return ok(
+            "session",
+            format!(
+                "{} (empty; created with the first prompt)",
+                display_path(&path)
+            ),
+        );
+    }
+
+    let header =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())
+            .and_then(|connection| {
+                let version: i64 = connection
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                let format: String = connection
+                    .query_row(
+                        "SELECT payload_format FROM sessions ORDER BY id DESC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_else(|_| "unknown".to_string());
+                Ok((version, format))
+            });
+
+    match header {
+        Ok((version, format)) => {
+            // A version or payload format this build does not know opens the
+            // session read-only, so it is a warning rather than a quiet pass.
+            let version_ok = version == i64::from(crate::session::SCHEMA_VERSION);
+            let format_ok = format == crate::session::PAYLOAD_FORMAT;
+            let mut detail = format!("{} · schema v{version}", display_path(&path));
+            if !version_ok {
+                detail.push_str(&format!(
+                    " (this build expects v{})",
+                    crate::session::SCHEMA_VERSION
+                ));
+            }
+            detail.push_str(&format!(" · {format}"));
+            if !format_ok {
+                detail.push_str(&format!(
+                    " (this build reads {})",
+                    crate::session::PAYLOAD_FORMAT
+                ));
+            }
+            detail.push_str(if writable {
+                " · writable"
+            } else {
+                " · not writable"
+            });
+            result(
+                "session",
+                if version_ok && format_ok && writable {
+                    CheckStatus::Ok
+                } else {
+                    CheckStatus::Warn
+                },
+                detail,
+            )
+        }
+        Err(error) => warn(
+            "session",
+            format!("{} is unreadable: {error}", display_path(&path)),
+        ),
     }
 }
 

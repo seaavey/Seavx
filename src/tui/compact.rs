@@ -8,6 +8,8 @@ use crate::tui::app::Segment;
 pub const MIN_TRANSCRIPT_CHARS: usize = 4_000;
 pub const MIN_TRANSCRIPT_LINES: usize = 40;
 pub const CHUNK_CHARS: usize = 24_000;
+/// The banner a compaction summary enters the request under.
+pub const SESSION_CONTEXT_BANNER: &str = "# SESSION CONTEXT (compacted)";
 
 const TRUNCATION_MARKER: &str = "\n...[truncated]...\n";
 
@@ -80,6 +82,7 @@ pub fn transcript_from_segments(segments: &[Segment]) -> String {
         .iter()
         .map(|segment| match segment {
             Segment::Text(text) => text.clone(),
+            Segment::Notice(text) => text.clone(),
             Segment::Thinking(text) => format!("[reasoning]\n{text}"),
         })
         .collect::<Vec<_>>()
@@ -196,6 +199,8 @@ pub async fn run_compaction(
     if summary.is_empty() {
         return Err("compaction returned an empty summary".to_string());
     }
+    // One gate: a summary that cannot carry the plan is rejected here too.
+    crate::agent::budget::validate_summary(&summary)?;
 
     Ok(CompactResult {
         after_chars: summary.chars().count(),
@@ -219,7 +224,7 @@ async fn summarize(summarizer: &dyn Summarizer, prompt: String) -> Result<String
 pub fn build_agent_task(prompt: &str, session_context: Option<&str>) -> String {
     match session_context {
         Some(context) => {
-            format!("# SESSION CONTEXT (compacted)\n{context}\n\n# CURRENT REQUEST\n{prompt}")
+            format!("{SESSION_CONTEXT_BANNER}\n{context}\n\n# CURRENT REQUEST\n{prompt}")
         }
         None => prompt.to_string(),
     }

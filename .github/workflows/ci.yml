@@ -104,6 +104,19 @@ jobs:
           # The sha-suffixed copy is the immutable record; the plain name stays the "latest" alias.
           cp "dist/${{ matrix.binary_name }}" "dist/${{ matrix.binary_name }}-$SHORT_SHA"
 
+      - name: Compute checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          file="dist/${{ matrix.binary_name }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            digest=$(sha256sum "$file" | cut -d' ' -f1)
+          else
+            # Windows without coreutils: certutil prints the hash on line 2.
+            digest=$(certutil -hashfile "$file" SHA256 | sed -n '2p' | tr -d ' \r')
+          fi
+          echo "SHA256=$digest" >> "$GITHUB_ENV"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -130,8 +143,8 @@ jobs:
 
           # Pointer the worker's /latest/ routes resolve; short cache, the target is immutable.
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          printf '{"sha":"%s","key":"%s","version":"%s","built_at":"%s"}\n' \
-            "$SHORT_SHA" "$key" "$version" "$(date -u +%FT%TZ)" > "pointer/latest-${{ matrix.platform }}.json"
+          printf '{"sha":"%s","key":"%s","version":"%s","built_at":"%s","sha256":"%s"}\n' \
+            "$SHORT_SHA" "$key" "$version" "$(date -u +%FT%TZ)" "$SHA256" > "pointer/latest-${{ matrix.platform }}.json"
           aws s3 cp "pointer/latest-${{ matrix.platform }}.json" \
             "s3://seavx/latest-${{ matrix.platform }}.json" \
             --endpoint-url "$endpoint" \

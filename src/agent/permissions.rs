@@ -102,7 +102,8 @@ impl Confirmer for DenyingConfirmer {
 }
 
 /// The matrix. Destructive is refused unconditionally, a global write is asked
-/// in every mode, and `permitted` only lifts execute/network out of `ask`.
+/// in every mode, and a workspace write asks like a command: `permitted` lifts
+/// write, execute and network out of `ask`, never out of `deny` or the floor.
 pub fn decide(mode: PermissionMode, permitted: &[ActionKind], kind: ActionKind) -> Verdict {
     match kind {
         ActionKind::Destructive => Verdict::Deny,
@@ -111,11 +112,7 @@ pub fn decide(mode: PermissionMode, permitted: &[ActionKind], kind: ActionKind) 
             PermissionMode::Ask | PermissionMode::Allow => Verdict::Ask,
         },
         ActionKind::Read => Verdict::Allow,
-        ActionKind::Write => match mode {
-            PermissionMode::Deny => Verdict::Deny,
-            PermissionMode::Ask | PermissionMode::Allow => Verdict::Allow,
-        },
-        ActionKind::Execute | ActionKind::Network => match mode {
+        ActionKind::Write | ActionKind::Execute | ActionKind::Network => match mode {
             PermissionMode::Deny => Verdict::Deny,
             PermissionMode::Allow => Verdict::Allow,
             PermissionMode::Ask => {
@@ -140,17 +137,19 @@ pub fn parse_mode(raw: &str) -> Result<PermissionMode, String> {
     }
 }
 
-/// Only execute and network are liftable. `global-write` and the destructive
-/// floor are not, so a config naming them is an error rather than a decision.
+/// Only write, execute and network are liftable. `global-write` and the
+/// destructive floor are not, so a config naming them is an error rather than a
+/// decision.
 pub fn parse_permitted(raw: &[String]) -> Result<Vec<ActionKind>, String> {
     let mut kinds = Vec::new();
     for entry in raw {
         let kind = match entry.trim().to_ascii_lowercase().as_str() {
+            "write" => ActionKind::Write,
             "execute" => ActionKind::Execute,
             "network" => ActionKind::Network,
             other => {
                 return Err(format!(
-                    "permitted_actions accepts execute, network; `{other}` is not liftable"
+                    "permitted_actions accepts write, execute, network; `{other}` is not liftable"
                 ));
             }
         };

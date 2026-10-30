@@ -22,6 +22,7 @@ async fn write_file_captures_a_restorable_checkpoint() {
         .execute(
             json!({ "path": "notes.txt", "content": "after" }),
             &security,
+            &crate::agent::cancel::CancelToken::new(),
         )
         .await
         .unwrap();
@@ -60,6 +61,7 @@ async fn write_file_aborts_when_the_checkpoint_cannot_be_written() {
         .execute(
             json!({ "path": "notes.txt", "content": "after" }),
             &security,
+            &crate::agent::cancel::CancelToken::new(),
         )
         .await;
 
@@ -81,6 +83,7 @@ async fn edit_file_captures_the_pre_edit_bytes() {
         .execute(
             json!({ "path": "notes.txt", "old_string": "before", "new_string": "after" }),
             &security,
+            &crate::agent::cancel::CancelToken::new(),
         )
         .await
         .unwrap();
@@ -118,6 +121,7 @@ async fn checkpoint_never_records_created_for_an_existing_target() {
         .execute(
             json!({ "path": "notes.txt", "content": "after" }),
             &security,
+            &crate::agent::cancel::CancelToken::new(),
         )
         .await
         .unwrap();
@@ -147,6 +151,7 @@ async fn write_file_fails_closed_when_the_target_cannot_be_read() {
         .execute(
             json!({ "path": "locked.txt", "content": "overwritten" }),
             &security,
+            &crate::agent::cancel::CancelToken::new(),
         )
         .await;
 
@@ -175,7 +180,11 @@ async fn undo_does_not_delete_an_unreadable_target() {
     let _ = registry
         .get("write_file")
         .unwrap()
-        .execute(json!({ "path": "locked.txt", "content": "x" }), &security)
+        .execute(
+            json!({ "path": "locked.txt", "content": "x" }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await;
 
     let restored = crate::checkpoint::CheckpointStore::undo_latest(&root).unwrap();
@@ -203,7 +212,11 @@ async fn tool_output_and_logs_never_contain_a_fake_key() {
     let refused = registry
         .get("read_file")
         .unwrap()
-        .execute(json!({ "path": ".seavx/config.toml" }), &security)
+        .execute(
+            json!({ "path": ".seavx/config.toml" }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -215,7 +228,11 @@ async fn tool_output_and_logs_never_contain_a_fake_key() {
     let found = registry
         .get("search_files")
         .unwrap()
-        .execute(json!({ "pattern": "api_key" }), &security)
+        .execute(
+            json!({ "pattern": "api_key" }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await
         .unwrap_or_default();
     assert!(!found.contains(key), "the search echoed the key: {found}");
@@ -276,7 +293,11 @@ async fn command_output_is_capped_and_environment_is_cleared() {
         async move {
             tool.get("run_command")
                 .unwrap()
-                .execute(json!({ "command": command }), &security)
+                .execute(
+                    json!({ "command": command }),
+                    &security,
+                    &crate::agent::cancel::CancelToken::new(),
+                )
                 .await
         }
     };
@@ -284,7 +305,7 @@ async fn command_output_is_capped_and_environment_is_cleared() {
 
     let big = run("yes x | head -c 200000").await.unwrap();
     assert!(
-        big.contains("bytes omitted"),
+        big.contains("chars omitted"),
         "a 200 KB stream must be capped: {}",
         &big[big.len().saturating_sub(120)..]
     );
@@ -314,7 +335,11 @@ async fn recursive_search_output_withholds_protected_lines() {
     let output = ToolRegistry::with_default_tools()
         .get("run_command")
         .unwrap()
-        .execute(json!({ "command": "grep -rn PRIVATE_KEY ." }), &security)
+        .execute(
+            json!({ "command": "grep -rn PRIVATE_KEY ." }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await
         .unwrap();
 
@@ -337,7 +362,13 @@ async fn a_command_outliving_its_timeout_leaves_no_child() {
     let pid_file = root.join("child.pid");
     let command = format!("echo $$ > {}; exec sleep 60", pid_file.display());
 
-    let result = super::run_shell(&command, &security, std::time::Duration::from_millis(300)).await;
+    let result = super::run_shell(
+        &command,
+        &security,
+        std::time::Duration::from_millis(300),
+        &crate::agent::cancel::CancelToken::new(),
+    )
+    .await;
     assert!(result.is_err(), "the timeout must be reported");
 
     let pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
@@ -362,6 +393,7 @@ async fn ambiguous_snippet_is_refused_with_count_and_samples() {
         .execute(
             json!({ "path": "notes.txt", "old_string": "fn", "new_string": "pub fn" }),
             &security,
+            &crate::agent::cancel::CancelToken::new(),
         )
         .await
         .unwrap_err();
@@ -389,7 +421,7 @@ async fn replace_all_changes_every_occurrence() {
         .unwrap()
         .execute(
             json!({ "path": "notes.txt", "old_string": "fn", "new_string": "pub fn", "replace_all": true }),
-            &security,
+            &security, &crate::agent::cancel::CancelToken::new(),
         )
         .await
         .unwrap();
@@ -410,6 +442,7 @@ async fn an_empty_old_string_and_a_noop_edit_are_handled() {
         .execute(
             json!({ "path": "notes.txt", "old_string": "", "new_string": "x" }),
             &security,
+            &crate::agent::cancel::CancelToken::new(),
         )
         .await
         .unwrap_err();
@@ -419,6 +452,7 @@ async fn an_empty_old_string_and_a_noop_edit_are_handled() {
         .execute(
             json!({ "path": "notes.txt", "old_string": "one line", "new_string": "one line" }),
             &security,
+            &crate::agent::cancel::CancelToken::new(),
         )
         .await
         .unwrap();
@@ -442,7 +476,11 @@ async fn apply_patch_writes_multiple_files_and_creates_new_ones() {
     let result = ToolRegistry::with_default_tools()
         .get("apply_patch")
         .unwrap()
-        .execute(json!({ "patch": diff }), &security)
+        .execute(
+            json!({ "patch": diff }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await
         .unwrap();
 
@@ -479,7 +517,11 @@ async fn apply_patch_writes_nothing_when_any_file_fails() {
     let error = ToolRegistry::with_default_tools()
         .get("apply_patch")
         .unwrap()
-        .execute(json!({ "patch": diff }), &security)
+        .execute(
+            json!({ "patch": diff }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
         .await
         .unwrap_err();
 
@@ -493,5 +535,144 @@ async fn apply_patch_writes_nothing_when_any_file_fails() {
             .unwrap_or(0)
             == 0,
         "nothing may be checkpointed or written"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cancelled_command_returns_a_complete_result_naming_the_outcome() {
+    let (_temp, root, _security) = prepare().await;
+    let cancel = crate::agent::cancel::CancelToken::new();
+    let clone = cancel.clone();
+
+    let call = tokio::spawn(async move {
+        let registry = ToolRegistry::with_default_tools();
+        let tool = registry.get("run_command").unwrap();
+        let security = WorkspaceSecurity::new(root);
+        tool.execute(json!({ "command": "sleep 30" }), &security, &clone)
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    cancel.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+        .await
+        .expect("a cancelled command returns inside the window")
+        .unwrap()
+        .expect("a cancelled command is a result, not an error");
+
+    assert!(
+        result.contains("outcome: cancelled"),
+        "the result names the outcome: {result}"
+    );
+    assert!(
+        !result.contains("timed out"),
+        "a cancel is not a timeout: {result}"
+    );
+}
+
+// ---- Audit regressions ------------------------------------------------------
+
+#[tokio::test]
+async fn a_create_patch_over_an_existing_file_is_refused() {
+    let (_temp, root, security) = prepare().await;
+    std::fs::write(root.join("existing.txt"), "user content\n").unwrap();
+
+    let diff = "--- /dev/null\n+++ b/existing.txt\n@@ -0,0 +1,1 @@\n+NEW LINE\n";
+    let error = ToolRegistry::with_default_tools()
+        .get("apply_patch")
+        .unwrap()
+        .execute(
+            json!({ "patch": diff }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("existing.txt")).unwrap(),
+        "user content\n",
+        "a refused create patch writes nothing"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn search_does_not_follow_a_symlinked_directory() {
+    let (_temp, root, security) = prepare().await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.md"), "PRIVATE_KEY here\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+
+    let output = ToolRegistry::with_default_tools()
+        .get("search_files")
+        .unwrap()
+        .execute(
+            json!({ "pattern": "PRIVATE_KEY" }),
+            &security,
+            &crate::agent::cancel::CancelToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !output.contains("secret.md") && !output.contains("PRIVATE_KEY here"),
+        "a symlinked directory is not part of the workspace: {output}"
+    );
+}
+
+#[tokio::test]
+async fn a_background_child_does_not_hold_the_turn_open() {
+    let (_temp, _root, security) = prepare().await;
+    let cancel = crate::agent::cancel::CancelToken::new();
+
+    // The shell exits at once; the sleep it left behind keeps the pipe open.
+    let call = async {
+        let registry = ToolRegistry::with_default_tools();
+        let tool = registry.get("run_command").unwrap();
+        tool.execute(
+            json!({ "command": "sleep 30 & exit 0" }),
+            &security,
+            &cancel,
+        )
+        .await
+    };
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+        .await
+        .expect("a background child must not hold the turn open");
+    let result = result.expect("the command itself succeeded");
+    assert!(!result.contains("timed out"), "{result}");
+}
+
+#[tokio::test]
+async fn undo_refuses_a_file_the_user_edited_after_the_write() {
+    let (_temp, root, security) = prepare().await;
+    let registry = ToolRegistry::with_default_tools();
+    let cancel = crate::agent::cancel::CancelToken::new();
+
+    registry
+        .get("write_file")
+        .unwrap()
+        .execute(
+            json!({ "path": "notes.txt", "content": "agent wrote this" }),
+            &security,
+            &cancel,
+        )
+        .await
+        .unwrap();
+    std::fs::write(root.join("notes.txt"), "the user wrote this instead").unwrap();
+
+    let error = CheckpointStore::undo_latest(&root).unwrap_err();
+    assert!(
+        error.to_string().contains("changed since it was written"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "the user wrote this instead",
+        "the newer edit survives the undo"
     );
 }

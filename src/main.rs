@@ -73,6 +73,12 @@ enum Commands {
         command: cli::sessions::SessionsCommand,
     },
 
+    /// Resume a stored session, picking one from a list when no id is given
+    Resume {
+        /// Session id (`svx-…`); omit to choose from this workspace's sessions
+        id: Option<String>,
+    },
+
     /// Self-update SEAVX to the latest release
     Update {
         /// Force update even if already up to date
@@ -90,18 +96,10 @@ enum SetupSection {
     Providers,
 }
 
-fn init_tracing(debug_flag: bool) -> anyhow::Result<Option<PathBuf>> {
-    let log_file_path = util::prepare_log_file(std::path::Path::new(".seavx"))?;
-
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file_path)?;
-
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(file)
-        .with_ansi(false);
-
+/// Install the subscriber. Only a command that runs the agent writes a log
+/// file: `doctor`, `update` and the rest must work in a directory they cannot
+/// write, so their logs go to stderr and nothing is created on disk.
+fn init_tracing(debug_flag: bool, to_file: bool) -> anyhow::Result<()> {
     // An explicit `--debug` raises the filter; otherwise the env or a default applies.
     let filter = if debug_flag {
         EnvFilter::new("seavx=trace,genai=debug")
@@ -110,16 +108,34 @@ fn init_tracing(debug_flag: bool) -> anyhow::Result<Option<PathBuf>> {
             .unwrap_or_else(|_| EnvFilter::new("seavx=debug,genai=debug"))
     };
 
+    if !to_file {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init();
+        return Ok(());
+    }
+
+    let log_file_path = util::prepare_log_file(std::path::Path::new(".seavx"))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)?;
+
     tracing_subscriber::registry()
         .with(filter)
-        .with(file_layer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(file)
+                .with_ansi(false),
+        )
         .init();
 
     tracing::info!(
         "Tracing initialized. Writing debug log to {:?}",
         log_file_path
     );
-    Ok(Some(log_file_path))
+    Ok(())
 }
 
 #[tokio::main]
@@ -127,7 +143,27 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     let args = Cli::parse();
-    let _log_path = init_tracing(args.debug)?;
+    if args.debug {
+        util::set_debug_flag();
+    }
+    // Only the agent commands own a workspace log; a diagnostic or an update
+    // must not create `.seavx` in whatever directory it was started from.
+    let writes_log = matches!(
+        &args.command,
+        None | Some(Commands::Run { .. })
+            | Some(Commands::Exec { .. })
+            | Some(Commands::Resume { .. })
+    );
+    // A TUI run owns its workspace, so it records the debug state it resolved
+    // in `.env` for the next run. `exec` keeps its promise and writes nothing.
+    let owns_workspace = matches!(
+        &args.command,
+        None | Some(Commands::Run { .. }) | Some(Commands::Resume { .. })
+    );
+    if owns_workspace {
+        let _ = util::persist_debug_flag(std::path::Path::new("."), util::is_debug());
+    }
+    init_tracing(args.debug, writes_log)?;
 
     match args.command {
         Some(Commands::Run { prompt }) => {
@@ -153,25 +189,37 @@ async fn main() -> anyhow::Result<()> {
 
             let runtime = agent::engine::AgentRuntime::new(config, security);
             println!("Executing task: {task}\n");
+            // Set by the first streamed token: the answer is already on screen,
+            // so printing it again would show it twice.
+            let mut streamed = false;
             let result = runtime
                 .execute_task(
                     &task,
                     agent::engine::AgentMode::Build,
                     Vec::new(),
                     &agent::permissions::DenyingConfirmer,
+                    &agent::cancel::CancelToken::new(),
                     |evt| {
                         // Reasoning blocks are a TUI concern; headless runs skip them.
-                        if !evt.starts_with("THINKING:") {
+                        if let Some(token) = evt.strip_prefix("TOKEN:") {
+                            streamed = true;
+                            print!("{token}");
+                        } else if !evt.starts_with("THINKING:") {
                             println!("{evt}");
                         }
                     },
                     // `seavx exec` stays session-free: no row is ever written.
-                    |_| {},
+                    |_, _| {},
                 )
                 .await
+                .result
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            println!("\nFinal Response:\n{result}");
+            if streamed {
+                println!();
+            } else {
+                println!("\nFinal Response:\n{result}");
+            }
         }
         Some(Commands::Init) => {
             let (config_path, created) = cli::config::init_workspace(std::path::Path::new("."))
@@ -201,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Model { model, effort }) => cli::model::run(model, effort).await?,
         Some(Commands::Memory) => cli::memory::run()?,
         Some(Commands::Sessions { command }) => cli::sessions::run(command).await?,
+        Some(Commands::Resume { id }) => cli::sessions::run_resume(id).await?,
         Some(Commands::Update { force }) => cli::update::run(force).await?,
         Some(Commands::Uninstall) => cli::uninstall::run()?,
         None => {

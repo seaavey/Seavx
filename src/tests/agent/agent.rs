@@ -46,6 +46,7 @@ mod test_cases {
             .execute(
                 json!({ "path": "Cargo.toml", "offset": 1, "limit": 5 }),
                 &sec,
+                &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(res.is_ok());
@@ -54,7 +55,11 @@ mod test_cases {
         let search_res = registry
             .get("search_files")
             .unwrap()
-            .execute(json!({ "pattern": "name = \"seavx\"" }), &sec)
+            .execute(
+                json!({ "pattern": "name = \"seavx\"" }),
+                &sec,
+                &crate::agent::cancel::CancelToken::new(),
+            )
             .await;
         assert!(search_res.is_ok());
         assert!(search_res.unwrap().contains("Cargo.toml"));
@@ -75,7 +80,11 @@ mod test_cases {
         let mem_res = registry
             .get("save_memory")
             .unwrap()
-            .execute(json!({ "lesson": "secret_api_key_123" }), &mem_sec)
+            .execute(
+                json!({ "lesson": "secret_api_key_123" }),
+                &mem_sec,
+                &crate::agent::cancel::CancelToken::new(),
+            )
             .await;
         assert!(mem_res.is_err());
 
@@ -86,6 +95,7 @@ mod test_cases {
             .execute(
                 json!({ "lesson": "Low confidence guess", "confidence": 50 }),
                 &mem_sec,
+                &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(low_conf_res.is_err());
@@ -101,6 +111,7 @@ mod test_cases {
             .execute(
                 json!({ "lesson": "High confidence verified rule", "confidence": 95 }),
                 &mem_sec,
+                &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(high_conf_res.is_ok());
@@ -250,7 +261,7 @@ mod test_cases {
                     "name": name,
                     "content": "---\nname: seavx-skill-tools-roundtrip\ndescription: \"Roundtrip test skill.\"\n---\n\nStep A\n"
                 }),
-                &sec,
+                &sec, &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(created.unwrap().contains("Successfully created"));
@@ -261,6 +272,7 @@ mod test_cases {
             .execute(
                 json!({ "name": name, "old_string": "Step A", "new_string": "Step B" }),
                 &sec,
+                &crate::agent::cancel::CancelToken::new(),
             )
             .await;
         assert!(patched.unwrap().contains("Successfully patched"));
@@ -268,7 +280,11 @@ mod test_cases {
         let viewed = registry
             .get("skill_view")
             .unwrap()
-            .execute(json!({ "name": name }), &sec)
+            .execute(
+                json!({ "name": name }),
+                &sec,
+                &crate::agent::cancel::CancelToken::new(),
+            )
             .await
             .unwrap();
         assert!(viewed.contains("Step B"));
@@ -276,7 +292,11 @@ mod test_cases {
         let missing = registry
             .get("skill_view")
             .unwrap()
-            .execute(json!({ "name": "no-such-skill-xyz" }), &sec)
+            .execute(
+                json!({ "name": "no-such-skill-xyz" }),
+                &sec,
+                &crate::agent::cancel::CancelToken::new(),
+            )
             .await;
         assert!(missing.is_err());
 
@@ -384,7 +404,8 @@ mod test_cases {
 
 #[cfg(test)]
 mod engine_seam {
-    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime, ChatBackend};
+    use crate::agent::backend::ChatBackend;
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
     use crate::agent::permissions::DenyingConfirmer;
     use crate::agent::security::WorkspaceSecurity;
     use genai::adapter::AdapterKind;
@@ -392,7 +413,7 @@ mod engine_seam {
         ChatMessage, ChatOptions, ChatRequest, ChatResponse, MessageContent, ToolResponse,
     };
 
-    fn response(content: MessageContent) -> ChatResponse {
+    pub(super) fn response(content: MessageContent) -> ChatResponse {
         let model = genai::ModelIden::new(AdapterKind::OpenAI, "fake-model");
         ChatResponse {
             content,
@@ -415,24 +436,33 @@ mod engine_seam {
         .unwrap()
     }
 
-    /// A scripted provider: one response per request, every request recorded.
+    /// A scripted provider: one response or error per request, every request
+    /// recorded.
     #[derive(Clone, Default)]
-    struct FakeBackend {
+    pub(super) struct FakeBackend {
         inner: std::sync::Arc<FakeInner>,
     }
 
     #[derive(Default)]
     struct FakeInner {
-        script: std::sync::Mutex<std::collections::VecDeque<ChatResponse>>,
+        script: std::sync::Mutex<std::collections::VecDeque<Result<ChatResponse, String>>>,
         requests: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
     }
 
     impl FakeBackend {
-        fn push(&self, response: ChatResponse) {
-            self.inner.script.lock().unwrap().push_back(response);
+        pub(super) fn push(&self, response: ChatResponse) {
+            self.inner.script.lock().unwrap().push_back(Ok(response));
         }
 
-        fn requests(&self) -> Vec<Vec<ChatMessage>> {
+        pub(super) fn push_error(&self, message: &str) {
+            self.inner
+                .script
+                .lock()
+                .unwrap()
+                .push_back(Err(message.to_string()));
+        }
+
+        pub(super) fn requests(&self) -> Vec<Vec<ChatMessage>> {
             self.inner.requests.lock().unwrap().clone()
         }
     }
@@ -450,12 +480,11 @@ mod engine_seam {
                 .lock()
                 .unwrap()
                 .push(request.messages.clone());
-            self.inner
-                .script
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or_else(|| "fake backend ran out of responses".into())
+            match self.inner.script.lock().unwrap().pop_front() {
+                Some(Ok(response)) => Ok(response),
+                Some(Err(message)) => Err(std::io::Error::other(message).into()),
+                None => Err(std::io::Error::other("fake backend ran out of responses").into()),
+            }
         }
     }
 
@@ -490,10 +519,12 @@ mod engine_seam {
                 AgentMode::Build,
                 history,
                 &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
                 |_| {},
-                |message| reported.push(message.clone()),
+                |message, _| reported.push(message.clone()),
             )
             .await
+            .result
             .unwrap();
 
         assert_eq!(answer, "all done");
@@ -540,10 +571,12 @@ mod engine_seam {
                 AgentMode::Build,
                 history,
                 &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
                 |_| {},
-                |_| {},
+                |_, _| {},
             )
             .await
+            .result
             .unwrap();
 
         let requests = fake.requests();
@@ -567,5 +600,663 @@ mod engine_seam {
         );
         assert_eq!(messages[3].content.tool_responses()[0].content, "file body");
         assert_eq!(messages[4].content.first_text(), Some("now"));
+    }
+}
+
+#[cfg(test)]
+mod context_budget {
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
+    use crate::agent::security::WorkspaceSecurity;
+    use crate::tui::compact::Summarizer;
+    use genai::chat::{ChatMessage, ChatRequest};
+
+    /// A summary that passes the quality gate.
+    pub fn valid_summary() -> String {
+        format!(
+            "# Goals\n{}\n# Decisions\nkeep going\n# Files\nsrc/agent/engine.rs\n# Pending\nnone",
+            "continue the task without losing the plan".repeat(4)
+        )
+    }
+
+    struct ScriptedSummarizer {
+        calls: std::sync::atomic::AtomicUsize,
+        response: Result<String, String>,
+    }
+
+    impl ScriptedSummarizer {
+        fn ok(summary: String) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                response: Ok(summary),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                response: Err("provider said no".to_string()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Summarizer for ScriptedSummarizer {
+        async fn summarize(&self, _prompt: String) -> Result<String, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.response.clone()
+        }
+    }
+
+    fn runtime(workspace: &std::path::Path) -> AgentRuntime {
+        let mut config = AgentConfig::load(workspace);
+        config.model = "deepseek-chat".to_string(); // 128k window
+        config.max_turns = 4;
+        config.system_prompt = Some("system prompt".to_string());
+        AgentRuntime::new(config, WorkspaceSecurity::new(workspace))
+    }
+
+    /// Twelve turns of ~10 000 estimated tokens: 120k over a 102.4k budget.
+    fn over_budget_history() -> Vec<ChatMessage> {
+        let mut history = Vec::new();
+        for index in 0..12 {
+            history.push(ChatMessage::user(format!("question {index}")));
+            history.push(ChatMessage::assistant("x".repeat(40_000)));
+        }
+        history
+    }
+
+    fn notices() -> Vec<String> {
+        Vec::new()
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_history_compacts_once_and_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        let summarizer = ScriptedSummarizer::ok(valid_summary());
+        let mut notices = notices();
+        let mut sink = |notice: &str| notices.push(notice.to_string());
+
+        let request = runtime
+            .prepare_request(
+                over_budget_history(),
+                "current task",
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+
+        assert!(summarizer.calls() >= 2, "chunk calls plus a merge");
+        let summary_message = request
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .content
+                    .first_text()
+                    .is_some_and(|text| text.contains("# SESSION CONTEXT (compacted)"))
+            })
+            .expect("a summary message enters the request");
+        assert_eq!(
+            summary_message.role,
+            genai::chat::ChatRole::User,
+            "the summary is a user message, never a mid-conversation system one"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("context compacted")),
+            "{notices:?}"
+        );
+        assert!(
+            request
+                .messages
+                .last()
+                .and_then(|message| message.content.first_text())
+                == Some("current task"),
+            "the newest instruction is never lost"
+        );
+        assert!(
+            crate::agent::budget::estimate_tokens(&request) <= 102_400,
+            "the compacted request fits the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_summarizer_drops_older_turns_and_says_why() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        let summarizer = ScriptedSummarizer::failing();
+        let mut notices = notices();
+        let mut sink = |notice: &str| notices.push(notice.to_string());
+
+        let request = runtime
+            .prepare_request(
+                over_budget_history(),
+                "current task",
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+
+        let failing = notices
+            .iter()
+            .find(|notice| notice.contains("compaction failed"))
+            .unwrap_or_else(|| panic!("{notices:?}"));
+        assert!(failing.contains("provider said no"), "{failing}");
+        assert!(failing.contains("older turns dropped"), "{failing}");
+        assert!(
+            !request.messages.iter().any(|message| message
+                .content
+                .first_text()
+                .is_some_and(|text| text.contains("# SESSION CONTEXT"))),
+            "no summary enters a request that failed to summarize"
+        );
+        assert_eq!(
+            request.messages.last().unwrap().content.first_text(),
+            Some("current task")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_summary_that_still_does_not_fit_shrinks_then_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        // Well-formed but far too large: ~100 000 estimated tokens.
+        let huge = format!(
+            "# Goals\n{}\n# Decisions\nx\n# Files\nx\n# Pending\nx",
+            "y".repeat(400_000)
+        );
+        let summarizer = ScriptedSummarizer::ok(huge);
+        let mut notices = notices();
+        let mut sink = |notice: &str| notices.push(notice.to_string());
+
+        let request = runtime
+            .prepare_request(
+                over_budget_history(),
+                "current task",
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+
+        assert!(
+            summarizer.calls() >= 4,
+            "one attempt plus three 10 % shrinks: {}",
+            summarizer.calls()
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("older turns dropped")
+                    || notice.contains("sending the newest turn anyway")),
+            "the drop is never silent: {notices:?}"
+        );
+        assert_eq!(
+            request.messages.len(),
+            4,
+            "system, the newest turn, the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_newest_turn_is_sent_with_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        let summarizer = ScriptedSummarizer::ok(valid_summary());
+        let mut notices = notices();
+        let mut sink = |notice: &str| notices.push(notice.to_string());
+
+        let history = vec![
+            ChatMessage::user("huge question"),
+            ChatMessage::assistant("z".repeat(480_000)),
+        ];
+        let request: ChatRequest = runtime
+            .prepare_request(
+                history,
+                "current task",
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+
+        assert_eq!(summarizer.calls(), 0, "nothing older exists to summarize");
+        let warning = notices
+            .iter()
+            .find(|notice| notice.contains("sending the newest turn anyway"))
+            .unwrap_or_else(|| panic!("{notices:?}"));
+        assert!(warning.contains("deepseek-chat"), "{warning}");
+        assert!(
+            warning.contains("102400"),
+            "names the estimate budget: {warning}"
+        );
+        assert_eq!(
+            request.messages[2].content.first_text(),
+            Some("z".repeat(480_000).as_str()),
+            "the oversized message is never truncated"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_budget {
+    use super::context_budget::valid_summary;
+    use super::engine_seam::{FakeBackend, response};
+    use crate::agent::engine::{
+        AgentConfig, AgentMode, AgentRuntime, RetryBudget, RetryTrigger, classify_failure,
+    };
+    use crate::agent::security::WorkspaceSecurity;
+    use crate::tui::compact::Summarizer;
+    use genai::chat::{ChatMessage, MessageContent};
+
+    struct CountingSummarizer {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Summarizer for CountingSummarizer {
+        async fn summarize(&self, _prompt: String) -> Result<String, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(valid_summary())
+        }
+    }
+
+    fn runtime(
+        backend: &FakeBackend,
+        summarizer: std::sync::Arc<CountingSummarizer>,
+        workspace: &std::path::Path,
+        stream: bool,
+    ) -> AgentRuntime {
+        let mut config = AgentConfig::load(workspace);
+        config.model = "deepseek-chat".to_string();
+        config.max_turns = 4;
+        config.system_prompt = Some("system prompt".to_string());
+        config.stream = stream;
+        AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(workspace),
+            Box::new(backend.clone()),
+        )
+        .with_summarizer(summarizer)
+    }
+
+    /// Six turns of ~10 000 tokens: under the 102k budget, over the 40 % one.
+    fn history() -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+        for index in 0..6 {
+            messages.push(ChatMessage::user(format!("question {index}")));
+            messages.push(ChatMessage::assistant("x".repeat(40_000)));
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn a_capacity_error_retries_once_with_aggressive_compaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("400: maximum context length is 128000 tokens");
+        fake.push(response(MessageContent::from_text("recovered")));
+        let summarizer = std::sync::Arc::new(CountingSummarizer {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = runtime(&fake, summarizer.clone(), temp.path(), true);
+
+        let answer = runtime
+            .execute_task(
+                "current task",
+                AgentMode::Build,
+                history(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        assert_eq!(answer, "recovered");
+        assert_eq!(fake.requests().len(), 2, "exactly one retry");
+        assert!(
+            summarizer.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the retry compacts against the 40 % budget"
+        );
+        let second = &fake.requests()[1];
+        assert!(
+            second.iter().any(|message| {
+                message
+                    .content
+                    .first_text()
+                    .is_some_and(|text| text.contains("# SESSION CONTEXT (compacted)"))
+            }),
+            "the retried request carries the aggressive summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unidentified_provider_error_is_not_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("400 bad model: no such model");
+        let summarizer = std::sync::Arc::new(CountingSummarizer {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // The non-streaming path: the streaming fallback is its own row of the
+        // retry table and is covered by `tests/core/streaming.rs`.
+        let runtime = runtime(&fake, summarizer, temp.path(), false);
+
+        let error = runtime
+            .execute_task(
+                "current task",
+                AgentMode::Build,
+                history(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap_err();
+
+        assert!(error.to_string().contains("bad model"), "{error}");
+        assert_eq!(fake.requests().len(), 1, "no retry, no second request");
+    }
+
+    #[tokio::test]
+    async fn a_replay_rejection_and_a_capacity_error_share_one_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("400: invalid tool_call_id in messages");
+        fake.push_error("400: maximum context length exceeded");
+        let summarizer = std::sync::Arc::new(CountingSummarizer {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = runtime(&fake, summarizer, temp.path(), true);
+
+        let error = runtime
+            .execute_task(
+                "current task",
+                AgentMode::Build,
+                history(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("maximum context length"),
+            "the turn fails with the second error: {error}"
+        );
+        assert_eq!(
+            fake.requests().len(),
+            2,
+            "the replay rejection spent the only retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_partial_output_is_retried_zero_times() {
+        // Phase 5's streaming path calls `note_output`; the invariant is here.
+        let mut budget = RetryBudget::default();
+        budget.note_output();
+        assert!(!budget.spend(RetryTrigger::CapacityError));
+        assert!(!budget.spend(RetryTrigger::ReplayRejection));
+
+        let mut budget = RetryBudget::default();
+        assert!(budget.spend(RetryTrigger::ReplayRejection));
+        assert!(
+            !budget.spend(RetryTrigger::CapacityError),
+            "two triggers never stack"
+        );
+
+        assert_eq!(
+            classify_failure(&std::io::Error::other("400 bad model")),
+            None
+        );
+        assert_eq!(
+            classify_failure(&std::io::Error::other("prompt is too long")),
+            Some(RetryTrigger::CapacityError)
+        );
+        assert_eq!(
+            classify_failure(&std::io::Error::other("invalid tool_calls")),
+            Some(RetryTrigger::ReplayRejection)
+        );
+    }
+}
+
+#[cfg(test)]
+mod repeated_actions {
+    use super::engine_seam::{FakeBackend, response};
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
+    use crate::agent::security::WorkspaceSecurity;
+    use genai::chat::{ChatMessage, MessageContent};
+
+    fn tool_call(call_id: &str, name: &str, path: &str) -> genai::chat::ToolCall {
+        serde_json::from_value(serde_json::json!({
+            "call_id": call_id,
+            "fn_name": name,
+            "fn_arguments": { "path": path },
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_repeated_call_stops_the_loop_with_a_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        for call_id in ["call_one", "call_two", "call_three"] {
+            fake.push(response(MessageContent::from_tool_calls(vec![tool_call(
+                call_id,
+                "list_directory",
+                ".",
+            )])));
+        }
+
+        let mut config = AgentConfig::load(temp.path());
+        config.model = "fake-model".to_string();
+        config.max_turns = 10;
+        config.system_prompt = Some("system prompt".to_string());
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let mut messages: Vec<(String, crate::session::MessageStatus)> = Vec::new();
+        let result = runtime
+            .execute_task(
+                "look around",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |message, status| {
+                    messages.push((
+                        message.content.first_text().unwrap_or_default().to_string(),
+                        status,
+                    ));
+                },
+            )
+            .await
+            .result
+            .unwrap();
+
+        assert!(
+            result.starts_with("stopped: list_directory("),
+            "the reason names the tool and its arguments: {result}"
+        );
+        assert!(result.contains("repeated twice"), "{result}");
+        let (last, status) = messages
+            .last()
+            .expect("a stopped turn still leaves an assistant row");
+        assert_eq!(*status, crate::session::MessageStatus::Complete);
+        assert_eq!(
+            last, &result,
+            "the session stores the same reason the user sees"
+        );
+        assert_eq!(
+            fake.requests().len(),
+            2,
+            "the loop stops instead of asking a third time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_call_does_not_echo_a_secret_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        for call_id in ["call_one", "call_two"] {
+            fake.push(response(MessageContent::from_tool_calls(vec![tool_call(
+                call_id,
+                "list_directory",
+                "sk-live-abcdefgh",
+            )])));
+        }
+
+        let mut config = AgentConfig::load(temp.path());
+        config.model = "fake-model".to_string();
+        config.max_turns = 10;
+        config.system_prompt = Some("system prompt".to_string());
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let mut last = String::new();
+        let result = runtime
+            .execute_task(
+                "look around",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |message, _| {
+                    last = message.content.first_text().unwrap_or_default().to_string();
+                },
+            )
+            .await
+            .result
+            .unwrap();
+
+        // The reason is shown and stored, so the argument is masked in both.
+        assert!(!result.contains("sk-live-abcdefgh"), "{result}");
+        assert!(result.contains("[redacted]"), "{result}");
+        assert_eq!(last, result, "the stored row is masked too");
+    }
+}
+
+#[cfg(test)]
+mod transcript_redaction {
+    use super::engine_seam::{FakeBackend, response};
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
+    use crate::agent::security::WorkspaceSecurity;
+    use genai::chat::{ChatMessage, MessageContent};
+
+    #[tokio::test]
+    async fn a_tool_call_argument_is_masked_in_the_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            serde_json::from_value(serde_json::json!({
+                "call_id": "call_one",
+                "fn_name": "list_directory",
+                "fn_arguments": { "path": "sk-live-abcdefgh" },
+            }))
+            .unwrap(),
+        ])));
+        fake.push(response(MessageContent::from_text("done")));
+
+        let mut config = AgentConfig::load(temp.path());
+        config.model = "fake-model".to_string();
+        config.max_turns = 4;
+        config.system_prompt = Some("system prompt".to_string());
+        let runtime =
+            AgentRuntime::with_backend(config, WorkspaceSecurity::new(temp.path()), Box::new(fake));
+
+        let mut seen: Vec<String> = Vec::new();
+        let answer = runtime
+            .execute_task(
+                "look around",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |message, _| seen.push(format!("{message:?}")),
+            )
+            .await
+            .result
+            .unwrap();
+
+        assert_eq!(answer, "done");
+        assert!(!seen.is_empty(), "the turn reported messages");
+        for message in &seen {
+            assert!(
+                !message.contains("sk-live-abcdefgh"),
+                "a tool-call argument reached the transcript: {message}"
+            );
+        }
+        assert!(
+            seen.iter().any(|message| message.contains("[redacted]")),
+            "the argument was masked, not dropped: {seen:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod backend_seam {
+    use super::engine_seam::{FakeBackend, response};
+    use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
+    use crate::agent::security::WorkspaceSecurity;
+    use genai::chat::{ChatMessage, MessageContent};
+
+    #[tokio::test]
+    async fn the_engine_reaches_the_provider_through_the_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_text("through the seam")));
+
+        let mut config = AgentConfig::load(temp.path());
+        config.model = "fake-model".to_string();
+        config.max_turns = 2;
+        config.system_prompt = Some("system prompt".to_string());
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let answer = runtime
+            .execute_task(
+                "do it",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        assert_eq!(answer, "through the seam");
+        assert_eq!(fake.requests().len(), 1, "exactly one backend call");
     }
 }

@@ -7,13 +7,21 @@ pub struct SkillMetadata {
 }
 
 pub struct SkillManager {
-    /// Highest priority first: project (debug), installed, then shared agent skills.
+    /// Highest priority first: the project (hidden, then open), installed, then
+    /// shared agent skills.
     roots: Vec<PathBuf>,
 }
 
 impl SkillManager {
     pub fn new(workspace_root: &Path) -> Self {
-        let mut roots = vec![workspace_root.join(".seavx/skills")];
+        let mut roots = vec![
+            // The hidden project dir stays first: `save_skill` writes here.
+            workspace_root.join(".seavx/skills"),
+            // A repo can ship its skills in the open as
+            // `skills/<category>/<name>/SKILL.md`. Still a project root, so it
+            // outranks the user's own skills rather than being shadowed by them.
+            workspace_root.join("skills"),
+        ];
         if let Some(home) = crate::home::dir() {
             roots.push(home.join(".seavx/skills"));
             roots.push(home.join(".agents/skills"));
@@ -123,3 +131,7 @@ fn scan_dir(base: &Path, list: &mut Vec<SkillMetadata>, depth: usize) {
 fn extract_description(content: &str) -> Option<String> {
     crate::util::frontmatter_value(content, "description")
 }
+
+#[cfg(test)]
+#[path = "../tests/core/skills.rs"]
+mod tests;

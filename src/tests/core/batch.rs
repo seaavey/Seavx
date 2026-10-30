@@ -493,6 +493,7 @@ fn the_interrupted_notice_reaches_the_transcript() {
             (PathBuf::from("/w/a.txt"), true),
             (PathBuf::from("/w/b.txt"), false),
         ],
+        error: None,
     };
     let rendered = batch.render();
     assert!(
@@ -510,7 +511,9 @@ fn the_interrupted_notice_reaches_the_transcript() {
         .segments
         .iter()
         .filter_map(|segment| match segment {
-            crate::tui::app::Segment::Text(text) => Some(text.as_str()),
+            crate::tui::app::Segment::Text(text) | crate::tui::app::Segment::Notice(text) => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<String>();
@@ -528,4 +531,57 @@ fn a_rewrite_of_the_last_line_keeps_a_missing_trailing_newline() {
         out, "a\nB",
         "the file had no trailing newline; it keeps none"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_journal_failure_after_a_rename_rolls_the_batch_back() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ws = workspace(&[("a.txt", "a\n"), ("b.txt", "b\n")]);
+    let security = WorkspaceSecurity::new(ws.path());
+    let root = ws.path().to_path_buf();
+
+    // The first rename is journaled, then the manifest stops accepting appends:
+    // the second rename cannot be recorded.
+    let hook_root = root.clone();
+    let hook = move |event: crate::agent::batch::Hook| {
+        if let crate::agent::batch::Hook::Renamed(0) = event {
+            for directory in checkpoint_dirs(&hook_root) {
+                let _ = std::fs::set_permissions(
+                    directory.join("manifest"),
+                    std::fs::Permissions::from_mode(0o400),
+                );
+            }
+        }
+    };
+    let result = commit_with_hook(
+        &security,
+        vec![edit(&root, "a.txt", "A\n"), edit(&root, "b.txt", "B\n")],
+        &hook,
+    );
+
+    match result {
+        Err(BatchError::Commit {
+            restored,
+            reason,
+            partial,
+            ..
+        }) => {
+            assert!(
+                reason.contains("journal"),
+                "the reason names the journal: {reason}"
+            );
+            assert!(!partial, "a working rollback is not partial");
+            assert!(
+                restored.contains(&root.join("a.txt")),
+                "the renamed file is put back: {restored:?}"
+            );
+        }
+        other => panic!("a journal failure is a commit failure, got {other:?}"),
+    }
+
+    // Both files are as the user had them: a journal failure is not "not applied".
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "b\n");
 }

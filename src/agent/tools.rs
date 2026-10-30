@@ -1,3 +1,4 @@
+use crate::agent::cancel::{CancelToken, Cleanup, REAP_WINDOW, cleanup_notice, kill_tree};
 use crate::agent::engine::AgentMode;
 use crate::agent::permissions::ActionKind;
 use crate::agent::security::WorkspaceSecurity;
@@ -35,7 +36,12 @@ pub trait AgentTool: Send + Sync {
         None
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String>;
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        cancel: &CancelToken,
+    ) -> Result<String, String>;
 }
 
 // ---- Shared cores ----------------------------------------------------------
@@ -56,21 +62,51 @@ fn write_with_parents(path: &Path, content: String, ctx: &str) -> Result<(), Str
         .map_err(|e| format!("Failed to write {ctx}: {e}"))
 }
 
+/// Read a text file after checking its size: a file over the write cap is
+/// refused rather than loaded whole.
+async fn read_text_capped(path: &Path, ctx: &str) -> Result<String, String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| format!("Failed to read {ctx}: {error}"))?;
+    if metadata.len() > crate::atomic_file::MAX_ATOMIC_BYTES {
+        return Err(format!(
+            "Failed to read {ctx}: {} bytes is over the {} byte read limit",
+            metadata.len(),
+            crate::atomic_file::MAX_ATOMIC_BYTES
+        ));
+    }
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| format!("Failed to read {ctx}: {error}"))
+}
+
 /// Capture the pre-write bytes of `path` so `/undo` can restore them. A target
 /// outside the workspace is accepted only inside an allowed global root.
-fn capture_checkpoint(security: &WorkspaceSecurity, path: &Path) -> Result<(), String> {
+fn capture_checkpoint(security: &WorkspaceSecurity, path: &Path) -> Result<PathBuf, String> {
     // Existence decides the class, never a successful read: recording an
     // existing file as `created` would make `/undo` delete it.
-    let exists = std::fs::symlink_metadata(path).is_ok();
-    let original = if exists {
-        Some(std::fs::read(path).map_err(|error| {
-            format!(
-                "refusing to write {}: it exists but cannot be read, so it cannot be checkpointed ({error})",
-                path.display()
-            )
-        })?)
-    } else {
-        None
+    let metadata = std::fs::symlink_metadata(path).ok();
+    let exists = metadata.is_some();
+    let original = match &metadata {
+        Some(metadata) => {
+            // The write refuses anything this large anyway; reading it into
+            // memory first is the allocation the write cap exists to avoid.
+            if metadata.len() > crate::atomic_file::MAX_ATOMIC_BYTES {
+                return Err(format!(
+                    "refusing to write {}: {} bytes is over the {} byte write limit",
+                    path.display(),
+                    metadata.len(),
+                    crate::atomic_file::MAX_ATOMIC_BYTES
+                ));
+            }
+            Some(std::fs::read(path).map_err(|error| {
+                format!(
+                    "refusing to write {}: it exists but cannot be read, so it cannot be checkpointed ({error})",
+                    path.display()
+                )
+            })?)
+        }
+        None => None,
     };
     let state = if exists {
         EntryState::Modified
@@ -103,8 +139,24 @@ fn capture_checkpoint(security: &WorkspaceSecurity, path: &Path) -> Result<(), S
             original,
         }],
     )
-    .map(|_| ())
     .map_err(|error| format!("Checkpoint failed: {error}"))
+}
+
+/// Record what the write left on disk. Undo compares the file against this
+/// before restoring, so a later edit is reported instead of overwritten.
+fn record_written(
+    security: &WorkspaceSecurity,
+    checkpoint: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("Written file cannot be re-read for the checkpoint: {error}"))?;
+    let name = crate::checkpoint::relative_name(security.root(), path);
+    crate::checkpoint::append_written(checkpoint, Path::new(&name), &bytes).map_err(|error| {
+        format!(
+            "the write succeeded, but the checkpoint journal could not record it, so undo will refuse this file: {error}"
+        )
+    })
 }
 
 /// Replace `old_string` and write the file back, returning how many occurrences
@@ -188,7 +240,12 @@ impl AgentTool for ReadFileTool {
         schema::<ReadFileArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<ReadFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
         let content = crate::agent::security::read_verified(&path).await?;
@@ -241,11 +298,17 @@ impl AgentTool for WriteFileTool {
         schema::<WriteFileArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<WriteFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        capture_checkpoint(security, &path)?;
+        let checkpoint = capture_checkpoint(security, &path)?;
         write_with_parents(&path, parsed.content, "file")?;
+        record_written(security, &checkpoint, &path)?;
         Ok(format!("Successfully wrote {}", parsed.path))
     }
 }
@@ -277,10 +340,15 @@ impl AgentTool for EditFileTool {
         schema::<EditFileArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<EditFileArgs>(args)?;
         let path = security.validate_path(&parsed.path)?;
-        capture_checkpoint(security, &path)?;
+        let checkpoint = capture_checkpoint(security, &path)?;
         let count = replace_unique(
             &path,
             &parsed.old_string,
@@ -289,6 +357,7 @@ impl AgentTool for EditFileTool {
             "file",
         )
         .await?;
+        record_written(security, &checkpoint, &path)?;
         Ok(if count == 0 {
             format!("No change to {}: old_string equals new_string", parsed.path)
         } else {
@@ -330,7 +399,12 @@ impl AgentTool for ListDirectoryTool {
         schema::<ListDirArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<ListDirArgs>(args)?;
         let req_path = match parsed.path {
             Some(ref p) if p != "None" && !p.trim().is_empty() => p.as_str(),
@@ -387,7 +461,12 @@ impl AgentTool for RunCommandTool {
         schema::<RunCommandArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<RunCommandArgs>(args)?;
         let class = crate::agent::shell::classify(&parsed.command, security);
 
@@ -397,33 +476,54 @@ impl AgentTool for RunCommandTool {
             return Err("Command refused by security policy".to_string());
         }
 
-        let output = run_shell(&parsed.command, security, COMMAND_TIMEOUT).await?;
-        let stdout = cap_stream(&String::from_utf8_lossy(&output.stdout));
-        let stderr = cap_stream(&String::from_utf8_lossy(&output.stderr));
+        let outcome = run_shell(&parsed.command, security, COMMAND_TIMEOUT, cancel).await?;
+        let stdout = cap_stream(&outcome.stdout);
+        let stderr = cap_stream(&outcome.stderr);
 
         // A recursive read names a directory, so its lines are filtered: the
         // policy cannot see the files it walked.
         let recursive = class.segments.iter().any(|segment| {
             crate::agent::shell::RECURSIVE_READERS.contains(&segment.program.as_str())
         });
-        let (stdout, withheld) = if recursive {
+        let stdout = if recursive {
             crate::agent::shell::filter_output(&stdout, security)
         } else {
-            (stdout, 0)
+            stdout
         };
-        let _ = withheld;
 
-        let status = output.status.code().unwrap_or(-1);
-        let text = format!("exit: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        let mut text = format!(
+            "exit: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            outcome.status
+        );
+        if let Some(cleanup) = outcome.cleanup {
+            // The result stays `complete`: the call answered, the answer says
+            // how far the kill got.
+            text.push_str("\noutcome: cancelled");
+            if cleanup == Cleanup::Unconfirmed {
+                text.push('\n');
+                text.push_str(&cleanup_notice(outcome.pid));
+            }
+        }
         Ok(crate::agent::security::redact(&text))
     }
 }
 
 /// Wall-clock ceiling for one command; the child is killed when it expires.
 pub(crate) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Per-stream ceiling, split evenly between the head and the tail.
+/// Per-stream ceiling, in characters, split evenly between the head and the
+/// tail.
 const STREAM_CAP: usize = 32 * 1024;
 const STREAM_HALF: usize = 16 * 1024;
+
+/// One command's result, including how a killed tree ended.
+pub(crate) struct ShellOutcome {
+    pub status: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub pid: u32,
+    /// `Some` only when a cancel killed the tree.
+    pub cleanup: Option<Cleanup>,
+}
 
 /// Run one command with a cleared environment: a tool call cannot read the
 /// agent's own `SEAVX_*` variables, and the child dies with the future.
@@ -431,7 +531,8 @@ pub(crate) async fn run_shell(
     command: &str,
     security: &WorkspaceSecurity,
     limit: std::time::Duration,
-) -> Result<std::process::Output, String> {
+    cancel: &CancelToken,
+) -> Result<ShellOutcome, String> {
     // Windows has no `sh`; `cmd /C` runs the same command through the system shell.
     #[cfg(windows)]
     let mut shell = {
@@ -454,6 +555,12 @@ pub(crate) async fn run_shell(
         .stderr(std::process::Stdio::piped())
         .env_clear()
         .kill_on_drop(true);
+    // The whole tree must be addressable by one signal: its own process group
+    // on Unix, so `sh -c 'sleep 30 & wait'` takes the grandchild with it.
+    #[cfg(unix)]
+    shell.process_group(0);
+    #[cfg(windows)]
+    shell.creation_flags(0x0000_0200);
     for name in ["PATH", "LANG", "TERM"] {
         if let Ok(value) = std::env::var(name) {
             shell.env(name, value);
@@ -464,36 +571,141 @@ pub(crate) async fn run_shell(
         shell.env("HOME", home);
     }
 
-    let child = shell
+    let mut child = shell
         .spawn()
         .map_err(|e| format!("Process execution failed: {e}"))?;
-    match tokio::time::timeout(limit, child.wait_with_output()).await {
-        Err(_) => Err(format!(
-            "Command execution timed out ({}s limit)",
-            limit.as_secs()
-        )),
-        Ok(Err(error)) => Err(format!("Process execution failed: {error}")),
-        Ok(Ok(output)) => Ok(output),
+    // kill_tree signals the negated pid as a process group; a fallback of 0
+    // would signal this process's own group, so a missing id is an error.
+    let pid = child
+        .id()
+        .ok_or_else(|| "Process execution failed: the child has no pid".to_string())?;
+
+    // The pipes are drained while the child runs: a chatty command must not
+    // block on a full pipe before we ever look at the cancel token.
+    let out_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Process stdout was not captured".to_string())?;
+    let err_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Process stderr was not captured".to_string())?;
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut read_out = tokio::spawn(drain_into(out_pipe, out_buf.clone()));
+    let mut read_err = tokio::spawn(drain_into(err_pipe, err_buf.clone()));
+
+    enum End {
+        Exited(std::process::ExitStatus),
+        Cancelled,
+        TimedOut,
+    }
+
+    let end = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => End::Cancelled,
+        _ = tokio::time::sleep(limit) => End::TimedOut,
+        status = child.wait() => match status {
+            Ok(status) => End::Exited(status),
+            Err(error) => return Err(format!("Process execution failed: {error}")),
+        },
+    };
+
+    // A killed tree closes its pipes. A grandchild that outlived the shell does
+    // not: `sleep 30 &` leaves the write end open after the shell exits, so even
+    // a clean exit drains against the same fixed window. Whatever arrived by
+    // then is kept; the readers are aborted rather than left to grow.
+    let drained = tokio::time::timeout(REAP_WINDOW, async {
+        tokio::join!(&mut read_out, &mut read_err)
+    })
+    .await;
+    if drained.is_err() {
+        read_out.abort();
+        read_err.abort();
+    }
+    let stdout = take_buffer(&out_buf);
+    let stderr = take_buffer(&err_buf);
+
+    let (status, cleanup) = match end {
+        End::Exited(status) => (status.code().unwrap_or(-1), None),
+        End::Cancelled => {
+            let cleanup = kill_tree(&mut child, pid).await;
+            cancel.note_cleanup(pid, cleanup);
+            (-1, Some(cleanup))
+        }
+        End::TimedOut => {
+            let cleanup = kill_tree(&mut child, pid).await;
+            cancel.note_cleanup(pid, cleanup);
+            let mut message = format!("Command execution timed out ({}s limit)", limit.as_secs());
+            if cleanup == Cleanup::Unconfirmed {
+                message.push('\n');
+                message.push_str(&cleanup_notice(pid));
+            }
+            return Err(message);
+        }
+    };
+
+    Ok(ShellOutcome {
+        status,
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
+        pid,
+        cleanup,
+    })
+}
+
+/// How much of one stream is kept while the command runs. A pipe held open by
+/// an escaped grandchild must not grow the buffer without bound.
+const MAX_DRAIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a pipe into a shared buffer, so a drain that is cut short still reports
+/// what the command had already produced.
+async fn drain_into(
+    mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    into: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut pipe, &mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let mut buffer = into.lock().unwrap_or_else(|error| error.into_inner());
+                let room = MAX_DRAIN_BYTES.saturating_sub(buffer.len());
+                buffer.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        }
     }
 }
 
+fn take_buffer(buffer: &std::sync::Mutex<Vec<u8>>) -> Vec<u8> {
+    std::mem::take(&mut *buffer.lock().unwrap_or_else(|error| error.into_inner()))
+}
+
 /// Keep a bounded head and tail so a chatty command cannot flood the context.
+/// Counted in characters, so the two halves and the reported omission agree for
+/// multi-byte output.
 fn cap_stream(text: &str) -> String {
+    // Byte length is an upper bound on the character count, so this avoids the
+    // allocation for every command that stayed inside the cap.
     if text.len() <= STREAM_CAP {
         return text.to_string();
     }
-    let head: String = text.chars().take(STREAM_HALF).collect();
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(STREAM_HALF)
-        .collect::<Vec<char>>()
-        .into_iter()
-        .rev()
+    let characters: Vec<char> = text.chars().collect();
+    if characters.len() <= STREAM_CAP {
+        return text.to_string();
+    }
+    let head: String = characters.iter().take(STREAM_HALF).collect();
+    let tail: String = characters
+        .iter()
+        .skip(characters.len() - STREAM_HALF)
         .collect();
-    let omitted = text.len().saturating_sub(head.len() + tail.len());
-    format!("{head}\n[{omitted} bytes omitted]\n{tail}")
+    let omitted = characters.len() - STREAM_HALF * 2;
+    format!("{head}\n[{omitted} chars omitted]\n{tail}")
 }
+
+/// One file's content is only searched when it is this small: a match in a
+/// multi-gigabyte log is not worth reading the whole thing into memory.
+const MAX_SEARCH_BYTES: u64 = 2 * 1024 * 1024;
 
 // 6. search_files
 #[derive(Deserialize, JsonSchema)]
@@ -527,7 +739,12 @@ impl AgentTool for SearchFilesTool {
         schema::<SearchFilesArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SearchFilesArgs>(args)?;
         let target_mode = parsed.target.unwrap_or_else(|| "content".to_string());
         let search_path = parsed.path.unwrap_or_else(|| ".".to_string());
@@ -553,11 +770,22 @@ impl AgentTool for SearchFilesTool {
                             .map(|s| s.to_string_lossy())
                             .unwrap_or_default();
 
+                        let metadata = match std::fs::symlink_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
+                        // The walk never follows a link: a symlink to a directory
+                        // outside the workspace would hand back content the read
+                        // policy never saw.
+                        if metadata.file_type().is_symlink() {
+                            continue;
+                        }
+
                         // Policy before the skip list: a protected file is counted even
                         // when it is hidden, while a protected directory is dropped
                         // without a count because it is not a file result.
                         if crate::agent::security::check_file(&path).is_err() {
-                            if path.is_file() {
+                            if metadata.is_file() {
                                 skipped += 1;
                             }
                             continue;
@@ -568,14 +796,17 @@ impl AgentTool for SearchFilesTool {
                             continue;
                         }
 
-                        if path.is_dir() {
+                        if metadata.is_dir() {
                             stack.push(path);
-                        } else if path.is_file() {
+                        } else if metadata.is_file() {
                             if target_mode == "files" {
                                 if file_name.contains(&pattern) {
                                     matches.push(path.display().to_string());
                                 }
                             } else {
+                                if metadata.len() > MAX_SEARCH_BYTES {
+                                    continue;
+                                }
                                 if let Ok(content) = std::fs::read_to_string(&path) {
                                     for (idx, line) in content.lines().enumerate() {
                                         if line.contains(&pattern) {
@@ -705,7 +936,12 @@ impl AgentTool for SaveMemoryTool {
         schema::<SaveMemoryArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SaveMemoryArgs>(args)?;
 
         let lesson = parsed.lesson.trim();
@@ -738,7 +974,7 @@ impl AgentTool for SaveMemoryTool {
             let _ = tokio::fs::create_dir_all(dir).await;
         }
 
-        let existing = tokio::fs::read_to_string(&target_file)
+        let existing = read_text_capped(&target_file, "memory")
             .await
             .unwrap_or_default();
 
@@ -763,9 +999,10 @@ impl AgentTool for SaveMemoryTool {
 
         updated.push_str(&format!("- [{confidence}%] {lesson}\n"));
 
-        capture_checkpoint(security, &target_file)?;
+        let checkpoint = capture_checkpoint(security, &target_file)?;
         write_atomic(&target_file, updated.as_bytes(), ModePolicy::Preserve)
             .map_err(|e| format!("Failed to write memory: {e}"))?;
+        record_written(security, &checkpoint, &target_file)?;
 
         Ok(format!(
             "Saved [{confidence}%] to {}: {}",
@@ -825,12 +1062,15 @@ impl AgentTool for SkillViewTool {
         schema::<SkillViewArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SkillViewArgs>(args)?;
         let path = find_skill_file(security, &parsed.name)?;
-        tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| format!("Failed to read skill: {e}"))
+        read_text_capped(&path, "skill").await
     }
 }
 
@@ -858,7 +1098,12 @@ impl AgentTool for ApplyPatchTool {
         schema::<ApplyPatchArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<ApplyPatchArgs>(args)?;
         let files = crate::agent::patch::parse(&parsed.patch)
             .map_err(|error| format!("Patch refused: {error}"))?;
@@ -873,10 +1118,23 @@ impl AgentTool for ApplyPatchTool {
                 .to_str()
                 .ok_or_else(|| format!("{}: path is not valid UTF-8", file.path.display()))?;
             let path = security.validate_path(requested)?;
-            let current = match crate::agent::security::read_verified(&path).await {
-                Ok(text) => text,
-                Err(_) if file.create => String::new(),
-                Err(error) => return Err(format!("{requested}: {error}")),
+            // A create patch describes a file that is not there yet. Applying one
+            // to an existing file splices the new lines in front of the user's
+            // content, so the absence is checked instead of assumed.
+            let current = if file.create {
+                match std::fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Ok(_) => {
+                        return Err(format!(
+                            "{requested}: the patch creates this file, but it already exists; use an update patch"
+                        ));
+                    }
+                    Err(error) => return Err(format!("{requested}: {error}")),
+                }
+            } else {
+                crate::agent::security::read_verified(&path)
+                    .await
+                    .map_err(|error| format!("{requested}: {error}"))?
             };
             let (updated, stats) = crate::agent::patch::apply_to(&current, file)?;
             hunks += stats.hunks;
@@ -934,7 +1192,12 @@ impl AgentTool for SkillWriteTool {
         schema::<SkillWriteArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SkillWriteArgs>(args)?;
         if parsed.content.trim().is_empty() {
             return Err("Skill content cannot be empty".to_string());
@@ -942,14 +1205,17 @@ impl AgentTool for SkillWriteTool {
 
         // Overwrite in place when the skill already exists (could live in a shared skills root).
         if let Ok(path) = find_skill_file(security, &parsed.name) {
-            capture_checkpoint(security, &path)?;
+            let checkpoint = capture_checkpoint(security, &path)?;
             write_with_parents(&path, parsed.content, "skill")?;
+            record_written(security, &checkpoint, &path)?;
             return Ok(format!("Successfully updated {}", path.display()));
         }
 
         let manager = crate::agent::skills::SkillManager::new(security.root());
-        capture_checkpoint(security, &manager.skill_path(&parsed.name)?)?;
+        let planned = manager.skill_path(&parsed.name)?;
+        let checkpoint = capture_checkpoint(security, &planned)?;
         let path = manager.save_skill(&parsed.name, &parsed.content)?;
+        record_written(security, &checkpoint, &path)?;
         Ok(format!("Successfully created {}", path.display()))
     }
 }
@@ -986,10 +1252,15 @@ impl AgentTool for SkillPatchTool {
         schema::<SkillPatchArgs>()
     }
 
-    async fn execute(&self, args: Value, security: &WorkspaceSecurity) -> Result<String, String> {
+    async fn execute(
+        &self,
+        args: Value,
+        security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
         let parsed = parse_args::<SkillPatchArgs>(args)?;
         let path = find_skill_file(security, &parsed.name)?;
-        capture_checkpoint(security, &path)?;
+        let checkpoint = capture_checkpoint(security, &path)?;
         let count = replace_unique(
             &path,
             &parsed.old_string,
@@ -998,6 +1269,7 @@ impl AgentTool for SkillPatchTool {
             "skill",
         )
         .await?;
+        record_written(security, &checkpoint, &path)?;
         Ok(if count == 0 {
             format!(
                 "No change to skill {}: old_string equals new_string",

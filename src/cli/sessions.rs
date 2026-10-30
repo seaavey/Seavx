@@ -13,18 +13,18 @@ pub enum SessionsCommand {
     List,
     /// Print one session's transcript
     Show {
-        /// Exact session id
-        id: i64,
+        /// Session id, `svx-…` (a bare number still works)
+        id: String,
     },
     /// Open one session in the TUI
     Resume {
-        /// Exact session id
-        id: i64,
+        /// Session id, `svx-…` (a bare number still works)
+        id: String,
     },
     /// Print one session as JSON
     Export {
-        /// Exact session id
-        id: i64,
+        /// Session id, `svx-…` (a bare number still works)
+        id: String,
     },
 }
 
@@ -40,31 +40,128 @@ pub async fn run(command: SessionsCommand) -> anyhow::Result<()> {
             );
         }
         SessionsCommand::Show { id } => {
-            print!("{}", show_text(&store, id).map_err(anyhow::Error::msg)?);
+            let id = resolve(&store, &id)?;
+            print!(
+                "{}",
+                show_text(&store, &workspace, id).map_err(anyhow::Error::msg)?
+            );
         }
         SessionsCommand::Export { id } => {
-            println!("{}", export_text(&store, id).map_err(anyhow::Error::msg)?);
+            let id = resolve(&store, &id)?;
+            println!(
+                "{}",
+                export_text(&store, &workspace, id).map_err(anyhow::Error::msg)?
+            );
         }
         SessionsCommand::Resume { id } => {
-            let session = resume_target(&store, &workspace, id).map_err(anyhow::Error::msg)?;
-            let state = session_state(&store, &workspace, id);
-            if state == TurnState::Pending {
-                // rc.3 has no lease, so this is the honest word.
-                println!("note: another process may still be writing to this session");
-            }
-            if session.read_only.is_none() {
-                store
-                    .record_recovery(id)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-            }
-            let loaded = store.load(id).map_err(|error| anyhow::anyhow!("{error}"))?;
-            crate::tui::app::start_tui(None, Some(loaded)).await?;
+            let id = resolve(&store, &id)?;
+            open_session(&store, &workspace, id).await?
         }
     }
     Ok(())
 }
 
-/// `id / age / msgs / state / title`, newest first; an empty workspace says so.
+/// Turn what the user typed into a row id: the `svx-…` slug, or a number from
+/// a build that had no slugs. The error keeps the text they typed.
+fn resolve(store: &SessionStore, key: &str) -> anyhow::Result<i64> {
+    store.id_for(key).map_err(|error| match error {
+        SessionError::UnknownKey(key) => {
+            anyhow::anyhow!("Unknown session {key}. Run 'seavx sessions list'.")
+        }
+        other => anyhow::Error::msg(other.to_string()),
+    })
+}
+
+/// `seavx resume`: open a session by id, or — with no id — list this
+/// workspace's sessions and ask which one. The listing is the same text
+/// `/sessions` prints, so the number a user reads there is the number the
+/// prompt accepts.
+pub async fn run_resume(key: Option<String>) -> anyhow::Result<()> {
+    let store = SessionStore::open().map_err(anyhow::Error::msg)?;
+    let workspace = crate::session::workspace_key();
+
+    let Some(key) = key else {
+        return pick_and_open(&store, &workspace).await;
+    };
+    let id = resolve(&store, &key)?;
+    open_session(&store, &workspace, id).await
+}
+
+async fn pick_and_open(store: &SessionStore, workspace: &str) -> anyhow::Result<()> {
+    let summaries = store
+        .list(workspace)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let listing = numbered_list_text(store, workspace).map_err(anyhow::Error::msg)?;
+    println!("{listing}");
+    if summaries.is_empty() {
+        return Ok(());
+    }
+
+    println!();
+    let input = crate::cli::prompt::line("Resume which number? (Enter to cancel)", "")?;
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    let number = parse_resume_number(&input, summaries.len()).map_err(anyhow::Error::msg)?;
+    open_session(store, workspace, summaries[number as usize - 1].id).await
+}
+
+/// The picker accepts only a number it printed: no ids, no titles, no range.
+pub fn parse_resume_number(input: &str, count: usize) -> Result<u32, String> {
+    if count == 0 {
+        return Err("no sessions to resume".to_string());
+    }
+    match input.trim().parse::<usize>() {
+        Ok(number) if (1..=count).contains(&number) => Ok(number as u32),
+        _ => Err(format!("Enter a number from 1 to {count}.")),
+    }
+}
+
+/// Load one session and hand it to the TUI. Both `sessions resume <id>` and
+/// `resume` end here, so the recovery note and the read-only rule cannot drift.
+async fn open_session(store: &SessionStore, workspace: &str, id: i64) -> anyhow::Result<()> {
+    let session = resume_target(store, workspace, id).map_err(anyhow::Error::msg)?;
+    let state = session_state(store, workspace, id);
+    if state == TurnState::Pending {
+        // rc.3 has no lease, so this is the honest word.
+        println!("note: another process may still be writing to this session");
+    }
+    if session.read_only.is_none() {
+        store
+            .record_recovery(id)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    let loaded = store.load(id).map_err(|error| anyhow::anyhow!("{error}"))?;
+    crate::tui::app::start_tui(None, Some(loaded)).await
+}
+
+/// One compact row per session, newest first: the `/sessions` picker's rows.
+pub fn session_rows(store: &SessionStore, workspace: &str) -> Result<Vec<String>, String> {
+    let summaries = store.list(workspace).map_err(|error| error.to_string())?;
+    let now = crate::util::epoch_secs() as i64;
+    Ok(summaries
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| {
+            format!(
+                "{}  {}  {}  {} msgs  {}  {}",
+                index + 1,
+                summary.slug,
+                relative_age(summary.updated_at, now),
+                summary.messages,
+                summary.state.as_str(),
+                if summary.title.is_empty() {
+                    "(untitled)"
+                } else {
+                    summary.title.as_str()
+                }
+            )
+        })
+        .collect())
+}
+
+/// `slug / age / msgs / state / title`, newest first; an empty workspace says so.
 pub fn list_text(store: &SessionStore, workspace: &str) -> Result<String, String> {
     let summaries = store.list(workspace).map_err(|error| error.to_string())?;
     if summaries.is_empty() {
@@ -76,7 +173,7 @@ pub fn list_text(store: &SessionStore, workspace: &str) -> Result<String, String
         .iter()
         .map(|summary| {
             [
-                summary.id.to_string(),
+                summary.slug.clone(),
                 relative_age(summary.updated_at, now),
                 summary.messages.to_string(),
                 summary.state.as_str().to_string(),
@@ -84,7 +181,7 @@ pub fn list_text(store: &SessionStore, workspace: &str) -> Result<String, String
             ]
         })
         .collect();
-    let header = ["id", "age", "msgs", "state", "title"];
+    let header = ["slug", "age", "msgs", "state", "title"];
 
     let mut widths = [0usize; 5];
     for column in 0..4 {
@@ -115,13 +212,67 @@ pub fn list_text(store: &SessionStore, workspace: &str) -> Result<String, String
     Ok(out)
 }
 
+/// The TUI's `/sessions` list: numbered in the order `resume <n>` reads.
+pub fn numbered_list_text(store: &SessionStore, workspace: &str) -> Result<String, String> {
+    let summaries = store.list(workspace).map_err(|error| error.to_string())?;
+    if summaries.is_empty() {
+        return Ok(format!(
+            "No sessions yet for {workspace}. Start one by sending a prompt."
+        ));
+    }
+
+    let now = crate::util::epoch_secs() as i64;
+    let mut out = String::from("Sessions (newest first):");
+    for (index, summary) in summaries.iter().enumerate() {
+        out.push_str(&format!(
+            "\n  {}  {}  {}  {} msgs  {}\n     {}",
+            index + 1,
+            summary.slug,
+            relative_age(summary.updated_at, now),
+            summary.messages,
+            summary.state.as_str(),
+            if summary.title.is_empty() {
+                "(untitled)"
+            } else {
+                summary.title.as_str()
+            }
+        ));
+    }
+    out.push_str("\nResume one with /sessions <number> or /resume.");
+    Ok(out)
+}
+
+/// Load the session at `number` in the listed order, refusing a read-only one
+/// with its reason instead of opening it.
+pub fn resume_by_number(
+    store: &SessionStore,
+    workspace: &str,
+    number: u32,
+) -> Result<LoadedSession, String> {
+    let summaries = store.list(workspace).map_err(|error| error.to_string())?;
+    let summary = summaries
+        .get(number.saturating_sub(1) as usize)
+        .filter(|_| number > 0)
+        .ok_or_else(|| {
+            format!("No session {number}. Run `/sessions` to list this workspace's sessions.")
+        })?;
+    let session = store.load(summary.id).map_err(|error| error.to_string())?;
+    if let Some(reason) = &session.read_only {
+        return Err(format!(
+            "Session {} is read-only: {reason}. Use /clear to start a new one.",
+            session.id
+        ));
+    }
+    Ok(session)
+}
+
 /// Full transcript with the header the spec asks for: id, title, model,
 /// payload format and usage.
-pub fn show_text(store: &SessionStore, id: i64) -> Result<String, String> {
-    let session = load_named(store, id)?;
+pub fn show_text(store: &SessionStore, workspace: &str, id: i64) -> Result<String, String> {
+    let session = resume_target(store, workspace, id)?;
     let mut out = format!(
         "Session {} · {}\n",
-        session.id,
+        session.slug,
         session.title.as_deref().unwrap_or("(untitled)")
     );
     out.push_str(&format!(
@@ -139,11 +290,14 @@ pub fn show_text(store: &SessionStore, id: i64) -> Result<String, String> {
     Ok(out)
 }
 
-pub fn export_text(store: &SessionStore, id: i64) -> Result<String, String> {
-    Ok(crate::session::export_json(&load_named(store, id)?))
+pub fn export_text(store: &SessionStore, workspace: &str, id: i64) -> Result<String, String> {
+    Ok(crate::session::export_json(&resume_target(
+        store, workspace, id,
+    )?))
 }
 
-/// Resume's pre-flight: another workspace's session is refused with that path.
+/// Another workspace's session is refused with that path, for resume, show and
+/// export alike: a transcript is not readable just because its id was guessed.
 pub fn resume_target(
     store: &SessionStore,
     workspace: &str,
@@ -162,6 +316,9 @@ pub fn resume_target(
 fn load_named(store: &SessionStore, id: i64) -> Result<LoadedSession, String> {
     store.load(id).map_err(|error| match error {
         SessionError::Unknown(id) => format!("Unknown session {id}. Run 'seavx sessions list'."),
+        SessionError::UnknownKey(key) => {
+            format!("Unknown session {key}. Run 'seavx sessions list'.")
+        }
         other => other.to_string(),
     })
 }

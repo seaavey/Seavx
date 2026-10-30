@@ -1,13 +1,17 @@
+use crate::agent::backend::{BackendError, ChatBackend, GenaiBackend, StreamDelta};
+use crate::agent::cancel::{CancelToken, Cleanup, TurnState, TurnStatus};
 use crate::agent::permissions::{
     self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
 };
 use crate::agent::prompt::{PLAN_POLICY, load_system_prompt};
 use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
+use crate::session::MessageStatus;
 use genai::Client;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, ChatResponse, ReasoningEffort, ToolResponse,
+    ChatMessage, ChatOptions, ChatRequest, ContentPart, MessageContent, ReasoningEffort, ToolCall,
+    ToolResponse,
 };
 use genai::resolver::{AuthData, Endpoint};
 
@@ -53,15 +57,30 @@ pub(crate) fn with_mode_policy(mut prompt: String, mode: AgentMode) -> String {
 /// TUI modal, the CLI prompts and `parse_reasoning_effort`.
 pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx", "max"];
 
+/// Turn budget a new config starts with. An existing file keeps its own value.
+pub const DEFAULT_MAX_TURNS: usize = 100;
+
+/// Model a new config starts with. An existing file keeps its own value.
+pub const DEFAULT_MODEL: &str = "openai/gpt-4o-mini";
+
+fn default_model() -> String {
+    DEFAULT_MODEL.to_string()
+}
+
+fn default_max_turns() -> usize {
+    DEFAULT_MAX_TURNS
+}
+
 /// Endpoint used when the config does not set `base_url`.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
 
 /// Config keys that can appear in a config file, in display order.
-pub const CONFIG_KEYS: [&str; 8] = [
+pub const CONFIG_KEYS: [&str; 9] = [
     "model",
     "base_url",
     "api_key",
     "reasoning_effort",
+    "stream",
     "max_turns",
     "system_prompt",
     "tool_permissions",
@@ -107,11 +126,19 @@ impl ConfigReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
+    // Every field has a default so a hand-written file that sets only one key
+    // is merged with the built-in values instead of failing to parse.
+    #[serde(default = "default_model")]
     pub model: String,
+    #[serde(default = "default_max_turns")]
     pub max_turns: usize,
+    #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
     pub system_prompt: Option<String>,
     /// `deny` | `ask` | `allow`, kept raw so an invalid value is reported with
     /// the file that holds it instead of being coerced to a silent default.
@@ -120,10 +147,17 @@ pub struct AgentConfig {
     /// Action kinds lifted from `ask` to `allow`; never `global-write`.
     #[serde(default)]
     pub permitted_actions: Vec<String>,
+    /// Stream the answer instead of waiting for the whole response.
+    #[serde(default = "default_stream")]
+    pub stream: bool,
 }
 
 fn default_tool_permissions() -> String {
     "ask".to_string()
+}
+
+fn default_stream() -> bool {
+    true
 }
 
 impl Default for AgentConfig {
@@ -136,7 +170,7 @@ impl AgentConfig {
     /// Build the built-in defaults from an injected environment, so tests
     /// never depend on the caller's real variables.
     fn from_env(env: impl Fn(&str) -> Option<String>) -> Self {
-        let model = env("SEAVX_MODEL").unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+        let model = env("SEAVX_MODEL").unwrap_or_else(default_model);
         let base_url = env("SEAVX_BASE_URL");
         let api_key = env("SEAVX_API_KEY")
             .or_else(|| env("OPENAI_API_KEY"))
@@ -144,14 +178,60 @@ impl AgentConfig {
         let reasoning_effort = env("SEAVX_REASONING_EFFORT");
         Self {
             model,
-            max_turns: 1000,
+            max_turns: DEFAULT_MAX_TURNS,
             base_url,
             api_key,
             reasoning_effort,
             system_prompt: None,
             tool_permissions: default_tool_permissions(),
             permitted_actions: Vec::new(),
+            stream: default_stream(),
         }
+    }
+}
+
+/// The context window a model is assumed to have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextLimit {
+    pub tokens: i32,
+    /// `true` when the id was not recognised and the conservative default was
+    /// used, so the footer and `doctor` can say so.
+    pub assumed: bool,
+}
+
+/// Model families known to have a 1M window.
+const MILLION_TOKEN_FAMILIES: [&str; 3] = ["claude", "gemini", "nemotron"];
+/// Model families known to have a 128k window.
+const HUNDRED_TWENTY_EIGHT_K_FAMILIES: [&str; 6] =
+    ["deepseek", "glm", "gpt-4o", "gpt-4.1", "o3", "o4"];
+/// Anything unrecognised gets this instead of the largest guess.
+pub const ASSUMED_CONTEXT_LIMIT: i32 = 64_000;
+
+/// One table, shared by the footer, the context budget and `doctor`. An
+/// unrecognised id is never assumed to be 128k.
+pub fn model_context_limit(model: &str) -> ContextLimit {
+    let id = model.to_lowercase();
+    if MILLION_TOKEN_FAMILIES
+        .iter()
+        .any(|family| id.contains(family))
+    {
+        return ContextLimit {
+            tokens: 1_000_000,
+            assumed: false,
+        };
+    }
+    if HUNDRED_TWENTY_EIGHT_K_FAMILIES
+        .iter()
+        .any(|family| id.contains(family))
+    {
+        return ContextLimit {
+            tokens: 128_000,
+            assumed: false,
+        };
+    }
+    ContextLimit {
+        tokens: ASSUMED_CONTEXT_LIMIT,
+        assumed: true,
     }
 }
 
@@ -283,8 +363,10 @@ impl AgentConfig {
                                 }
                             }
                         }
-                        // The file replaces the whole default config, matching
-                        // `load`: keys it omits do not inherit fallback envs.
+                        // A key the file omits takes the built-in default: a
+                        // partial file must not be discarded, and it must not
+                        // silently inherit the fallback API-key variables
+                        // either, which would make the file's origin a lie.
                         config = parsed;
                     }
                     Err(error) => parse_error = Some(first_line(&error.to_string())),
@@ -346,37 +428,234 @@ fn apply_env_overrides(
     }
 }
 
-/// One request, one response. The only place the engine talks to a provider, so
-/// a test can script turns without a network.
-#[async_trait::async_trait]
-pub trait ChatBackend: Send + Sync {
-    async fn send(
-        &self,
-        model: &str,
-        request: ChatRequest,
-        options: Option<&ChatOptions>,
-    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>>;
+/// What a provider failure is allowed to buy: at most one retry per user turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryTrigger {
+    /// The provider said the request is too large for the model.
+    CapacityError,
+    /// The provider refused the replayed tool-call structure.
+    ReplayRejection,
+    /// The stream produced no chunk at all: the endpoint may not stream.
+    StreamUnavailable,
 }
 
-struct GenaiBackend {
-    client: Client,
+/// One budget per user turn, never per tool call.
+#[derive(Debug, Default)]
+pub struct RetryBudget {
+    used: bool,
+    output_seen: bool,
 }
 
-#[async_trait::async_trait]
-impl ChatBackend for GenaiBackend {
-    async fn send(
-        &self,
-        model: &str,
-        request: ChatRequest,
-        options: Option<&ChatOptions>,
-    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.client.exec_chat(model, request, options).await?)
+impl RetryBudget {
+    /// Any received output closes the budget: partial output is persisted, never
+    /// resent. Phase 5's streaming path is the caller that sets this.
+    pub fn note_output(&mut self) {
+        self.output_seen = true;
     }
+
+    /// `true` when this trigger may be retried; a second call is always refused,
+    /// so two triggers can never stack.
+    pub fn spend(&mut self, _trigger: RetryTrigger) -> bool {
+        if self.used || self.output_seen {
+            return false;
+        }
+        self.used = true;
+        true
+    }
+}
+
+/// Phrases that identify a capacity error. Anything else is not retried: an
+/// unidentified failure may be a bad model, a bad key or a bug.
+const CAPACITY_MARKERS: [&str; 6] = [
+    "maximum context length",
+    "context length",
+    "context_length_exceeded",
+    "token limit",
+    "prompt is too long",
+    "prompt too long",
+];
+
+/// Phrases that identify a replay rejection: the provider refused the structure
+/// of the replayed tool calls.
+const REPLAY_MARKERS: [&str; 4] = ["tool_call_id", "tool_calls", "tool result", "tool_use"];
+
+fn message_of(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        text.push(' ');
+        text.push_str(&error.to_string());
+        source = error.source();
+    }
+    text.to_lowercase()
+}
+
+/// The one classifier: only a message that names the condition counts.
+pub fn classify_failure(error: &(dyn std::error::Error + 'static)) -> Option<RetryTrigger> {
+    let text = message_of(error);
+    if CAPACITY_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Some(RetryTrigger::CapacityError);
+    }
+    if REPLAY_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Some(RetryTrigger::ReplayRejection);
+    }
+    None
+}
+
+/// The kind the permission matrix must see. A tool that picks its own
+/// destination is judged by where that destination lives: a skill or a memory
+/// write lands under the global root, so it is a global write however the tool
+/// classifies itself, and the matrix asks for it.
+pub(crate) fn effective_kind(
+    home: Option<&Path>,
+    security: &WorkspaceSecurity,
+    declared: ActionKind,
+    destination: Option<&Path>,
+) -> ActionKind {
+    destination
+        .and_then(|path| permissions::classify_target_with_home(home, security, path).ok())
+        .unwrap_or(declared)
+}
+
+/// The replay-rejection retry: keep the newest half of the turns, cut at a user
+/// row, so a tool-call pair is never split.
+pub(crate) fn halve_turns(request: &ChatRequest) -> ChatRequest {
+    let messages = &request.messages;
+    if messages.len() < 4 {
+        return request.clone();
+    }
+
+    let body = &messages[1..messages.len() - 1];
+    let mut starts = vec![0];
+    for (index, message) in body.iter().enumerate().skip(1) {
+        if message.role == genai::chat::ChatRole::User {
+            starts.push(index);
+        }
+    }
+    // The newest half, measured in turn boundaries. A single boundary keeps
+    // everything: there is nothing to halve, and indexing past it panicked.
+    let keep_from = starts[starts.len() / 2];
+
+    let mut rebuilt = ChatRequest::default();
+    if let Some(tools) = &request.tools {
+        rebuilt = rebuilt.with_tools(tools.clone());
+    }
+    rebuilt = rebuilt.append_message(messages[0].clone());
+    for message in &body[keep_from..] {
+        rebuilt = rebuilt.append_message(message.clone());
+    }
+    rebuilt.append_message(messages[messages.len() - 1].clone())
+}
+
+/// What one turn ended as. `result` is the answer, or the error that failed or
+/// cancelled it.
+pub struct TurnOutcome {
+    pub status: TurnStatus,
+    pub cleanup: Option<Cleanup>,
+    /// The pid of a killed tree whose cleanup could not be confirmed.
+    pub pid: Option<u32>,
+    pub result: Result<String, BackendError>,
+}
+
+/// How a turn stops inside the loop: cancelled on request, or failed.
+enum TurnError {
+    Cancelled,
+    Failed(BackendError),
+}
+
+impl From<BackendError> for TurnError {
+    fn from(error: BackendError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Runs `future` until it finishes or the token is set; `None` means the caller
+/// must abandon it and keep whatever already left its sink.
+async fn until_cancelled<F: std::future::Future>(
+    cancel: &CancelToken,
+    future: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        value = future => Some(value),
+    }
+}
+
+/// The one way a turn reports a cancel: the state machine moves to
+/// `Cancelling`, the caller finishes at `Cancelled`.
+fn cancelled(turn_state: &mut TurnState) -> TurnError {
+    turn_state.transition(TurnStatus::Cancelling);
+    TurnError::Cancelled
+}
+
+/// A copy of the message with every string the model produced masked, for the
+/// transcript and the session. The request keeps the original: a tool result is
+/// matched to its call by the arguments that were sent, so masking them there
+/// would break the replay.
+fn redacted_for_display(message: &ChatMessage) -> ChatMessage {
+    let parts: Vec<ContentPart> = message
+        .content
+        .parts()
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text(text) => ContentPart::Text(security::redact(text)),
+            ContentPart::ToolCall(call) => ContentPart::ToolCall(ToolCall {
+                fn_arguments: redacted_value(&call.fn_arguments),
+                ..call.clone()
+            }),
+            other => other.clone(),
+        })
+        .collect();
+    ChatMessage {
+        role: message.role.clone(),
+        content: MessageContent::from_parts(parts),
+        options: message.options.clone(),
+    }
+}
+
+/// Mask every string inside a JSON value, keeping the shape so the transcript
+/// still shows which argument was redacted.
+fn redacted_value(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(security::redact(text)),
+        Value::Array(items) => Value::Array(items.iter().map(redacted_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), redacted_value(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// A loop that stops early still ends with one assistant row, so a resumed
+/// session can see why the turn ended instead of a completed turn with no
+/// answer. The reason is already redacted by the caller.
+fn report_stopped(
+    on_message: &mut impl FnMut(&ChatMessage, MessageStatus),
+    text: String,
+) -> String {
+    on_message(&ChatMessage::assistant(&text), MessageStatus::Complete);
+    text
+}
+
+/// A cancelled turn always leaves one assistant row: `cancelled` with no text,
+/// `partial` with what arrived.
+fn report_cancelled(on_message: &mut impl FnMut(&ChatMessage, MessageStatus), received: &str) {
+    let status = if received.trim().is_empty() {
+        MessageStatus::Cancelled
+    } else {
+        MessageStatus::Partial
+    };
+    on_message(&ChatMessage::assistant(received), status);
 }
 
 pub struct AgentRuntime {
     client: Client,
     backend: Box<dyn ChatBackend>,
+    summarizer: Option<std::sync::Arc<dyn crate::tui::compact::Summarizer>>,
     registry: ToolRegistry,
     security: WorkspaceSecurity,
     config: AgentConfig,
@@ -424,12 +703,11 @@ impl AgentRuntime {
         let client = builder
             .build()
             .unwrap_or_else(|_| Client::new().expect("Failed to initialize genai Client"));
-        let backend = Box::new(GenaiBackend {
-            client: client.clone(),
-        });
+        let backend = Box::new(GenaiBackend::new(client.clone()));
         Self {
             client,
             backend,
+            summarizer: None,
             registry: ToolRegistry::with_default_tools(),
             security,
             config,
@@ -446,6 +724,17 @@ impl AgentRuntime {
         let mut runtime = Self::new(config, security);
         runtime.backend = backend;
         runtime
+    }
+
+    /// Swap the summarizer the compaction step uses, so no test reaches the
+    /// network.
+    #[cfg(test)]
+    pub(crate) fn with_summarizer(
+        mut self,
+        summarizer: std::sync::Arc<dyn crate::tui::compact::Summarizer>,
+    ) -> Self {
+        self.summarizer = Some(summarizer);
+        self
     }
 
     pub fn client(&self) -> &Client {
@@ -473,30 +762,81 @@ impl AgentRuntime {
         }
     }
 
+    /// One user turn. The outcome carries the terminal status, what the OS said
+    /// about a killed process tree, and the answer or the failure.
+    // The argument list is the phase plan's interface, and the TUI and `exec`
+    // both call it: folding it into a struct would add a shape with one caller.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_task(
         &self,
         task: &str,
         mode: AgentMode,
         history: Vec<ChatMessage>,
         confirm: &dyn Confirmer,
-        mut event_sink: impl FnMut(&str) + Send,
-        mut on_message: impl FnMut(&ChatMessage),
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let system_prompt = self
-            .config
-            .system_prompt
-            .clone()
-            .unwrap_or_else(|| load_system_prompt(self.security.root()));
+        cancel: &CancelToken,
+        event_sink: impl FnMut(&str) + Send,
+        on_message: impl FnMut(&ChatMessage, MessageStatus),
+    ) -> TurnOutcome {
+        let mut turn = TurnState::new();
+        let result = match self
+            .run_turn(
+                task, mode, history, confirm, cancel, &mut turn, event_sink, on_message,
+            )
+            .await
+        {
+            Ok(answer) => {
+                turn.transition(TurnStatus::Completed);
+                Ok(answer)
+            }
+            Err(TurnError::Cancelled) => {
+                // `cancelled()` already moved the state to `Cancelling`; this is
+                // the one edge left, and it is reported because the TUI reads it.
+                turn.transition(TurnStatus::Cancelled);
+                Err(std::io::Error::other("the turn was cancelled").into())
+            }
+            Err(TurnError::Failed(error)) => {
+                turn.transition(TurnStatus::Failed);
+                Err(error)
+            }
+        };
 
-        let system_prompt = with_mode_policy(system_prompt, mode);
-
-        let mut chat_req = ChatRequest::default()
-            .with_tools(self.registry.to_genai_tools(mode))
-            .append_message(ChatMessage::system(&system_prompt));
-        for message in history {
-            chat_req = chat_req.append_message(message);
+        TurnOutcome {
+            status: turn.status(),
+            cleanup: turn.cleanup(),
+            pid: turn.pid(),
+            result,
         }
-        chat_req = chat_req.append_message(ChatMessage::user(task));
+    }
+
+    // Same seam, plus the state machine this layer owns.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_turn(
+        &self,
+        task: &str,
+        mode: AgentMode,
+        history: Vec<ChatMessage>,
+        confirm: &dyn Confirmer,
+        cancel: &CancelToken,
+        turn_state: &mut TurnState,
+        mut event_sink: impl FnMut(&str) + Send,
+        mut on_message: impl FnMut(&ChatMessage, MessageStatus),
+    ) -> Result<String, TurnError> {
+        if cancel.is_cancelled() {
+            // The same reporting path every other cancel uses.
+            return Err(cancelled(turn_state));
+        }
+        let summarizer: std::sync::Arc<dyn crate::tui::compact::Summarizer> = match &self.summarizer
+        {
+            Some(summarizer) => summarizer.clone(),
+            None => std::sync::Arc::new(crate::tui::compact::ModelSummarizer::from_config(
+                &self.config,
+            )),
+        };
+        let retry_history = history.clone();
+        let mut chat_req = self
+            .prepare_request(history, task, mode, &*summarizer, &mut event_sink)
+            .await;
+        let mut retry = RetryBudget::default();
 
         tracing::info!(model = %self.config.model, "Starting Seavx agent task");
 
@@ -505,8 +845,15 @@ impl AgentRuntime {
         // Tool steps of this run, fed to the post-task skill evaluator: the model
         // cannot judge repeatability from the task text alone.
         let mut steps: Vec<String> = Vec::new();
+        // Repeated-action detection: the same call or the same error twice ends
+        // the loop instead of burning the turn budget.
+        let mut last_action: Option<String> = None;
+        let mut last_failure: Option<String> = None;
 
         for turn in 0..self.config.max_turns {
+            if cancel.is_cancelled() {
+                return Err(cancelled(turn_state));
+            }
             tracing::debug!(turn = turn, "Executing chat request");
 
             // Log full request payload to .seavx/request.log
@@ -518,10 +865,99 @@ impl AgentRuntime {
                 self.security.root(),
             );
 
-            let response = self
-                .backend
-                .send(&self.config.model, chat_req.clone(), Some(&chat_options))
-                .await?;
+            // First attempt: a stream when the config allows it, one plain
+            // request otherwise. Both share the turn's single retry.
+            let mut got_delta = false;
+            let mut streamed_thinking = false;
+            let mut received = String::new();
+            let attempt = async {
+                if self.config.stream {
+                    let mut on_delta = |delta: StreamDelta| {
+                        got_delta = true;
+                        retry.note_output();
+                        match delta {
+                            StreamDelta::Token(token) => {
+                                received.push_str(&token);
+                                event_sink(&format!("TOKEN:{token}"));
+                            }
+                            StreamDelta::Thinking(thoughts) => {
+                                streamed_thinking = true;
+                                event_sink(&format!("THINKING:{thoughts}"));
+                            }
+                        }
+                    };
+                    self.backend
+                        .stream(
+                            &self.config.model,
+                            chat_req.clone(),
+                            Some(&chat_options),
+                            &mut on_delta,
+                        )
+                        .await
+                } else {
+                    self.backend
+                        .send(&self.config.model, chat_req.clone(), Some(&chat_options))
+                        .await
+                }
+            };
+
+            let first = match until_cancelled(cancel, attempt).await {
+                Some(first) => first,
+                None => {
+                    // The future is dropped, so nothing more is read; the
+                    // deltas that already left the sink are kept.
+                    report_cancelled(&mut on_message, &received);
+                    return Err(cancelled(turn_state));
+                }
+            };
+
+            let response = match first {
+                Ok(response) => response,
+                Err(error) if got_delta => {
+                    // Output already left the sink: persisted, never resent.
+                    if !received.trim().is_empty() {
+                        on_message(&ChatMessage::assistant(&received), MessageStatus::Partial);
+                    }
+                    return Err(TurnError::Failed(error));
+                }
+                Err(error) => {
+                    // One retry per turn, on the first identified trigger only.
+                    let trigger = classify_failure(error.as_ref());
+                    let spent = match trigger {
+                        Some(trigger) => retry.spend(trigger),
+                        // A stream that produced nothing may still answer
+                        // unstreamed; that attempt is the same single retry.
+                        None => self.config.stream && retry.spend(RetryTrigger::StreamUnavailable),
+                    };
+                    if !spent {
+                        return Err(TurnError::Failed(error));
+                    }
+                    match trigger {
+                        Some(RetryTrigger::ReplayRejection) => chat_req = halve_turns(&chat_req),
+                        Some(RetryTrigger::CapacityError) => {
+                            chat_req = self
+                                .aggressive_request(&retry_history, task, mode, &*summarizer)
+                                .await
+                        }
+                        // The same request, unstreamed: nothing to rebuild.
+                        Some(RetryTrigger::StreamUnavailable) | None => {}
+                    }
+                    // A failure here is the turn's failure: it never buys a
+                    // second retry.
+                    let retry_send = self.backend.send(
+                        &self.config.model,
+                        chat_req.clone(),
+                        Some(&chat_options),
+                    );
+                    match until_cancelled(cancel, retry_send).await {
+                        Some(result) => result?,
+                        None => {
+                            report_cancelled(&mut on_message, &received);
+                            return Err(cancelled(turn_state));
+                        }
+                    }
+                }
+            };
 
             // Track real usage tokens from provider response
             if let Some(total) = response.usage.total_tokens {
@@ -529,8 +965,10 @@ impl AgentRuntime {
                 event_sink(&format!("USAGE:{total}:{prompt}"));
             }
 
-            // Surface the model's reasoning so the TUI can render it as a gray block
-            if let Some(ref thoughts) = response.reasoning_content {
+            // Surface the model's reasoning so the TUI can render it as a gray
+            // block. The captured text repeats what the deltas already sent, so
+            // a streamed turn is skipped: re-sending it drew the block twice.
+            if !streamed_thinking && let Some(ref thoughts) = response.reasoning_content {
                 let trimmed = thoughts.trim();
                 if !trimmed.is_empty() {
                     event_sink(&format!("THINKING:{trimmed}"));
@@ -543,7 +981,10 @@ impl AgentRuntime {
 
                 // The filler is not model output: only real text is reported.
                 if !final_text.trim().is_empty() {
-                    on_message(&ChatMessage::assistant(&final_text));
+                    on_message(
+                        &ChatMessage::assistant(&final_text),
+                        crate::session::MessageStatus::Complete,
+                    );
                 }
 
                 let return_text = if !final_text.trim().is_empty() {
@@ -569,7 +1010,12 @@ impl AgentRuntime {
 
             let assistant_msg = response.clone().into_assistant_message_for_tool_use();
             if let Some(msg) = assistant_msg {
-                on_message(&msg);
+                // The model writes the arguments, so they may carry a secret:
+                // the transcript and the session get the masked copy.
+                on_message(
+                    &redacted_for_display(&msg),
+                    crate::session::MessageStatus::Complete,
+                );
                 chat_req = chat_req.append_message(msg);
             }
 
@@ -577,6 +1023,19 @@ impl AgentRuntime {
 
             for call in owned_calls {
                 let tool_name = &call.fn_name;
+                let signature = format!("{tool_name}({})", call.fn_arguments);
+                if last_action.as_deref() == Some(signature.as_str()) {
+                    // The reason reaches the transcript, so it is masked here
+                    // rather than only in the log line.
+                    let reason = security::redact(&signature);
+                    tracing::warn!(action = %reason, "repeated action stopped the loop");
+                    return Ok(report_stopped(
+                        &mut on_message,
+                        format!("stopped: {reason} repeated twice"),
+                    ));
+                }
+                last_action = Some(signature);
+
                 let args_summary = match &call.fn_arguments {
                     serde_json::Value::Object(map) => {
                         let parts: Vec<String> = map
@@ -610,13 +1069,18 @@ impl AgentRuntime {
                 let (result_str, is_err) = match self.registry.get_for_mode(tool_name, mode) {
                     Ok(tool) => {
                         let args = call.fn_arguments.clone();
-                        let kind = tool.classify(&args, &self.security);
-                        let detail = tool
-                            .destination(&args, &self.security)
+                        let destination = tool.destination(&args, &self.security);
+                        let kind = effective_kind(
+                            crate::home::dir().as_deref(),
+                            &self.security,
+                            tool.classify(&args, &self.security),
+                            destination.as_deref(),
+                        );
+                        let detail = destination
                             .map(|path| path.display().to_string())
                             .unwrap_or_else(|| args_summary.clone());
                         match self.gate(confirm, kind, tool_name, &detail).await {
-                            Ok(()) => match tool.execute(args, &self.security).await {
+                            Ok(()) => match tool.execute(args, &self.security, cancel).await {
                                 Ok(res) => (res, false),
                                 Err(err) => (format!("Error executing {tool_name}: {err}"), true),
                             },
@@ -627,7 +1091,24 @@ impl AgentRuntime {
                 };
 
                 let result_str = security::redact(&result_str);
+                // A cancelled command reports what the OS said; the turn carries it.
+                if let Some((pid, cleanup)) = cancel.last_cleanup() {
+                    turn_state.set_cleanup(pid, cleanup);
+                }
+
                 Self::log_tool_result(tool_name, is_err, &result_str);
+
+                if is_err {
+                    if last_failure.as_deref() == Some(result_str.as_str()) {
+                        return Ok(report_stopped(
+                            &mut on_message,
+                            format!("stopped: the same error repeated twice: {result_str}"),
+                        ));
+                    }
+                    last_failure = Some(result_str.clone());
+                } else {
+                    last_failure = None;
+                }
 
                 // Emit preview snippet of tool output (first 3 lines or 150 chars)
                 let preview = result_str.lines().take(3).collect::<Vec<_>>().join("\n");
@@ -641,7 +1122,7 @@ impl AgentRuntime {
 
                 let tool_message =
                     ChatMessage::from(ToolResponse::new(call.call_id.clone(), result_str));
-                on_message(&tool_message);
+                on_message(&tool_message, crate::session::MessageStatus::Complete);
                 chat_req = chat_req.append_message(tool_message);
             }
         }
@@ -653,20 +1134,155 @@ impl AgentRuntime {
             .with_tools(Vec::<genai::chat::Tool>::new())
             .append_message(ChatMessage::user(final_prompt));
 
-        let response = self
+        let forced = self
             .backend
-            .send(&self.config.model, forced_req, Some(&chat_options))
-            .await?;
+            .send(&self.config.model, forced_req, Some(&chat_options));
+        let response = match until_cancelled(cancel, forced).await {
+            Some(result) => result?,
+            None => {
+                report_cancelled(&mut on_message, "");
+                return Err(cancelled(turn_state));
+            }
+        };
 
         let final_text = response.into_first_text().unwrap_or_default();
         if !final_text.trim().is_empty() {
-            on_message(&ChatMessage::assistant(&final_text));
+            on_message(
+                &ChatMessage::assistant(&final_text),
+                crate::session::MessageStatus::Complete,
+            );
             Ok(final_text)
         } else {
             Ok(
                 "Turn budget reached. Work partially completed without a final response."
                     .to_string(),
             )
+        }
+    }
+
+    /// Assemble the request for one turn and compact it before it is sent.
+    /// `mode` belongs here because the estimate must cover the exported tool
+    /// schemas: the budget is spent on the request that actually goes out.
+    pub(crate) async fn prepare_request(
+        &self,
+        history: Vec<ChatMessage>,
+        task: &str,
+        mode: AgentMode,
+        summarizer: &dyn crate::tui::compact::Summarizer,
+        event_sink: &mut impl FnMut(&str),
+    ) -> ChatRequest {
+        use crate::agent::budget::{
+            compact, estimate_tokens, keep_recent_budget, request_budget, window_start,
+        };
+
+        let limit = model_context_limit(&self.config.model);
+        let budget = request_budget(limit.tokens);
+        let request = self.chat_request(None, &history, task, mode);
+        if estimate_tokens(&request) <= budget {
+            return request;
+        }
+
+        // One compaction, then at most three 10 % shrinks while the summary
+        // itself keeps the request over the budget.
+        let mut keep = keep_recent_budget(limit.tokens);
+        for _ in 0..=3 {
+            match compact(&history, keep, summarizer).await {
+                Ok(compaction) => {
+                    let candidate = self.chat_request(
+                        Some(&compaction.summary),
+                        &compaction.history,
+                        task,
+                        mode,
+                    );
+                    let after = estimate_tokens(&candidate);
+                    if after <= budget {
+                        event_sink(&format!(
+                            "System: context compacted ({} → {after} tokens est.)",
+                            compaction.before
+                        ));
+                        return candidate;
+                    }
+                }
+                Err(error) => {
+                    // A bad summary is worse than none: drop the older turns.
+                    let split = window_start(&history, keep);
+                    if split > 0 {
+                        event_sink(&format!(
+                            "System: compaction failed ({error}); older turns dropped"
+                        ));
+                        return self.chat_request(None, &history[split..], task, mode);
+                    }
+                    break;
+                }
+            }
+            keep = keep.saturating_sub(keep / 10);
+        }
+
+        // Last resort: the newest turn alone, never truncated.
+        let split = window_start(&history, 0);
+        let request = self.chat_request(None, &history[split..], task, mode);
+        let estimate = estimate_tokens(&request);
+        if estimate > budget {
+            event_sink(&format!(
+                "System: {estimate} tokens exceeds the {budget} budget for {}; sending the newest turn anyway",
+                self.config.model
+            ));
+        } else {
+            event_sink("System: compaction did not fit the budget; older turns dropped");
+        }
+        request
+    }
+
+    fn chat_request(
+        &self,
+        summary: Option<&str>,
+        history: &[ChatMessage],
+        task: &str,
+        mode: AgentMode,
+    ) -> ChatRequest {
+        let system_prompt = self
+            .config
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| load_system_prompt(self.security.root()));
+        let system_prompt = with_mode_policy(system_prompt, mode);
+
+        let mut request = ChatRequest::default()
+            .with_tools(self.registry.to_genai_tools(mode))
+            .append_message(ChatMessage::system(&system_prompt));
+        if let Some(summary) = summary {
+            request = request.append_message(ChatMessage::user(format!(
+                "{}\n{summary}",
+                crate::tui::compact::SESSION_CONTEXT_BANNER
+            )));
+        }
+        for message in history {
+            request = request.append_message(message.clone());
+        }
+        request.append_message(ChatMessage::user(task))
+    }
+
+    /// The capacity-error retry: compact against 40 % of the budget, keep the
+    /// newest turn when even that cannot summarise.
+    async fn aggressive_request(
+        &self,
+        history: &[ChatMessage],
+        task: &str,
+        mode: AgentMode,
+        summarizer: &dyn crate::tui::compact::Summarizer,
+    ) -> ChatRequest {
+        use crate::agent::budget::{compact, request_budget, window_start};
+
+        let limit = model_context_limit(&self.config.model);
+        let aggressive = request_budget(limit.tokens) * 40 / 100;
+        match compact(history, aggressive, summarizer).await {
+            Ok(compaction) => {
+                self.chat_request(Some(&compaction.summary), &compaction.history, task, mode)
+            }
+            Err(_) => {
+                let split = window_start(history, 0);
+                self.chat_request(None, &history[split..], task, mode)
+            }
         }
     }
 
@@ -924,3 +1540,7 @@ mod mode_policy_tests {
         assert!(prompt.contains(PLAN_POLICY));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/core/streaming.rs"]
+mod streaming_tests;

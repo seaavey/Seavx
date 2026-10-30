@@ -336,7 +336,7 @@ fn mode_change_is_rejected_while_busy_and_says_so() {
     assert_eq!(app.mode, AgentMode::Build);
     let notice = app.segments.iter().any(|segment| match segment {
         Segment::Text(text) => text.contains("Cannot switch mode"),
-        Segment::Thinking(_) => false,
+        Segment::Notice(_) | Segment::Thinking(_) => false,
     });
     assert!(
         notice,
@@ -345,12 +345,47 @@ fn mode_change_is_rejected_while_busy_and_says_so() {
 }
 
 #[test]
-fn switching_modes_does_not_write_to_the_transcript() {
+fn switching_modes_prints_one_line() {
     let mut app = test_app();
     app.toggle_mode();
+    assert!(transcript(&app).contains("Plan mode enabled — writes are disabled"));
+    // BackTab is the same call, so the shortcut cannot go silent again.
     app.toggle_mode();
+    assert!(transcript(&app).contains("Build mode enabled"));
+
+    let mut plan = test_app();
+    plan.mode = AgentMode::Plan;
+    run_command(&mut plan, "/plan off");
+    assert!(transcript(&plan).contains("Build mode enabled"));
+}
+
+#[test]
+fn repeating_the_mode_command_says_it_is_already_active() {
+    let mut app = test_app();
+    run_command(&mut app, "/plan");
+    assert!(transcript(&app).contains("Plan mode enabled — writes are disabled"));
+    run_command(&mut app, "/plan");
+    assert_eq!(app.mode, AgentMode::Plan);
+    assert!(transcript(&app).contains("Plan mode is already active"));
+
+    run_command(&mut app, "/plan off");
+    assert!(transcript(&app).contains("Build mode enabled"));
+    run_command(&mut app, "/plan off");
     assert_eq!(app.mode, AgentMode::Build);
-    assert!(app.segments.is_empty());
+    assert!(transcript(&app).contains("Build mode is already active"));
+}
+
+#[test]
+fn a_bare_slash_is_a_noop_through_the_enter_path() {
+    let mut app = test_app();
+    app.input.insert_str("/");
+    assert!(matches!(app.enter_action("/"), EnterAction::Nothing));
+    assert_eq!(typed(&app), "", "the bare slash is dropped");
+    assert!(app.segments.is_empty(), "no notice, no row");
+    assert_eq!(app.status, AgentState::Idle, "no agent call");
+
+    // The parser alone already answers None; the Enter path must agree.
+    assert_eq!(crate::tui::commands::parse("/"), None);
 }
 
 #[test]
@@ -358,8 +393,11 @@ fn second_plan_command_is_idempotent() {
     let mut app = test_app();
     run_command(&mut app, "/plan");
     run_command(&mut app, "/plan");
-    assert_eq!(app.mode, AgentMode::Plan);
-    assert!(app.segments.is_empty(), "no notice for a no-op switch");
+    assert_eq!(app.mode, AgentMode::Plan, "the mode does not flip back");
+    assert!(
+        transcript(&app).contains("Plan mode is already active"),
+        "the repeat explains itself instead of doing nothing silently"
+    );
 }
 
 #[test]
@@ -395,6 +433,7 @@ fn stored(
 fn loaded(messages: Vec<crate::session::StoredMessage>) -> crate::session::LoadedSession {
     crate::session::LoadedSession {
         id: 7,
+        slug: "svx-00000007".to_string(),
         workspace: crate::session::workspace_key(),
         title: Some("restored".to_string()),
         model: Some("fake-model".to_string()),
@@ -410,7 +449,7 @@ fn transcript(app: &App) -> String {
     app.segments
         .iter()
         .map(|segment| match segment {
-            Segment::Text(text) => text.clone(),
+            Segment::Text(text) | Segment::Notice(text) => text.clone(),
             Segment::Thinking(text) => text.clone(),
         })
         .collect()
@@ -447,6 +486,167 @@ fn load_session_rebuilds_segments_in_order_and_reports_omissions() {
     assert!(question < answer, "segments keep stored order: {text}");
     assert_eq!(app.session_id, Some(7));
     assert_eq!(app.total_tokens, 42);
+}
+
+#[test]
+fn resuming_a_session_replaces_the_previous_screen_instead_of_appending_to_it() {
+    let mut app = test_app();
+    app.push_text("previous session output");
+    app.push_notice("previous compaction notice");
+    app.session_context = Some("old summary".to_string());
+    app.set_input("unsent draft from the old session");
+    app.read_only = Some("archived".to_string());
+
+    app.load_session(loaded(vec![
+        stored(1, "user", &genai::chat::ChatMessage::user("new question")),
+        stored(
+            2,
+            "assistant",
+            &genai::chat::ChatMessage::assistant("answer"),
+        ),
+    ]));
+
+    let text = transcript(&app);
+    assert!(text.contains("User: new question"), "{text}");
+    assert!(
+        !text.contains("previous session output") && !text.contains("previous compaction notice"),
+        "the resume starts on a clean screen: {text}"
+    );
+    assert!(
+        app.session_context.is_none(),
+        "the old summary is not the loaded session's"
+    );
+    assert!(app.read_only.is_none(), "a normal session is not read-only");
+    assert_eq!(typed(&app), "", "the old draft does not ride along");
+    assert_eq!(app.session_id, Some(7));
+}
+
+#[test]
+fn a_new_session_drops_the_previous_token_usage() {
+    let mut app = test_app();
+    app.load_session(loaded(vec![]));
+    assert_eq!(app.total_tokens, 42);
+
+    app.start_new_session();
+
+    assert_eq!((app.total_tokens, app.prompt_tokens), (0, 0));
+}
+
+#[test]
+fn typed_letters_are_the_model_filter_and_never_reach_the_row_list() {
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+    assert_eq!(
+        edit_query("", &key(KeyCode::Char('g'))),
+        Some("g".to_string())
+    );
+    assert_eq!(
+        edit_query("g", &key(KeyCode::Char('p'))),
+        Some("gp".to_string())
+    );
+    assert_eq!(
+        edit_query("gp", &key(KeyCode::Backspace)),
+        Some("g".to_string())
+    );
+    assert_eq!(
+        edit_query("", &key(KeyCode::Backspace)),
+        Some(String::new())
+    );
+    assert_eq!(
+        edit_query("g", &key(KeyCode::Up)),
+        None,
+        "arrows still move"
+    );
+    assert_eq!(
+        edit_query(
+            "g",
+            &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
+        ),
+        None,
+        "ctrl+r still refreshes instead of typing"
+    );
+
+    let models = ["openai_codex/gpt-6-luna", "claude-sonnet", "GPT-4o"]
+        .map(str::to_string)
+        .to_vec();
+    let visible = visible_models(&models, "GPT");
+    assert_eq!(
+        visible,
+        vec![&models[0], &models[2]],
+        "matching is case-insensitive and untrimmed"
+    );
+    assert!(
+        visible_models(&models, "").len() == 3,
+        "an empty query keeps every row"
+    );
+    assert!(visible_models(&models, "zen").is_empty());
+}
+
+#[test]
+fn stepping_the_model_picker_wraps_inside_the_filtered_rows() {
+    let mut app = test_app();
+    app.modal = picker(&["alpha", "beta", "gamma"], 2);
+
+    // The wheel and Down are the same call.
+    app.step_model_picker(true);
+    assert_eq!(selected_of(&app), 0, "the last row wraps to the first");
+    app.step_model_picker(false);
+    assert_eq!(selected_of(&app), 2, "and back up wraps to the last");
+
+    // One matching row: stepping cannot leave it.
+    app.modal = Some(ModalSelection::Model {
+        models: ["alpha", "beta", "gamma"].map(str::to_string).to_vec(),
+        query: "et".to_string(),
+        selected: 0,
+    });
+    for down in [true, false, true] {
+        app.step_model_picker(down);
+        assert_eq!(selected_of(&app), 0, "the only filtered row stays selected");
+    }
+
+    // No picker at all: the wheel is a no-op instead of a panic.
+    app.modal = None;
+    app.step_model_picker(true);
+}
+
+fn selected_of(app: &App) -> usize {
+    match &app.modal {
+        Some(ModalSelection::Model { selected, .. }) => *selected,
+        other => panic!("the model picker is open: {other:?}"),
+    }
+}
+
+#[test]
+fn a_refresh_keeps_the_filter_and_the_cursor_stays_inside_it() {
+    let mut app = test_app();
+    app.config.model = "beta".to_string();
+    app.modal = Some(ModalSelection::Model {
+        models: vec!["alpha".to_string()],
+        query: "et".to_string(),
+        selected: 0,
+    });
+
+    app.models_refreshed(Ok(vec![
+        "alpha".to_string(),
+        "beta".to_string(),
+        "gamma".to_string(),
+    ]));
+
+    match &app.modal {
+        Some(ModalSelection::Model {
+            models,
+            query,
+            selected,
+        }) => {
+            assert_eq!(query, "et", "the typed filter survives the refresh");
+            assert_eq!(models.len(), 3);
+            assert_eq!(
+                *selected, 0,
+                "beta is the only filtered row, so it is row 0"
+            );
+        }
+        other => panic!("the picker stays open: {other:?}"),
+    }
 }
 
 #[test]
@@ -614,4 +814,284 @@ fn resending_a_pending_prompt_creates_one_row_and_one_request() {
         })
         .unwrap();
     assert_eq!(first, "complete", "the stored status is untouched");
+}
+
+#[test]
+fn esc_cancels_while_busy_and_quits_only_when_idle() {
+    let mut busy = test_app();
+    busy.status = AgentState::Streaming;
+    busy.escape();
+    assert!(busy.cancel.is_cancelled(), "Esc cancels the running turn");
+    assert!(!busy.should_quit, "a running turn is not a reason to quit");
+    assert_eq!(
+        busy.status,
+        AgentState::Streaming,
+        "the worker owns the status"
+    );
+
+    let mut idle = test_app();
+    idle.escape();
+    assert!(idle.should_quit, "Esc quits when nothing is running");
+
+    // With a popup on screen, Esc closes it and touches neither.
+    let mut popup = test_app();
+    popup.status = AgentState::Thinking;
+    popup.input.insert_str("/he");
+    assert!(popup.popup_open());
+    popup.escape();
+    assert!(!popup.popup_open(), "the popup closes first");
+    assert!(!popup.cancel.is_cancelled(), "the turn keeps running");
+    assert!(!popup.should_quit, "and the session is not ended");
+}
+
+#[test]
+fn a_cancelled_turn_prints_one_line_and_returns_to_idle() {
+    use crate::agent::cancel::{Cleanup, TurnStatus};
+
+    let mut app = test_app();
+    app.status = AgentState::Streaming;
+    app.finish_turn(TurnStatus::Cancelled, Some(Cleanup::Confirmed), Some(4242));
+    assert_eq!(app.status, AgentState::Idle);
+    let text = transcript(&app);
+    assert!(text.contains("System: cancelled"), "{text}");
+    assert!(
+        !text.contains("could not be confirmed"),
+        "a confirmed kill claims nothing extra: {text}"
+    );
+
+    let mut unconfirmed = test_app();
+    unconfirmed.status = AgentState::Streaming;
+    unconfirmed.finish_turn(
+        TurnStatus::Cancelled,
+        Some(Cleanup::Unconfirmed),
+        Some(4242),
+    );
+    let text = transcript(&unconfirmed);
+    assert!(text.contains("System: cancelled"), "{text}");
+    assert!(
+        text.contains("cancellation could not be confirmed; pid 4242 may still be running"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn agent_done_fires_exactly_once_per_turn() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let _guard = DoneGuard(tx.clone());
+    }
+    assert!(matches!(rx.try_recv(), Ok(Action::AgentDone)));
+    assert!(
+        rx.try_recv().is_err(),
+        "one turn, one AgentDone, even when the task returned early"
+    );
+}
+
+// ---- Audit regressions ------------------------------------------------------
+
+#[test]
+fn a_second_prompt_is_refused_while_a_turn_runs() {
+    use crate::tui::event::AgentState;
+
+    let mut app = test_app();
+    let first = app.submit_turn("first prompt").expect("the first request");
+    assert_eq!(app.status, AgentState::Thinking);
+
+    assert!(
+        app.submit_turn("second prompt").is_none(),
+        "one turn at a time: the running turn keeps its cancel token"
+    );
+    assert_eq!(
+        app.status,
+        AgentState::Thinking,
+        "the running turn is untouched"
+    );
+    assert_eq!(
+        transcript(&app).matches("User:").count(),
+        1,
+        "the refused prompt never reaches the transcript"
+    );
+    assert!(!first.cancel.is_cancelled());
+
+    // The turn finished (or was cancelled): the next prompt goes through.
+    app.status = AgentState::Idle;
+    assert!(app.submit_turn("second prompt").is_some());
+}
+
+#[test]
+fn a_title_for_another_session_does_not_rename_this_one() {
+    let mut app = test_app();
+    app.session_id = Some(2);
+
+    assert!(
+        !app.apply_title(Some(1), "old session".to_string()),
+        "a late title belongs to the session that asked for it"
+    );
+    assert!(app.session_title.is_none());
+
+    assert!(app.apply_title(Some(2), "this session".to_string()));
+    assert_eq!(app.session_title.as_deref(), Some("this session"));
+}
+
+#[test]
+fn the_resume_picker_lists_this_workspaces_sessions_newest_first() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let workspace = crate::session::workspace_key();
+    let mut app = test_app();
+
+    assert!(
+        !app.open_session_picker(&store),
+        "an empty store opens no modal"
+    );
+    assert!(app.modal.is_none());
+
+    for prompt in ["first prompt", "second prompt"] {
+        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt).unwrap();
+    }
+
+    assert!(app.open_session_picker(&store));
+    let Some(ModalSelection::Session { rows, selected }) = app.modal.clone() else {
+        panic!("expected the session picker, got {:?}", app.modal);
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(selected, 0, "the newest session starts highlighted");
+    assert!(rows[0].starts_with("1  svx-"), "{}", rows[0]);
+    assert!(rows[0].contains("second prompt"), "{}", rows[0]);
+    assert!(rows[1].contains("first prompt"), "{}", rows[1]);
+}
+
+#[test]
+fn quitting_is_never_blocked_by_a_pending_permission() {
+    let mut app = test_app();
+    let (reply, _answer) = tokio::sync::oneshot::channel();
+    app.pending_permission = Some(PendingPermission {
+        request: crate::agent::permissions::PermissionRequest::new(
+            crate::agent::permissions::ActionKind::Write,
+            "write_file",
+            "notes.txt",
+        ),
+        reply,
+    });
+
+    let ctrl = |code: KeyCode| KeyEvent::new(code, KeyModifiers::CONTROL);
+    assert!(
+        quit_shortcut(&mut app, &ctrl(KeyCode::Char('d'))),
+        "Ctrl+D quits while a question is on screen"
+    );
+    assert!(app.should_quit);
+    // The question was not answered: the dropped reply is the denial.
+    assert!(app.pending_permission.is_some());
+
+    let mut app = test_app();
+    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('q'))));
+    assert!(app.should_quit);
+}
+
+#[test]
+fn ctrl_c_needs_a_second_press_and_a_plain_key_is_not_a_shortcut() {
+    let mut app = test_app();
+    let ctrl = |code: KeyCode| KeyEvent::new(code, KeyModifiers::CONTROL);
+
+    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('c'))));
+    assert!(!app.should_quit, "one press only warns");
+    assert!(app.toast.is_some());
+
+    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('c'))));
+    assert!(app.should_quit, "the second press exits");
+
+    let mut app = test_app();
+    assert!(!quit_shortcut(
+        &mut app,
+        &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+    ));
+    assert!(!app.should_quit, "a bare d is still text");
+}
+
+#[test]
+fn model_index_outside_the_cached_list_is_an_error_not_a_name() {
+    let cached: Vec<String> = ["alpha", "beta"].iter().map(|m| m.to_string()).collect();
+
+    assert_eq!(resolve_model_target(&cached, "1").unwrap(), "alpha");
+    assert_eq!(resolve_model_target(&cached, "2").unwrap(), "beta");
+    assert_eq!(
+        resolve_model_target(&cached, "gpt-4o").unwrap(),
+        "gpt-4o",
+        "a name is never looked up in the cache"
+    );
+
+    for out_of_range in ["0", "3", "99"] {
+        assert!(
+            resolve_model_target(&cached, out_of_range).is_err(),
+            "`{out_of_range}` must not be saved as a model name"
+        );
+    }
+    assert!(
+        resolve_model_target(&[], "1").is_err(),
+        "a cold cache rejects every index"
+    );
+}
+
+fn picker(models: &[&str], selected: usize) -> Option<ModalSelection> {
+    Some(ModalSelection::Model {
+        models: models.iter().map(|model| model.to_string()).collect(),
+        query: String::new(),
+        selected,
+    })
+}
+
+#[test]
+fn a_finished_refresh_replaces_the_open_picker_and_stops_the_spinner() {
+    let mut app = test_app();
+    app.config.model = "beta".to_string();
+    app.modal = picker(&["alpha"], 0);
+    app.refreshing_models = true;
+
+    app.models_refreshed(Ok(vec!["alpha".to_string(), "beta".to_string()]));
+
+    assert!(!app.refreshing_models, "the spinner stops");
+    match &app.modal {
+        Some(ModalSelection::Model {
+            models, selected, ..
+        }) => {
+            assert_eq!(models, &["alpha", "beta"]);
+            assert_eq!(*selected, 1, "the active model is where the cursor lands");
+        }
+        other => panic!("the picker stays open: {other:?}"),
+    }
+    let (toast, _) = app.toast.clone().expect("the count is reported");
+    assert!(toast.starts_with('✓'), "{toast}");
+}
+
+#[test]
+fn a_refresh_that_lands_after_the_picker_closed_only_toasts() {
+    let mut app = test_app();
+    app.modal = None;
+    app.refreshing_models = true;
+
+    app.models_refreshed(Ok(vec!["alpha".to_string()]));
+
+    assert!(!app.refreshing_models);
+    assert!(
+        app.modal.is_none(),
+        "Esc keeps the picker closed instead of it popping back open"
+    );
+    assert!(app.toast.is_some());
+}
+
+#[test]
+fn a_failed_refresh_stops_the_spinner_and_says_why() {
+    let mut app = test_app();
+    app.modal = picker(&["alpha"], 0);
+    app.refreshing_models = true;
+
+    app.models_refreshed(Err("gateway returned error status: 429".to_string()));
+
+    assert!(!app.refreshing_models);
+    assert!(matches!(
+        app.modal,
+        Some(ModalSelection::Model { ref models, .. }) if models == &["alpha"]
+    ));
+    let (toast, _) = app.toast.clone().expect("the failure is reported");
+    assert!(toast.contains("429"), "{toast}");
 }

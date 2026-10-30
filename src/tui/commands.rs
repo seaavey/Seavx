@@ -8,8 +8,132 @@
 use crate::agent::engine::{AgentConfig, AgentMode};
 use crate::cli::config::{self, ConfigAction, ConfigKey};
 use crate::cli::memory::{self, MemoryView};
-use crate::tui::app::{App, SLASH_COMMANDS};
+use crate::tui::app::App;
 use crate::tui::event::AgentState;
+
+/// One command's identity, independent of how it is spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandId {
+    Model,
+    Compact,
+    Config,
+    Plan,
+    Clear,
+    New,
+    Help,
+    Init,
+    Doctor,
+    Memory,
+    Undo,
+    Sessions,
+    Resume,
+    Exit,
+}
+
+/// One row of the command table: the only place a command's spelling lives.
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub usage: &'static str,
+    pub summary: &'static str,
+    pub id: CommandId,
+}
+
+/// Every command, in menu order. `parse`, the palette, the autocomplete filter
+/// and `help_text` all read this one table.
+pub const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "/model",
+        usage: "/model [model] [effort]",
+        summary: "Switch model and reasoning effort",
+        id: CommandId::Model,
+    },
+    CommandSpec {
+        name: "/compact",
+        usage: "/compact [focus]",
+        summary: "Summarize the session and free context",
+        id: CommandId::Compact,
+    },
+    CommandSpec {
+        name: "/config",
+        usage: "/config [path|get <key>|set [--global] <key> <value>|unset [--global] <key>]",
+        summary: "Show or edit effective configuration",
+        id: CommandId::Config,
+    },
+    CommandSpec {
+        name: "/plan",
+        usage: "/plan [on|off]",
+        summary: "Enter plan mode (read-only)",
+        id: CommandId::Plan,
+    },
+    CommandSpec {
+        name: "/clear",
+        usage: "/clear",
+        summary: "Clear session conversation output",
+        id: CommandId::Clear,
+    },
+    CommandSpec {
+        name: "/new",
+        usage: "/new",
+        summary: "Alias for /clear",
+        id: CommandId::New,
+    },
+    CommandSpec {
+        name: "/help",
+        usage: "/help",
+        summary: "Show help and command palette",
+        id: CommandId::Help,
+    },
+    CommandSpec {
+        name: "/init",
+        usage: "/init",
+        summary: "Initialize workspace configuration",
+        id: CommandId::Init,
+    },
+    CommandSpec {
+        name: "/doctor",
+        usage: "/doctor [--offline]",
+        summary: "Check environment and health",
+        id: CommandId::Doctor,
+    },
+    CommandSpec {
+        name: "/memory",
+        usage: "/memory [show|project|user|skills|path]",
+        summary: "Inspect persistent memory",
+        id: CommandId::Memory,
+    },
+    CommandSpec {
+        name: "/undo",
+        usage: "/undo",
+        summary: "Restore the files changed by the last agent call",
+        id: CommandId::Undo,
+    },
+    CommandSpec {
+        name: "/sessions",
+        usage: "/sessions [number]",
+        summary: "Pick a stored session, or resume one by its number",
+        id: CommandId::Sessions,
+    },
+    CommandSpec {
+        name: "/resume",
+        usage: "/resume [number]",
+        summary: "Alias for /sessions",
+        id: CommandId::Resume,
+    },
+    CommandSpec {
+        name: "/exit",
+        usage: "/exit",
+        summary: "Quit Seavx agent TUI",
+        id: CommandId::Exit,
+    },
+];
+
+/// The autocomplete palette: every row, in table order.
+pub fn palette() -> Vec<(&'static str, &'static str)> {
+    COMMANDS
+        .iter()
+        .map(|spec| (spec.name, spec.summary))
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
@@ -39,6 +163,10 @@ pub enum SlashCommand {
     },
     /// Restore files from the newest checkpoint.
     Undo,
+    /// Open the session picker, or resume one by its listed number.
+    Sessions {
+        index: Option<u32>,
+    },
     Unknown(String),
 }
 
@@ -50,6 +178,8 @@ pub enum CommandEffect {
     RunDoctor { offline: bool },
     RunCompact { instructions: Option<String> },
     RunUndo,
+    RunSessions { number: u32 },
+    OpenSessionPicker,
 }
 
 /// Parse one line of input. Returns `None` when the line is not a slash
@@ -65,10 +195,29 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         return None;
     }
 
-    let command = match name {
-        "/help" if args.is_empty() => SlashCommand::Help,
-        "/clear" if args.is_empty() => SlashCommand::Clear,
-        "/plan" => match args.as_slice() {
+    // The table decides what exists; the id decides the argument grammar.
+    let Some(spec) = COMMANDS.iter().find(|spec| spec.name == name) else {
+        return Some(SlashCommand::Unknown(trimmed.to_string()));
+    };
+
+    let command = match spec.id {
+        CommandId::Model => {
+            // `list` is the historical way to ask for the picker.
+            match args.as_slice() {
+                ["list"] => SlashCommand::Model {
+                    target: None,
+                    effort: None,
+                },
+                _ if args.len() <= 2 => SlashCommand::Model {
+                    target: args.first().map(|arg| arg.to_string()),
+                    effort: args.get(1).map(|arg| arg.to_string()),
+                },
+                _ => SlashCommand::Unknown(trimmed.to_string()),
+            }
+        }
+        // One variant, one handler: the alias cannot drift from its target.
+        CommandId::Clear | CommandId::New => no_args(&args, trimmed, SlashCommand::Clear),
+        CommandId::Plan => match args.as_slice() {
             [] | ["on"] => SlashCommand::Plan {
                 mode: AgentMode::Plan,
             },
@@ -77,54 +226,61 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             },
             _ => SlashCommand::Unknown(trimmed.to_string()),
         },
-        "/exit" if args.is_empty() => SlashCommand::Exit,
-        "/init" if args.is_empty() => SlashCommand::Init,
-        "/compact" => SlashCommand::Compact {
+        CommandId::Help => no_args(&args, trimmed, SlashCommand::Help),
+        CommandId::Exit => no_args(&args, trimmed, SlashCommand::Exit),
+        CommandId::Init => no_args(&args, trimmed, SlashCommand::Init),
+        CommandId::Undo => no_args(&args, trimmed, SlashCommand::Undo),
+        CommandId::Compact => SlashCommand::Compact {
             instructions: (!args.is_empty()).then(|| args.join(" ")),
         },
-        "/doctor" => match args.as_slice() {
+        CommandId::Doctor => match args.as_slice() {
             [] => SlashCommand::Doctor { offline: false },
             ["--offline"] => SlashCommand::Doctor { offline: true },
             _ => SlashCommand::Unknown(trimmed.to_string()),
         },
-        "/config" => parse_config(&args, trimmed),
-        "/undo" if args.is_empty() => SlashCommand::Undo,
-        "/memory" if args.len() <= 1 => match args.first().copied() {
-            None | Some("show") => SlashCommand::Memory {
+        // One grammar for both spellings; `/resume` is the alias.
+        CommandId::Sessions | CommandId::Resume => match args.as_slice() {
+            [] => SlashCommand::Sessions { index: None },
+            [number] => match number.parse::<u32>() {
+                Ok(number) if number > 0 => SlashCommand::Sessions {
+                    index: Some(number),
+                },
+                _ => SlashCommand::Unknown(trimmed.to_string()),
+            },
+            _ => SlashCommand::Unknown(trimmed.to_string()),
+        },
+        CommandId::Config => parse_config(&args, trimmed),
+        CommandId::Memory => match args.as_slice() {
+            [] | ["show"] => SlashCommand::Memory {
                 view: MemoryView::All,
             },
-            Some("project") => SlashCommand::Memory {
+            ["project"] => SlashCommand::Memory {
                 view: MemoryView::Project,
             },
-            Some("user") => SlashCommand::Memory {
+            ["user"] => SlashCommand::Memory {
                 view: MemoryView::User,
             },
-            Some("skills") => SlashCommand::Memory {
+            ["skills"] => SlashCommand::Memory {
                 view: MemoryView::Skills,
             },
-            Some("path") => SlashCommand::Memory {
+            ["path"] => SlashCommand::Memory {
                 view: MemoryView::Path,
             },
-            Some(_) => SlashCommand::Unknown(trimmed.to_string()),
+            _ => SlashCommand::Unknown(trimmed.to_string()),
         },
-        "/model" if args.len() <= 2 => {
-            // `list` is the historical way to ask for the picker.
-            if args.first() == Some(&"list") && args.len() == 1 {
-                SlashCommand::Model {
-                    target: None,
-                    effort: None,
-                }
-            } else {
-                SlashCommand::Model {
-                    target: args.first().map(|arg| arg.to_string()),
-                    effort: args.get(1).map(|arg| arg.to_string()),
-                }
-            }
-        }
-        _ => SlashCommand::Unknown(trimmed.to_string()),
     };
 
     Some(command)
+}
+
+/// A command whose grammar has no arguments: anything after the name is an
+/// error, never silently ignored.
+fn no_args(args: &[&str], raw: &str, command: SlashCommand) -> SlashCommand {
+    if args.is_empty() {
+        command
+    } else {
+        SlashCommand::Unknown(raw.to_string())
+    }
 }
 
 /// `/config` has its own grammar: only `set`/`unset` accept `--global`, and
@@ -229,6 +385,11 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },
         SlashCommand::Undo => CommandEffect::RunUndo,
+        SlashCommand::Sessions { index } => match index {
+            // The picker is the list: no number means "let me choose".
+            None => CommandEffect::OpenSessionPicker,
+            Some(number) => CommandEffect::RunSessions { number },
+        },
         SlashCommand::Init => {
             match config::init_workspace(std::path::Path::new(".")) {
                 Ok((path, true)) => {
@@ -261,6 +422,10 @@ fn execute_config(app: &mut App, action: ConfigAction) {
     match action {
         ConfigAction::Show => {
             let (config, report) = AgentConfig::load_with_report(workspace);
+            if let Err(conflict) = config::recover_config(&config::workspace_config_path(workspace))
+            {
+                app.push_notice(conflict);
+            }
             app.push_notice(config::render_report(&config, &report));
         }
         ConfigAction::Path => {
@@ -372,16 +537,16 @@ fn unknown_key_message(key: &str) -> String {
 /// One aligned line per palette entry, so the help output and the autocomplete
 /// menu can never disagree about which commands exist.
 pub fn help_text() -> String {
-    let width = SLASH_COMMANDS
+    let width = COMMANDS
         .iter()
-        .map(|(command, _)| command.chars().count())
+        .map(|spec| spec.usage.chars().count())
         .max()
         .unwrap_or(0);
 
     let mut text = String::from("Slash commands:");
-    for (command, description) in SLASH_COMMANDS {
+    for spec in COMMANDS {
         text.push('\n');
-        text.push_str(&format!("{command:<width$}  {description}"));
+        text.push_str(&format!("{:<width$}  {}", spec.usage, spec.summary));
     }
     text
 }
