@@ -193,6 +193,7 @@ pub async fn run_agent_worker(
             turn_id,
             mut store,
             cancel,
+            steer,
         } = request;
         let mut session_id = session_id;
 
@@ -262,6 +263,7 @@ pub async fn run_agent_worker(
         // the turn must not append it a second time.
         let streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let streamed_evt = streamed.clone();
+        let runtime = runtime.with_steering(std::sync::Arc::new(super::SharedSteer(steer)));
         let runtime = runtime.with_questioner(std::sync::Arc::new(super::TuiQuestioner::new(
             tx.clone(),
             store.clone(),

@@ -14,6 +14,7 @@ pub mod review;
 pub mod security;
 pub mod shell;
 pub mod skills;
+pub mod steering;
 #[cfg(test)]
 #[path = "../tests/agent/agent.rs"]
 mod tests;

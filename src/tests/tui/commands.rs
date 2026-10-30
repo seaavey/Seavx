@@ -113,6 +113,18 @@ fn every_registry_entry_parses_to_a_handled_command() {
                 action: SkillsAction::List,
             },
         ),
+        (
+            "/steer",
+            SlashCommand::Steer {
+                text: String::new(),
+            },
+        ),
+        (
+            "/queue",
+            SlashCommand::Queue {
+                prompt: String::new(),
+            },
+        ),
         ("/undo", SlashCommand::Undo),
         ("/sessions", SlashCommand::Sessions { index: None }),
         ("/resume", SlashCommand::Sessions { index: None }),
@@ -246,6 +258,8 @@ fn the_palette_is_the_table() {
             "/plan",
             "/ask",
             "/review",
+            "/steer",
+            "/queue",
             "/clear",
             "/new",
             "/help",
@@ -1008,4 +1022,57 @@ fn goal_editing_parses_and_stays_draft_only() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn steering_and_queuing_parse_their_text_and_refuse_while_idle() {
+    assert_eq!(
+        parse("/steer focus on the parser"),
+        Some(SlashCommand::Steer {
+            text: "focus on the parser".to_string()
+        })
+    );
+    assert_eq!(
+        parse("/queue run the tests"),
+        Some(SlashCommand::Queue {
+            prompt: "run the tests".to_string()
+        })
+    );
+
+    let mut app = crate::tui::app::test_app();
+    // Idle: both are refused with a reason, and neither is stored.
+    assert!(matches!(
+        execute(&mut app, parse("/steer hurry").unwrap()),
+        CommandEffect::Handled
+    ));
+    assert!(!app.steer_waiting());
+    assert!(app.queued_prompt.is_none());
+
+    // Busy: both are accepted, and only one of each.
+    app.status = AgentState::Thinking;
+    execute(&mut app, parse("/steer hurry").unwrap());
+    assert!(app.steer_waiting());
+    execute(&mut app, parse("/steer again").unwrap());
+    assert_eq!(
+        app.steer.lock().unwrap().waiting.as_deref(),
+        Some("hurry"),
+        "a second steer never replaces the first"
+    );
+
+    execute(&mut app, parse("/queue run tests").unwrap());
+    assert_eq!(app.queued_prompt.as_deref(), Some("run tests"));
+    execute(&mut app, parse("/queue and again").unwrap());
+    assert_eq!(
+        app.queued_prompt.as_deref(),
+        Some("run tests"),
+        "a second queued prompt never replaces the first"
+    );
+
+    let status = status_text(&app);
+    assert!(status.contains("steer: waiting (hurry)"), "{status}");
+    assert!(status.contains("queued: run tests"), "{status}");
+
+    // The engine takes it exactly once.
+    assert_eq!(app.steer.lock().unwrap().take().as_deref(), Some("hurry"));
+    assert!(!app.steer_waiting());
 }

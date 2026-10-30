@@ -139,6 +139,10 @@ pub struct App<'a> {
     pub pending_permission: Option<PendingPermission>,
     /// A clarification on screen; it owns the next key like a permission does.
     pub pending_question: Option<PendingQuestion>,
+    /// The slot a `/steer` writes into; the worker reads it at each boundary.
+    pub steer: std::sync::Arc<std::sync::Mutex<SteerSlot>>,
+    /// A prompt held until the running turn succeeds. Memory only.
+    pub queued_prompt: Option<String>,
     /// The checkout the skill picker copied from; held so a candidate's source
     /// outlives the pick, and dropped when the picker is cancelled.
     pub pending_skills: Option<crate::cli::skills::Fetched>,
@@ -160,6 +164,8 @@ pub struct App<'a> {
 /// What the worker needs to run one turn: the raw prompt, the replayed history
 /// and the store handle the rows are written through.
 pub struct TurnRequest {
+    /// Shared with the UI so `/steer` can reach the running turn.
+    pub steer: std::sync::Arc<std::sync::Mutex<SteerSlot>>,
     pub prompt: String,
     pub session_id: Option<i64>,
     /// The turn this request runs, so its events can be correlated.
@@ -221,6 +227,48 @@ impl PendingQuestion {
                 }
             }
         }
+    }
+}
+
+impl App<'_> {
+    /// Whether a steer is already waiting for the next boundary.
+    pub fn steer_waiting(&self) -> bool {
+        self.steer
+            .lock()
+            .map(|slot| slot.waiting.is_some())
+            .unwrap_or(false)
+    }
+
+    /// One steer at a time; a second would silently replace the first.
+    pub fn queue_steer(&self, text: String) {
+        if let Ok(mut slot) = self.steer.lock() {
+            slot.waiting = Some(text);
+        }
+    }
+}
+
+/// What the user said to a running turn, and whether the engine picked it up.
+#[derive(Default)]
+pub struct SteerSlot {
+    pub waiting: Option<String>,
+    pub applied: usize,
+}
+
+impl SteerSlot {
+    pub fn take(&mut self) -> Option<String> {
+        let text = self.waiting.take()?;
+        self.applied += 1;
+        Some(text)
+    }
+}
+
+/// Reads steering from the shared slot at each turn boundary. Never touches the
+/// cancellation token: steering redirects a running turn, it does not stop it.
+pub struct SharedSteer(pub std::sync::Arc<std::sync::Mutex<SteerSlot>>);
+
+impl crate::agent::steering::Steering for SharedSteer {
+    fn take(&self) -> Option<String> {
+        self.0.lock().ok()?.take()
     }
 }
 
@@ -404,6 +452,8 @@ impl<'a> App<'a> {
             last_ctrl_c: None,
             pending_permission: None,
             pending_question: None,
+            steer: std::sync::Arc::new(std::sync::Mutex::new(SteerSlot::default())),
+            queued_prompt: None,
             pending_skills: None,
             store: None,
             session_id: None,

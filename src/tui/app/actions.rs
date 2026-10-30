@@ -158,6 +158,31 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             pid,
         } => {
             app.finish_turn(status, cleanup, pid);
+            // A queued prompt runs only after a turn that succeeded. A cancel or
+            // a failure drops it: replaying it would repeat work the user just
+            // stopped, and the queue lives in memory only.
+            if matches!(status, crate::agent::cancel::TurnStatus::Completed)
+                && let Some(prompt) = app.queued_prompt.take()
+                && let Some(request) = app.submit_turn(&prompt)
+            {
+                let is_first_turn = app.session_title.is_none();
+                let context = app.session_context.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    crate::tui::app::worker::run_agent_worker(
+                        request,
+                        tx,
+                        is_first_turn,
+                        crate::agent::engine::AgentMode::Build,
+                        context,
+                    )
+                    .await;
+                });
+            } else if !matches!(status, crate::agent::cancel::TurnStatus::Completed)
+                && app.queued_prompt.take().is_some()
+            {
+                app.push_notice("Queued prompt dropped: the turn did not succeed.");
+            }
             // A goal turn is done when its turn is: the tasks it ran are
             // recorded as completed with what actually happened, never with a
             // claim the turn did not make.

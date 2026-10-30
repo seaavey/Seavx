@@ -1544,3 +1544,31 @@ fn answering_a_restored_question_appends_exactly_one_result() {
         .collect();
     assert_eq!(results, vec!["call_ask".to_string()], "exactly one result");
 }
+
+#[test]
+fn a_queued_prompt_is_dropped_when_the_turn_does_not_succeed() {
+    use crate::agent::cancel::TurnStatus;
+
+    let mut app = test_app();
+    app.status = AgentState::Thinking;
+    app.queued_prompt = Some("run the tests".to_string());
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    super::actions::apply(
+        &mut app,
+        crate::tui::event::Action::TurnFinished {
+            status: TurnStatus::Cancelled,
+            cleanup: None,
+            pid: None,
+        },
+        &tx,
+    );
+
+    assert!(
+        app.queued_prompt.is_none(),
+        "a cancelled turn must not run the queue"
+    );
+    assert_eq!(app.status, AgentState::Idle);
+    let text = transcript(&app);
+    assert!(text.contains("Queued prompt dropped"), "{text}");
+}

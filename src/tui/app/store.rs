@@ -149,6 +149,7 @@ impl App<'_> {
         self.turn_id += 1;
 
         Some(TurnRequest {
+            steer: self.steer.clone(),
             prompt,
             session_id: self.session_id,
             turn_id: self.turn_id,

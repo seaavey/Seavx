@@ -1296,6 +1296,63 @@ mod engine_seam {
             "{unavailable}"
         );
     }
+
+    #[tokio::test]
+    async fn a_steer_reaches_the_next_request_as_a_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![tool_call(
+            "call_a",
+            "list_directory",
+        )])));
+        fake.push(response(MessageContent::from_text("redirected")));
+
+        let slot =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::tui::app::SteerSlot::default()));
+        // The user types `/steer` while the first request is in flight.
+        let typed = slot.clone();
+        let sink = move |_event: crate::agent::events::AgentEvent| {
+            let Ok(mut slot) = typed.lock() else { return };
+            if slot.waiting.is_none() && slot.applied == 0 {
+                slot.waiting = Some("focus on the tests".to_string());
+            }
+        };
+        let runtime = runtime_with(&fake, temp.path()).with_steering(std::sync::Arc::new(
+            crate::tui::app::SharedSteer(slot.clone()),
+        ));
+
+        runtime
+            .execute_task(
+                "do it",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                sink,
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[0]
+                .iter()
+                .any(|m| m.content.first_text() == Some("focus on the tests")),
+            "the first request was already in flight"
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .any(|m| m.content.first_text() == Some("focus on the tests")),
+            "the steer lands on the next turn as a user message"
+        );
+        let slot = slot.lock().unwrap();
+        assert_eq!(slot.applied, 1, "taken exactly once");
+        assert!(slot.waiting.is_none(), "and not left behind");
+    }
 }
 
 #[cfg(test)]

@@ -677,6 +677,8 @@ pub struct AgentRuntime {
     config: AgentConfig,
     /// Who answers `ask_user`. Headless runs keep the default: nobody.
     questioner: std::sync::Arc<dyn crate::agent::questions::Questioner>,
+    /// Where a running turn is steered from. Default: nowhere.
+    steering: std::sync::Arc<dyn crate::agent::steering::Steering>,
 }
 
 impl AgentRuntime {
@@ -730,11 +732,22 @@ impl AgentRuntime {
             security,
             config,
             questioner: std::sync::Arc::new(crate::agent::questions::UnavailableQuestioner),
+            steering: std::sync::Arc::new(crate::agent::steering::NoSteering),
         }
     }
 
     /// Swap who answers `ask_user`. The TUI sets a human; `exec` keeps the
     /// default, so a headless run never waits.
+    /// Swap where steering comes from. Nothing is delivered mid-call: the loop
+    /// reads it at a turn boundary, so a running tool is never interrupted.
+    pub fn with_steering(
+        mut self,
+        steering: std::sync::Arc<dyn crate::agent::steering::Steering>,
+    ) -> Self {
+        self.steering = steering;
+        self
+    }
+
     pub fn with_questioner(
         mut self,
         questioner: std::sync::Arc<dyn crate::agent::questions::Questioner>,
@@ -912,6 +925,13 @@ impl AgentRuntime {
                 return Err(cancelled(turn_state));
             }
             tracing::debug!(turn = turn, "Executing chat request");
+
+            // A steer lands between turns: after the previous response (tool
+            // results included), before this request. Never mid-call.
+            if let Some(steer) = self.steering.take() {
+                chat_req = chat_req.append_message(genai::chat::ChatMessage::user(steer.clone()));
+                event_sink(AgentEvent::Token(format!("\n\n[steer] {steer}\n\n")));
+            }
 
             // Log full request payload to .seavx/request.log
             Self::log_request_payload(

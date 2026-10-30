@@ -50,6 +50,8 @@ pub enum CommandId {
     Resume,
     Goal,
     Tasks,
+    Steer,
+    Queue,
     Status,
     Exit,
 }
@@ -100,6 +102,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "/review [working-tree|staged|commit <ref>|base <ref>]",
         summary: "Review a git target and report findings, read-only",
         id: CommandId::Review,
+    },
+    CommandSpec {
+        name: "/steer",
+        usage: "/steer <text>",
+        summary: "Tell the running turn something; applied at its next step",
+        id: CommandId::Steer,
+    },
+    CommandSpec {
+        name: "/queue",
+        usage: "/queue <prompt>",
+        summary: "Run this prompt after the current turn succeeds",
+        id: CommandId::Queue,
     },
     CommandSpec {
         name: "/clear",
@@ -202,6 +216,14 @@ pub enum SlashCommand {
         effort: Option<String>,
     },
     Clear,
+    /// Talk to the turn that is running; delivered at its next safe boundary.
+    Steer {
+        text: String,
+    },
+    /// Hold a prompt until the running turn finishes successfully.
+    Queue {
+        prompt: String,
+    },
     /// Switch the runtime mode; the mode marker already shows the result.
     Plan {
         mode: AgentMode,
@@ -414,6 +436,12 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         CommandId::Ask => SlashCommand::Ask {
             question: args.join(" "),
         },
+        CommandId::Steer => SlashCommand::Steer {
+            text: args.join(" "),
+        },
+        CommandId::Queue => SlashCommand::Queue {
+            prompt: args.join(" "),
+        },
         CommandId::Compact => SlashCommand::Compact {
             instructions: (!args.is_empty()).then(|| args.join(" ")),
         },
@@ -572,6 +600,16 @@ pub fn status_text(app: &App) -> String {
     if let Some(goal) = &app.goal {
         lines.push(format!("goal: {goal}"));
     }
+    if let Ok(slot) = app.steer.lock() {
+        if let Some(text) = &slot.waiting {
+            lines.push(format!("steer: waiting ({text})"));
+        } else if slot.applied > 0 {
+            lines.push(format!("steer: {} applied", slot.applied));
+        }
+    }
+    if let Some(prompt) = &app.queued_prompt {
+        lines.push(format!("queued: {prompt}"));
+    }
     if let Some(error) = &app.persistence_error {
         lines.push(format!("persistence: degraded ({error})"));
     }
@@ -596,6 +634,36 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         // A running turn is exactly what the user is asking about.
         SlashCommand::Status => {
             app.push_notice(status_text(app));
+            return CommandEffect::Handled;
+        }
+        // Steering and queuing exist for a running turn, so they skip the gate
+        // that refuses everything else while one is busy.
+        SlashCommand::Steer { text } => {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                app.push_notice("Usage: /steer <text>".to_string());
+            } else if app.status == AgentState::Idle {
+                app.push_notice("No turn is running; send it as a prompt instead.".to_string());
+            } else if app.steer_waiting() {
+                app.push_notice("A steer is already waiting for the next step.".to_string());
+            } else {
+                app.queue_steer(text);
+                app.push_notice("Steer queued: delivered at the next safe boundary.");
+            }
+            return CommandEffect::Handled;
+        }
+        SlashCommand::Queue { prompt } => {
+            let prompt = prompt.trim().to_string();
+            if prompt.is_empty() {
+                app.push_notice("Usage: /queue <prompt>".to_string());
+            } else if app.status == AgentState::Idle {
+                app.push_notice("No turn is running; nothing to queue behind.".to_string());
+            } else if app.queued_prompt.is_some() {
+                app.push_notice("A prompt is already queued.".to_string());
+            } else {
+                app.queued_prompt = Some(prompt);
+                app.push_notice("Prompt queued: it runs only after this turn succeeds.");
+            }
             return CommandEffect::Handled;
         }
         _ => {}
@@ -678,6 +746,9 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
                 CommandEffect::RunAsk { question }
             }
         }
+        // Handled above the busy gate; unreachable here, but the match must
+        // still say so.
+        SlashCommand::Steer { .. } | SlashCommand::Queue { .. } => CommandEffect::Handled,
         SlashCommand::Sessions { index } => match index {
             // The picker is the list: no number means "let me choose".
             None => CommandEffect::OpenSessionPicker,
