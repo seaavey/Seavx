@@ -6,10 +6,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+// The header tests name the mode through `use super::*`.
+#[cfg(test)]
 use crate::agent::engine::AgentMode;
 use crate::tui::app::{App, ModalSelection, Segment};
 use crate::tui::event::AgentState;
 use crate::tui::markdown;
+
+mod header;
+mod theme;
 
 pub fn render(app: &App, frame: &mut Frame) {
     let input_height = app.input_height();
@@ -38,32 +43,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     let input_area = chunks[4];
     let footer = chunks[5];
 
-    let dim = Style::default().fg(Color::DarkGray);
-    let (mode_style, mode_tag) = match app.mode {
-        AgentMode::Build => (dim, "[build]"),
-        AgentMode::Plan => (Style::default().fg(Color::Yellow), "[plan]"),
-    };
+    let dim = theme::dim();
+    let (_, mode_style) = theme::mode_tag(app.mode);
 
     // 1. Header
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "seavx",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!(" {mode_tag}"), mode_style),
-            Span::styled("  ", dim),
-            Span::styled(app.workspace.as_str(), dim),
-        ])),
-        header,
-    );
-    frame.render_widget(
-        Paragraph::new(Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), dim))
-            .alignment(Alignment::Right),
-        header,
-    );
+    header::render(app, header, frame);
 
     let millis = crate::util::epoch_millis();
 
