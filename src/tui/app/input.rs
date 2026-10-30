@@ -1,0 +1,75 @@
+use ratatui::{
+    style::{Color, Style},
+    widgets::{Block, BorderType, Borders},
+};
+use tui_textarea::TextArea;
+
+use super::{App, EnterAction};
+
+/// Single source for the prompt textarea so resets keep its styling.
+pub fn new_input<'a>() -> TextArea<'a> {
+    let mut input = TextArea::default();
+    input.set_cursor_line_style(Style::default());
+    // Ghost-completions are drawn with the dim selection style. No selection
+    // exists elsewhere in the app, so this style is never seen otherwise.
+    input.set_selection_style(Style::default().fg(Color::DarkGray));
+    input.set_placeholder_text("Ask anything, / for commands, @ for files");
+    input.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    input
+}
+
+impl App<'_> {
+    /// Enter: a slash line is a command, anything else is a turn. A bare `/`
+    /// clears the input and does nothing else — never a notice, never a call.
+    pub fn enter_action(&mut self, line: &str) -> EnterAction {
+        let prompt = line.trim();
+        if prompt.is_empty() {
+            return EnterAction::Nothing;
+        }
+        if !prompt.starts_with('/') {
+            return EnterAction::Turn(prompt.to_string());
+        }
+        self.input = new_input();
+        match crate::tui::commands::parse(prompt) {
+            Some(command) => EnterAction::Command(command),
+            None => EnterAction::Nothing,
+        }
+    }
+
+    /// Rendered prompt-box height; kept in sync with the vertical layout in `ui::render`.
+    pub fn input_height(&self) -> u16 {
+        (self.input.lines().len() as u16).clamp(1, 6) + 2
+    }
+
+    /// Scroll the transcript up `n` lines, turning off auto-scroll.
+    pub fn scroll_up(&mut self, n: u16) {
+        let lines = self.line_count();
+        if self.auto_scroll {
+            self.scroll = lines;
+        }
+        self.auto_scroll = false;
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    /// Scroll the transcript down `n` lines, re-enabling auto-scroll at the bottom.
+    pub fn scroll_down(&mut self, n: u16) {
+        let lines = self.line_count();
+        let next = self.scroll.saturating_add(n);
+        if next >= lines {
+            self.scroll = lines;
+            self.auto_scroll = true;
+        } else {
+            self.scroll = next;
+        }
+    }
+
+    /// Current prompt as a single trimmed string.
+    pub fn input_text(&self) -> String {
+        self.input.lines().join("\n").trim().to_string()
+    }
+}

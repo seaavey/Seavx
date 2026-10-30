@@ -9,13 +9,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::Rect,
-    style::{Color, Style},
-    widgets::{Block, BorderType, Borders},
-};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
@@ -23,7 +17,10 @@ use crate::agent::engine::{AgentMode, EFFORT_LEVELS};
 use crate::tui::event::{Action, AgentState};
 use crate::tui::ui;
 
+mod input;
 mod transcript;
+
+pub(crate) use input::new_input;
 
 const MAX_COMPLETION_RESULTS: usize = 20;
 
@@ -301,23 +298,6 @@ impl crate::agent::permissions::Confirmer for TuiConfirmer {
     }
 }
 
-/// Single source for the prompt textarea so resets keep its styling.
-pub fn new_input<'a>() -> TextArea<'a> {
-    let mut input = TextArea::default();
-    input.set_cursor_line_style(Style::default());
-    // Ghost-completions are drawn with the dim selection style. No selection
-    // exists elsewhere in the app, so this style is never seen otherwise.
-    input.set_selection_style(Style::default().fg(Color::DarkGray));
-    input.set_placeholder_text("Ask anything, / for commands, @ for files");
-    input.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
-    input
-}
-
 impl<'a> App<'a> {
     /// Answer the pending permission question with one key: `y` once, `a` this
     /// category, `u` unrestricted, `n`/`Esc` deny. Returns the answer sent, or
@@ -480,23 +460,6 @@ impl<'a> App<'a> {
         // Usage is per session too, or the footer keeps the old count.
         self.total_tokens = 0;
         self.prompt_tokens = 0;
-    }
-
-    /// Enter: a slash line is a command, anything else is a turn. A bare `/`
-    /// clears the input and does nothing else — never a notice, never a call.
-    pub fn enter_action(&mut self, line: &str) -> EnterAction {
-        let prompt = line.trim();
-        if prompt.is_empty() {
-            return EnterAction::Nothing;
-        }
-        if !prompt.starts_with('/') {
-            return EnterAction::Turn(prompt.to_string());
-        }
-        self.input = new_input();
-        match crate::tui::commands::parse(prompt) {
-            Some(command) => EnterAction::Command(command),
-            None => EnterAction::Nothing,
-        }
     }
 
     /// Show the prompt and hand the worker everything it needs. The user row is
@@ -982,11 +945,6 @@ impl<'a> App<'a> {
         self.dim_tail(col);
     }
 
-    /// Rendered prompt-box height; kept in sync with the vertical layout in `ui::render`.
-    pub fn input_height(&self) -> u16 {
-        (self.input.lines().len() as u16).clamp(1, 6) + 2
-    }
-
     /// Geometry of the `@` reference popup, shared by rendering and mouse hit-testing.
     pub fn at_popup_layout(&self, area: Rect, match_count: usize) -> AtPopupLayout {
         const MAX_VISIBLE: usize = 8;
@@ -1003,33 +961,6 @@ impl<'a> App<'a> {
             window_start: selected.saturating_sub(MAX_VISIBLE - 1),
             max_visible: MAX_VISIBLE,
         }
-    }
-
-    /// Scroll the transcript up `n` lines, turning off auto-scroll.
-    pub fn scroll_up(&mut self, n: u16) {
-        let lines = self.line_count();
-        if self.auto_scroll {
-            self.scroll = lines;
-        }
-        self.auto_scroll = false;
-        self.scroll = self.scroll.saturating_sub(n);
-    }
-
-    /// Scroll the transcript down `n` lines, re-enabling auto-scroll at the bottom.
-    pub fn scroll_down(&mut self, n: u16) {
-        let lines = self.line_count();
-        let next = self.scroll.saturating_add(n);
-        if next >= lines {
-            self.scroll = lines;
-            self.auto_scroll = true;
-        } else {
-            self.scroll = next;
-        }
-    }
-
-    /// Current prompt as a single trimmed string.
-    pub fn input_text(&self) -> String {
-        self.input.lines().join("\n").trim().to_string()
     }
 
     /// Trailing `@word` in the prompt, if any.
