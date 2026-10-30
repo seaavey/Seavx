@@ -8,6 +8,7 @@
 use crate::agent::engine::{AgentConfig, AgentMode};
 use crate::cli::config::{self, ConfigAction, ConfigKey};
 use crate::cli::memory::{self, MemoryView};
+use crate::cli::skills;
 use crate::tui::app::App;
 use crate::tui::event::AgentState;
 
@@ -24,6 +25,7 @@ pub enum CommandId {
     Init,
     Doctor,
     Memory,
+    Skills,
     Undo,
     Sessions,
     Resume,
@@ -97,9 +99,15 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/memory",
-        usage: "/memory [show|project|user|skills|path]",
+        usage: "/memory [show|project|user|path]",
         summary: "Inspect persistent memory",
         id: CommandId::Memory,
+    },
+    CommandSpec {
+        name: "/skills",
+        usage: "/skills [list|show <name>|add <dir>|install <url> [name...]|remove <name> --yes|path]",
+        summary: "List, inspect, install or remove skills",
+        id: CommandId::Skills,
     },
     CommandSpec {
         name: "/undo",
@@ -161,6 +169,9 @@ pub enum SlashCommand {
     Memory {
         view: MemoryView,
     },
+    Skills {
+        action: SkillsAction,
+    },
     /// Restore files from the newest checkpoint.
     Undo,
     /// Open the session picker, or resume one by its listed number.
@@ -170,9 +181,23 @@ pub enum SlashCommand {
     Unknown(String),
 }
 
+/// `/skills` subcommands. `add` and `remove` are the two that touch the disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillsAction {
+    List,
+    Show(String),
+    Add(std::path::PathBuf),
+    Install { url: String, names: Vec<String> },
+    Remove { name: String, confirmed: bool },
+    Path,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandEffect {
     Handled,
+    SkillsAdd { dir: std::path::PathBuf },
+    SkillsRemove { name: String },
+    SkillsFetch { url: String, names: Vec<String> },
     Quit,
     OpenModelPicker,
     RunDoctor { offline: bool },
@@ -260,11 +285,36 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             ["user"] => SlashCommand::Memory {
                 view: MemoryView::User,
             },
-            ["skills"] => SlashCommand::Memory {
-                view: MemoryView::Skills,
-            },
             ["path"] => SlashCommand::Memory {
                 view: MemoryView::Path,
+            },
+            _ => SlashCommand::Unknown(trimmed.to_string()),
+        },
+        CommandId::Skills => match args.as_slice() {
+            [] | ["list"] => SlashCommand::Skills {
+                action: SkillsAction::List,
+            },
+            ["show", name] => SlashCommand::Skills {
+                action: SkillsAction::Show((*name).to_string()),
+            },
+            ["add", dir] => SlashCommand::Skills {
+                action: SkillsAction::Add(std::path::PathBuf::from(dir)),
+            },
+            ["install", url, names @ ..] => SlashCommand::Skills {
+                action: SkillsAction::Install {
+                    url: (*url).to_string(),
+                    names: names.iter().map(|name| (*name).to_string()).collect(),
+                },
+            },
+            // Destructive: the flag is part of the grammar, not a later check.
+            ["remove", name, "--yes"] => SlashCommand::Skills {
+                action: SkillsAction::Remove {
+                    name: (*name).to_string(),
+                    confirmed: true,
+                },
+            },
+            ["path"] => SlashCommand::Skills {
+                action: SkillsAction::Path,
             },
             _ => SlashCommand::Unknown(trimmed.to_string()),
         },
@@ -381,6 +431,40 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         SlashCommand::Config { action } => {
             execute_config(app, action);
             CommandEffect::Handled
+        }
+        SlashCommand::Skills { action } => {
+            let workspace = std::path::Path::new(".");
+            match action {
+                SkillsAction::List => {
+                    app.push_notice(skills::render_list(&skills::list_report(workspace)));
+                    CommandEffect::Handled
+                }
+                SkillsAction::Path => {
+                    app.push_notice(skills::render_paths(workspace));
+                    CommandEffect::Handled
+                }
+                SkillsAction::Show(name) => {
+                    match skills::render_show(workspace, &name) {
+                        Ok(text) | Err(text) => app.push_notice(text),
+                    }
+                    CommandEffect::Handled
+                }
+                // The copy runs off the UI thread; the notice comes back as an action.
+                SkillsAction::Add(dir) => CommandEffect::SkillsAdd { dir },
+                SkillsAction::Install { url, names } => CommandEffect::SkillsFetch { url, names },
+                // The grammar already refuses a removal without `--yes`.
+                SkillsAction::Remove {
+                    name,
+                    confirmed: true,
+                } => CommandEffect::SkillsRemove { name },
+                SkillsAction::Remove {
+                    name,
+                    confirmed: false,
+                } => {
+                    app.push_notice(format!("Removing {name}: --yes is required."));
+                    CommandEffect::Handled
+                }
+            }
         }
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },

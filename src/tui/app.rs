@@ -70,6 +70,13 @@ pub enum ModalSelection {
     },
     /// One row per stored session, newest first: the order `/sessions <n>` reads.
     Session { rows: Vec<String>, selected: usize },
+    /// The skills a fetched repository offers; `marked` is what Enter installs.
+    Skills {
+        names: Vec<String>,
+        descriptions: Vec<String>,
+        selected: usize,
+        marked: Vec<bool>,
+    },
 }
 
 /// Cached markdown render of the whole transcript, invalidated by `revision`.
@@ -130,6 +137,9 @@ pub struct App<'a> {
     pub last_ctrl_c: Option<std::time::Instant>,
     /// The question the worker is blocked on, until the user answers it.
     pub pending_permission: Option<PendingPermission>,
+    /// The checkout the skill picker copied from; held so a candidate's source
+    /// outlives the pick, and dropped when the picker is cancelled.
+    pub pending_skills: Option<crate::cli::skills::Fetched>,
     /// The one store handle; `None` when persistence is off for this run.
     pub store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
     /// Session this transcript belongs to, `None` until the first prompt.
@@ -258,6 +268,7 @@ impl<'a> App<'a> {
             toast: None,
             last_ctrl_c: None,
             pending_permission: None,
+            pending_skills: None,
             store: None,
             session_id: None,
             persistence_error: None,

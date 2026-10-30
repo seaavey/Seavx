@@ -619,6 +619,42 @@ fn the_session_modal_highlights_the_selected_row() {
 }
 
 #[test]
+fn the_skill_picker_lists_candidates_and_their_marks() {
+    let mut app = test_app();
+    app.modal = Some(ModalSelection::Skills {
+        names: ["pdf", "charts", "deploy"].map(str::to_string).to_vec(),
+        descriptions: [
+            "Reads and fills PDF forms.",
+            "Draws a chart. It refuses to overwrite an existing image.",
+            "Ships the release.",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        selected: 1,
+        marked: vec![false, true, false],
+    });
+
+    let text = screen_of(&app);
+    for name in ["pdf", "charts", "deploy"] {
+        assert!(text.contains(name), "{name} is missing: {text}");
+    }
+    assert!(
+        text.contains("[x] charts"),
+        "the marked row is checked: {text}"
+    );
+    assert!(text.contains("[ ] pdf"), "an unmarked row is blank: {text}");
+    assert!(
+        text.contains("Install Skills 1/3"),
+        "the title counts the marks: {text}"
+    );
+    assert!(text.contains("Draws a chart"), "{text}");
+    assert!(
+        !text.contains("It refuses"),
+        "only the first sentence is drawn: {text}"
+    );
+}
+
+#[test]
 fn the_at_popup_tags_folders_and_files() {
     let mut app = test_app();
     app.input.insert_str("@src");

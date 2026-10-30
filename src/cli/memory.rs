@@ -5,8 +5,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agent::skills::SkillManager;
-
 /// Cap a single memory file at 200 lines or 16 KiB, whichever comes first.
 const MAX_LINES: usize = 200;
 const MAX_BYTES: usize = 16 * 1024;
@@ -16,7 +14,6 @@ pub enum MemoryView {
     All,
     Project,
     User,
-    Skills,
     Path,
 }
 
@@ -28,18 +25,9 @@ pub struct MemoryFile {
     pub total_lines: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct SkillSummary {
-    pub name: String,
-    pub description: String,
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
 pub struct MemoryReport {
     pub project: Option<MemoryFile>,
     pub user: Option<MemoryFile>,
-    pub skills: Vec<SkillSummary>,
 }
 
 /// Project memory candidates, highest precedence first.
@@ -72,26 +60,13 @@ pub fn build_report_with_home(workspace: &Path, home: Option<&Path>) -> MemoryRe
         .iter()
         .find_map(|path| read_memory_file(path));
 
-    let skills = SkillManager::new(workspace)
-        .list_skills()
-        .into_iter()
-        .map(|skill| SkillSummary {
-            name: skill.name,
-            description: skill.description,
-            path: skill.path,
-        })
-        .collect();
-
-    MemoryReport {
-        project,
-        user,
-        skills,
-    }
+    MemoryReport { project, user }
 }
 
 /// Read one candidate, capping it at [`MAX_LINES`] lines or [`MAX_BYTES`]
-/// bytes without splitting a UTF-8 character.
-fn read_memory_file(path: &Path) -> Option<MemoryFile> {
+/// bytes without splitting a UTF-8 character. Shared with `/skills show`, so
+/// a skill body and a memory file are cut by the same rule.
+pub(crate) fn read_memory_file(path: &Path) -> Option<MemoryFile> {
     if !path.exists() {
         return None;
     }
@@ -163,11 +138,6 @@ pub fn render_text(report: &MemoryReport, view: MemoryView) -> String {
             ".seavx/USER.md",
         ));
     }
-    // Skills are not memory: `show` answers "what does the agent remember",
-    // and a catalogue of installed skills pushed that off the screen.
-    if matches!(view, MemoryView::Skills) {
-        sections.push(render_skills(report));
-    }
     if matches!(view, MemoryView::Path) {
         sections.push(render_paths(report));
     }
@@ -195,32 +165,6 @@ fn render_file_section(heading: &str, file: Option<&MemoryFile>, hint: &str) -> 
                 "\n{heading}: not found\nThe agent can create one with the `save_memory` tool, or you can add {hint} manually."
             ));
         }
-    }
-    text
-}
-
-/// First sentence of a skill description, capped, so one skill is one row.
-fn one_line(description: &str) -> String {
-    let first = description.split(". ").next().unwrap_or(description).trim();
-    match first.char_indices().nth(100) {
-        Some((cut, _)) => format!("{}…", first[..cut].trim_end()),
-        None => first.to_string(),
-    }
-}
-
-fn render_skills(report: &MemoryReport) -> String {
-    let mut text = String::from("## Installed skills");
-    if report.skills.is_empty() {
-        text.push_str("\nNo skills installed.");
-        return text;
-    }
-    for skill in &report.skills {
-        text.push_str(&format!(
-            "\n- {}: {} ({})",
-            skill.name,
-            one_line(&skill.description),
-            display_path(&skill.path)
-        ));
     }
     text
 }

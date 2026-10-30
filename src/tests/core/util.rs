@@ -86,3 +86,21 @@ fn an_exported_form_of_the_key_is_rewritten_in_place() {
         "SEAVX_DEBUG=false\n"
     );
 }
+
+#[test]
+fn a_yaml_block_scalar_loses_its_marker_and_keeps_its_text() {
+    let folded = "---\ndescription: >\n  Multi-line folded text\n  that continues here.\nname: demo\n---\nbody";
+    assert_eq!(
+        frontmatter_value(folded, "description").as_deref(),
+        Some("Multi-line folded text that continues here.")
+    );
+
+    let literal = "---\ndescription: |-\n  Line one.\n  Line two.\n---";
+    assert_eq!(
+        frontmatter_value(literal, "description").as_deref(),
+        Some("Line one. Line two.")
+    );
+
+    // A marker with no body must not become the description.
+    assert_eq!(frontmatter_value("description: >\n", "description"), None);
+}

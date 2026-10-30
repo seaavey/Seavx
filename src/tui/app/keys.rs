@@ -190,6 +190,71 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                 }
                 _ => {}
             },
+            ModalSelection::Skills {
+                names,
+                descriptions,
+                selected,
+                mut marked,
+            } => match key.code {
+                // Cancelling drops the checkout: nothing is copied.
+                KeyCode::Esc => {
+                    app.modal = None;
+                    app.pending_skills = None;
+                }
+                KeyCode::Up => {
+                    let selected = prev_index(selected, names.len());
+                    app.modal = Some(ModalSelection::Skills {
+                        names,
+                        descriptions,
+                        selected,
+                        marked,
+                    });
+                }
+                KeyCode::Down => {
+                    let selected = next_index(selected, names.len());
+                    app.modal = Some(ModalSelection::Skills {
+                        names,
+                        descriptions,
+                        selected,
+                        marked,
+                    });
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(mark) = marked.get_mut(selected) {
+                        *mark = !*mark;
+                    }
+                    app.modal = Some(ModalSelection::Skills {
+                        names,
+                        descriptions,
+                        selected,
+                        marked,
+                    });
+                }
+                KeyCode::Char('a') => {
+                    marked.fill(true);
+                    app.modal = Some(ModalSelection::Skills {
+                        names,
+                        descriptions,
+                        selected,
+                        marked,
+                    });
+                }
+                KeyCode::Enter => {
+                    app.modal = None;
+                    let mut chosen: Vec<usize> = marked
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, mark)| **mark)
+                        .map(|(index, _)| index)
+                        .collect();
+                    // Nothing marked installs the row under the cursor.
+                    if chosen.is_empty() && selected < names.len() {
+                        chosen.push(selected);
+                    }
+                    let _ = tx.send(Action::SkillsInstallMarked(chosen));
+                }
+                _ => {}
+            },
         }
         return;
     }

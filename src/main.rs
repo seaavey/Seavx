@@ -67,6 +67,12 @@ enum Commands {
     /// Inspect agent memory
     Memory,
 
+    /// List, inspect, install or remove skills
+    Skills {
+        #[command(subcommand)]
+        command: Option<cli::skills::SkillsCommand>,
+    },
+
     /// List, show, resume or export stored sessions
     Sessions {
         #[command(subcommand)]
@@ -248,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Model { model, effort }) => cli::model::run(model, effort).await?,
         Some(Commands::Memory) => cli::memory::run()?,
+        Some(Commands::Skills { command }) => cli::skills::run(command)?,
         Some(Commands::Sessions { command }) => cli::sessions::run(command).await?,
         Some(Commands::Resume { id }) => cli::sessions::run_resume(id).await?,
         Some(Commands::Update { force }) => cli::update::run(force).await?,

@@ -88,6 +88,12 @@ fn every_registry_entry_parses_to_a_handled_command() {
                 view: MemoryView::All,
             },
         ),
+        (
+            "/skills",
+            SlashCommand::Skills {
+                action: SkillsAction::List,
+            },
+        ),
         ("/undo", SlashCommand::Undo),
         ("/sessions", SlashCommand::Sessions { index: None }),
         ("/resume", SlashCommand::Sessions { index: None }),
@@ -133,6 +139,7 @@ fn every_handled_command_appears_in_the_registry() {
         "/init",
         "/doctor",
         "/memory",
+        "/skills",
         "/undo",
         "/sessions",
         "/resume",
@@ -175,6 +182,9 @@ fn every_handled_command_appears_in_the_registry() {
         SlashCommand::Memory {
             view: MemoryView::Path,
         },
+        SlashCommand::Skills {
+            action: SkillsAction::Path,
+        },
         SlashCommand::Undo,
         SlashCommand::Exit,
     ];
@@ -209,6 +219,7 @@ fn the_palette_is_the_table() {
             "/init",
             "/doctor",
             "/memory",
+            "/skills",
             "/undo",
             "/sessions",
             "/resume",
@@ -348,6 +359,80 @@ fn parses_memory_views() {
         parse("/memory nope"),
         Some(SlashCommand::Unknown("/memory nope".into()))
     );
+}
+
+#[test]
+fn parses_skills_actions() {
+    let list = Some(SlashCommand::Skills {
+        action: SkillsAction::List,
+    });
+    assert_eq!(parse("/skills"), list);
+    assert_eq!(parse("/skills list"), list);
+    assert_eq!(
+        parse("/skills install https://github.com/anthropics/skills"),
+        Some(SlashCommand::Skills {
+            action: SkillsAction::Install {
+                url: "https://github.com/anthropics/skills".into(),
+                names: Vec::new(),
+            }
+        })
+    );
+    assert_eq!(
+        parse("/skills install https://example.test/repo pdf docx"),
+        Some(SlashCommand::Skills {
+            action: SkillsAction::Install {
+                url: "https://example.test/repo".into(),
+                names: vec!["pdf".into(), "docx".into()],
+            }
+        })
+    );
+    assert_eq!(
+        parse("/skills install"),
+        Some(SlashCommand::Unknown("/skills install".into())),
+        "a fetch needs a URL"
+    );
+    assert_eq!(
+        parse("/skills path"),
+        Some(SlashCommand::Skills {
+            action: SkillsAction::Path
+        })
+    );
+    assert_eq!(
+        parse("/skills show demo"),
+        Some(SlashCommand::Skills {
+            action: SkillsAction::Show("demo".into())
+        })
+    );
+    assert_eq!(
+        parse("/skills add ../demo"),
+        Some(SlashCommand::Skills {
+            action: SkillsAction::Add(std::path::PathBuf::from("../demo"))
+        })
+    );
+    assert_eq!(
+        parse("/skills remove demo --yes"),
+        Some(SlashCommand::Skills {
+            action: SkillsAction::Remove {
+                name: "demo".into(),
+                confirmed: true,
+            }
+        })
+    );
+
+    // A wrong shape is an error, never silently ignored.
+    for raw in [
+        "/skills show",
+        "/skills add",
+        "/skills remove demo",
+        "/skills remove demo --force",
+        "/skills nope",
+    ] {
+        assert_eq!(
+            parse(raw),
+            Some(SlashCommand::Unknown(raw.into())),
+            "{raw} should not parse"
+        );
+    }
 }
 
 #[test]

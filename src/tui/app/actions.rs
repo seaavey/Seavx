@@ -1,11 +1,11 @@
 use tokio::sync::mpsc;
 
 use super::store::lock_store;
-use super::{App, PendingPermission};
+use super::{App, ModalSelection, PendingPermission};
 use crate::tui::event::{Action, AgentState};
 
 /// Apply one result the loop did not route to a key or mouse handler.
-pub(super) fn apply(app: &mut App, action: Action, _tx: &mpsc::UnboundedSender<Action>) {
+pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Action>) {
     match action {
         // Routed by `run`: the loop needs the terminal for these three.
         Action::Tick => {}
@@ -114,6 +114,89 @@ pub(super) fn apply(app: &mut App, action: Action, _tx: &mpsc::UnboundedSender<A
                 }
                 Err(error) => app.push_notice(format!("Undo failed: {error}")),
             }
+        }
+        Action::SkillsInstalled(result) => {
+            app.status = AgentState::Idle;
+            match result {
+                Ok(path) => app.push_notice(format!("Installed skill at {}", path.display())),
+                Err(error) => app.push_notice(format!("Install failed: {error}")),
+            }
+        }
+        Action::SkillsRemoved(result) => {
+            app.status = AgentState::Idle;
+            match result {
+                Ok(path) => app.push_notice(format!("Removed skill at {}", path.display())),
+                Err(error) => app.push_notice(format!("Remove failed: {error}")),
+            }
+        }
+        Action::SkillsInstallMarked(indices) => {
+            let Some(fetched) = app.pending_skills.take() else {
+                app.push_notice("The fetched skills are gone; run /skills install again.");
+                return;
+            };
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            let root = app.root.clone();
+            // The copies walk a checkout: they stay off the UI thread.
+            tokio::task::spawn_blocking(move || {
+                let results = indices
+                    .into_iter()
+                    .map(|index| {
+                        let name = fetched
+                            .candidates
+                            .get(index)
+                            .map(|candidate| candidate.name.clone())
+                            .unwrap_or_else(|| format!("#{}", index + 1));
+                        (name, fetched.install(&root, index))
+                    })
+                    .collect();
+                let _ = tx.send(Action::SkillsInstalledBatch(results));
+            });
+        }
+        Action::SkillsFetched(result) => {
+            app.status = AgentState::Idle;
+            match result {
+                Ok(fetched) if fetched.candidates.is_empty() => {
+                    app.push_notice("No skills with a SKILL.md in that repository.")
+                }
+                Ok(fetched) => {
+                    let names: Vec<String> =
+                        fetched.candidates.iter().map(|c| c.name.clone()).collect();
+                    let descriptions: Vec<String> = fetched
+                        .candidates
+                        .iter()
+                        .map(|c| c.description.clone())
+                        .collect();
+                    let marked = vec![false; names.len()];
+                    app.pending_skills = Some(fetched);
+                    app.modal = Some(ModalSelection::Skills {
+                        names,
+                        descriptions,
+                        selected: 0,
+                        marked,
+                    });
+                }
+                Err(error) => app.push_notice(format!("Fetch failed: {error}")),
+            }
+        }
+        Action::SkillsInstalledBatch(results) => {
+            app.status = AgentState::Idle;
+            let mut text = String::new();
+            let mut installed = 0;
+            for (name, result) in &results {
+                match result {
+                    Ok(path) => {
+                        installed += 1;
+                        text.push_str(&format!("installed {name} at {}\n", path.display()));
+                    }
+                    Err(reason) => text.push_str(&format!("refused {name}: {reason}\n")),
+                }
+            }
+            text.push_str(&format!(
+                "{installed} of {} skill(s) installed.",
+                results.len()
+            ));
+            app.push_notice(text);
         }
         Action::CompactDone { result } => {
             app.status = AgentState::Idle;

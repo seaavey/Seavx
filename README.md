@@ -123,6 +123,16 @@ seavx resume                 # list them and pick a number
 seavx resume svx-2f124b69    # same as sessions resume
 ```
 
+Skills have a CLI surface too; the interactive picker stays in the TUI (`/skills install <url>`):
+
+```bash
+seavx skills                          # every skill your roots can load, with the owning root
+seavx skills install https://github.com/anthropics/skills   # what that repository holds
+seavx skills install https://github.com/anthropics/skills pdf docx   # install two of them
+seavx skills add ../my-skill          # copy a local directory that has SKILL.md
+seavx skills remove pdf --yes         # immediate, refuses a symlinked copy
+```
+
 Retention: sessions are not pruned (roughly 1 KB per turn). To delete, stop
 Seavx and remove the database: `rm ~/.seavx/sessions.db*`. To back up, copy
 `sessions.db` with its `-wal` and `-shm` files while Seavx is closed, or run
@@ -258,7 +268,8 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/help`                                       | Show help and the command palette.                                                                                                                                                                                        |
 | `/init`                                       | Create `.seavx/config.toml` with defaults.                                                                                                                                                                                |
 | `/doctor [--offline]`                         | Check config, key, endpoint, cache, workspace, memory, and skills. The session check opens the database read-only, never creates it, and warns when its schema version or payload format is not the one this build reads. |
-| `/memory [show\|project\|user\|skills\|path]` | Inspect persistent memory and installed skills.                                                                                                                                                                           |
+| `/memory [show\|project\|user\|path]` | Inspect persistent memory.                                                                                                                                                                                                                                   |
+| `/skills [list\|show <name>\|add <dir>\|install <url> [name...]\|remove <name> --yes\|path]` | List, inspect, install (from a directory or a git repository) or remove skills.                                                                                                                                                              |
 | `/undo`                                       | Restore files from the newest checkpoint and remove it; repeat to walk back. A file edited after the agent wrote it is left alone and named, so undo never overwrites newer work.                                         |
 | `/sessions [number]`                          | Pick a stored session with the arrow keys, or resume one by its number directly.                                                                                                                                          |
 | `/resume [number]`                            | Alias for `/sessions`.                                                                                                                                                                                                    |

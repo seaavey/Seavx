@@ -39,6 +39,13 @@ pub enum Action {
         result: Result<crate::tui::compact::CompactResult, String>,
     },
     UndoDone(Result<Vec<std::path::PathBuf>, String>),
+    SkillsInstalled(Result<std::path::PathBuf, String>),
+    SkillsRemoved(Result<std::path::PathBuf, String>),
+    /// The picker's Enter: the indices to install from the pending checkout.
+    SkillsInstallMarked(Vec<usize>),
+    /// One row per picked skill: its name and where it landed, or why not.
+    SkillsInstalledBatch(Vec<(String, Result<std::path::PathBuf, String>)>),
+    SkillsFetched(Result<crate::cli::skills::Fetched, String>),
     /// `/sessions`: the numbered list, or the reason it could not be read.
     /// `/sessions <n>`: the session to open, or the refusal with its reason.
     SessionResume(Result<crate::session::LoadedSession, String>),
