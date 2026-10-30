@@ -1,7 +1,8 @@
+use crate::agent::events::{AgentEvent, FailureKind, SUMMARY_LIMIT, ToolEvent, ToolStatus};
 use crate::session::{
-    INTERRUPTED_RESULT, LoadedSession, MessageStatus, PAYLOAD_FORMAT, RESUME_BUDGET_BYTES,
-    SCHEMA_VERSION, SessionError, SessionStore, StoredMessage, TurnState, WRITE_BUDGET,
-    export_json, render_text, replay,
+    INTERRUPTED_RESULT, LoadedSession, MessageStatus, NewEvent, PAYLOAD_FORMAT,
+    RESUME_BUDGET_BYTES, SCHEMA_VERSION, SessionError, SessionStore, StoredMessage, TurnState,
+    WRITE_BUDGET, export_json, render_text, replay,
 };
 use genai::chat::{ChatMessage, MessageContent, ToolCall, ToolResponse};
 
@@ -1290,4 +1291,280 @@ fn a_v1_file_gains_a_slug_for_every_existing_row() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
+}
+
+/// The table set a 0.1.2 binary wrote: v2 is this database without
+/// `agent_events`. Written out rather than taken from `SCHEMA`, which is now v3
+/// and would pre-create the table the migration is supposed to add.
+const V2_SCHEMA: &str = "
+CREATE TABLE sessions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL DEFAULT '',
+    workspace TEXT NOT NULL,
+    title TEXT,
+    model TEXT,
+    payload_format TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active','ended')),
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE messages(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'complete'
+        CHECK(status IN ('complete','partial','cancelled','interrupted')),
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(session_id, seq)
+);
+CREATE UNIQUE INDEX sessions_slug ON sessions(slug) WHERE slug <> '';
+CREATE INDEX messages_session_seq ON messages(session_id, seq);
+CREATE INDEX sessions_workspace_updated ON sessions(workspace, updated_at DESC);
+";
+
+#[test]
+fn events_append_with_monotonic_per_session_sequence_and_survive_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let (first, second) = {
+        let store = SessionStore::open_at(&path).unwrap();
+        let first = store.create("ws", None, Some("first")).unwrap();
+        let second = store.create("ws", None, Some("second")).unwrap();
+        let mut seqs = Vec::new();
+        for status in [
+            ToolStatus::Queued,
+            ToolStatus::Running,
+            ToolStatus::Completed,
+        ] {
+            seqs.push(
+                store
+                    .record_event(
+                        first,
+                        NewEvent {
+                            turn_id: 1,
+                            kind: "tool",
+                            status: status.as_str(),
+                            failure: None,
+                            tool_call_id: Some("call-1"),
+                            summary: "read_file(note.txt)",
+                            pid: None,
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(seqs, vec![1, 2, 3], "one sequence per session");
+        let other = store
+            .record_event(
+                second,
+                NewEvent {
+                    turn_id: 1,
+                    kind: "turn",
+                    status: "completed",
+                    failure: None,
+                    tool_call_id: None,
+                    summary: "",
+                    pid: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(other, 1, "a second session numbers its own events");
+        (first, second)
+    };
+
+    let store = SessionStore::open_at(&path).unwrap();
+    let stored = store.events(first).unwrap();
+    assert_eq!(
+        stored.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the database order survives a reopen"
+    );
+    assert_eq!(stored[0].status, "queued");
+    assert_eq!(stored[2].status, "completed");
+    assert_eq!(stored[0].kind, "tool");
+    assert_eq!(stored[0].tool_call_id.as_deref(), Some("call-1"));
+    assert_eq!(stored[0].turn_id, 1);
+    assert_eq!(stored[0].summary, "read_file(note.txt)");
+    assert_eq!(stored[0].failure, None);
+    assert_eq!(store.events(second).unwrap().len(), 1);
+    assert!(
+        store.events(999).unwrap().is_empty(),
+        "no rows for no session"
+    );
+}
+
+#[test]
+fn event_summaries_are_redacted_and_limited_at_the_store_boundary() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let session = store.create("ws", None, None).unwrap();
+
+    let long = "é".repeat(900);
+    store
+        .record_event(
+            session,
+            NewEvent {
+                turn_id: 1,
+                kind: "tool",
+                status: "queued",
+                failure: None,
+                tool_call_id: Some("call-1"),
+                summary: &long,
+                pid: None,
+            },
+        )
+        .unwrap();
+    let capped = &store.events(session).unwrap()[0].summary;
+    assert_eq!(capped.chars().count(), SUMMARY_LIMIT + 1);
+    assert!(capped.ends_with('…'));
+
+    store
+        .record_event(
+            session,
+            NewEvent {
+                turn_id: 1,
+                kind: "tool",
+                status: "failed",
+                failure: Some("tool"),
+                tool_call_id: Some("call-2"),
+                summary: "run_command(curl -H 'Authorization: Bearer sk-live-4f3c2b1a')",
+                pid: None,
+            },
+        )
+        .unwrap();
+    let masked = &store.events(session).unwrap()[1].summary;
+    assert!(!masked.contains("sk-live-4f3c2b1a"), "{masked}");
+}
+
+#[test]
+fn only_lifecycle_events_are_durable_and_they_map_to_their_rows() {
+    let tool = AgentEvent::Tool(ToolEvent {
+        call_id: "call-7".to_string(),
+        name: "run_command".to_string(),
+        summary: "run_command(ls)".to_string(),
+        status: ToolStatus::Failed,
+        failure: Some(FailureKind::PermissionDenied),
+        started_at: 1,
+        elapsed: Some(std::time::Duration::from_millis(12)),
+    });
+    let row = NewEvent::from_event(3, &tool).expect("a tool transition is durable");
+    assert_eq!(row.turn_id, 3);
+    assert_eq!(row.kind, "tool");
+    assert_eq!(row.status, "failed");
+    assert_eq!(row.failure, Some("permission_denied"));
+    assert_eq!(row.tool_call_id, Some("call-7"));
+    assert_eq!(row.summary, "run_command(ls)");
+    assert_eq!(row.pid, None);
+
+    let turn = AgentEvent::Turn {
+        status: crate::agent::cancel::TurnStatus::Cancelled,
+        failure: Some(FailureKind::CleanupUnconfirmed),
+        cleanup: Some(crate::agent::cancel::Cleanup::Unconfirmed),
+        pid: Some(4242),
+    };
+    let row = NewEvent::from_event(3, &turn).expect("a turn outcome is durable");
+    assert_eq!(row.kind, "turn");
+    assert_eq!(row.status, "cancelled");
+    assert_eq!(row.failure, Some("cleanup_unconfirmed"));
+    assert_eq!(row.pid, Some(4242));
+
+    // Presentation is not trace.
+    for event in [
+        AgentEvent::Token("a".to_string()),
+        AgentEvent::Thinking("b".to_string()),
+        AgentEvent::Notice("c".to_string()),
+        AgentEvent::Usage {
+            total_tokens: 1,
+            prompt_tokens: 1,
+        },
+    ] {
+        assert!(NewEvent::from_event(1, &event).is_none(), "{event:?}");
+    }
+}
+
+#[test]
+fn a_v2_database_fixture_migrates_to_v3_and_keeps_its_messages() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    let user = serde_json::to_string(&ChatMessage::user("old prompt")).unwrap();
+    let answer = serde_json::to_string(&ChatMessage::assistant("old answer")).unwrap();
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(V2_SCHEMA).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 2;")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(slug, workspace, title, model, payload_format, status, created_at, updated_at)
+                 VALUES ('svx-old', 'ws', 'old session', 'm', ?1, 'active', 1, 1)",
+                [PAYLOAD_FORMAT],
+            )
+            .unwrap();
+        for (seq, role, payload) in [(1, "user", &user), (2, "assistant", &answer)] {
+            connection
+                .execute(
+                    "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+                     VALUES (1, ?1, ?2, 'complete', ?3, 1)",
+                    rusqlite::params![seq, role, payload],
+                )
+                .unwrap();
+        }
+    }
+
+    let store = SessionStore::open_at(&path).expect("a v2 file opens");
+    let version: u32 = store
+        .connection()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+
+    let payloads: Vec<String> = store
+        .connection()
+        .prepare("SELECT payload FROM messages ORDER BY seq")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![user, answer],
+        "the transcript bytes are kept"
+    );
+
+    let loaded = store.load(1).expect("the stored turn is readable");
+    assert_eq!(loaded.title.as_deref(), Some("old session"));
+    let texts: Vec<String> = replay(&loaded)
+        .history
+        .iter()
+        .filter_map(|message| message.content.first_text().map(str::to_string))
+        .collect();
+    assert_eq!(texts, vec!["old prompt", "old answer"]);
+
+    store
+        .record_event(
+            1,
+            NewEvent {
+                turn_id: 1,
+                kind: "turn",
+                status: "completed",
+                failure: None,
+                tool_call_id: None,
+                summary: "",
+                pid: None,
+            },
+        )
+        .expect("the new table accepts a row after the migration");
+    assert_eq!(store.events(1).unwrap().len(), 1);
+
+    // The transcript is still writable through the old path.
+    store
+        .record_message(1, &ChatMessage::user("new prompt"), MessageStatus::Complete)
+        .unwrap();
+    assert_eq!(row_count(&store), 3);
 }

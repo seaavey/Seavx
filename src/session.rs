@@ -15,8 +15,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// `ChatMessage` shape; a mismatch opens the session read-only.
 pub const PAYLOAD_FORMAT: &str = "genai-chat-v1";
 /// Schema version this build understands. 2 added the `slug` column; `migrate`
-/// adds it to a v1 file and names every existing row.
-pub const SCHEMA_VERSION: u32 = 2;
+/// adds it to a v1 file and names every existing row. 3 added the `agent_events`
+/// ledger, which every older file gains in the same transaction.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Total budget for one write: three attempts, 100 ms and 200 ms waits.
 pub const WRITE_BUDGET: Duration = Duration::from_secs(5);
@@ -92,6 +93,71 @@ pub struct StoredMessage {
     pub role: String,
     pub status: MessageStatus,
     pub payload: String,
+    pub created_at: i64,
+}
+
+/// One row of the execution trace, before it is stored. Only the lifecycle
+/// carries durable text: the summary is redacted and bounded here, at the trust
+/// boundary, so no caller can write raw arguments or output through it.
+pub struct NewEvent<'a> {
+    pub turn_id: u64,
+    /// `"tool"` or `"turn"`.
+    pub kind: &'a str,
+    pub status: &'a str,
+    pub failure: Option<&'a str>,
+    pub tool_call_id: Option<&'a str>,
+    pub summary: &'a str,
+    /// Only set on a turn row whose process-tree cleanup was not confirmed.
+    pub pid: Option<u32>,
+}
+
+impl<'a> NewEvent<'a> {
+    /// `None` for the presentation events: a streamed token is not a trace.
+    pub fn from_event(turn_id: u64, event: &'a crate::agent::events::AgentEvent) -> Option<Self> {
+        use crate::agent::events::AgentEvent;
+        match event {
+            AgentEvent::Tool(tool) => Some(Self {
+                turn_id,
+                kind: "tool",
+                status: tool.status.as_str(),
+                failure: tool.failure.map(|failure| failure.as_str()),
+                tool_call_id: Some(&tool.call_id),
+                summary: &tool.summary,
+                pid: None,
+            }),
+            AgentEvent::Turn {
+                status,
+                failure,
+                pid,
+                ..
+            } => Some(Self {
+                turn_id,
+                kind: "turn",
+                status: status.as_str(),
+                failure: failure.map(|failure| failure.as_str()),
+                tool_call_id: None,
+                summary: "",
+                pid: *pid,
+            }),
+            AgentEvent::Token(_)
+            | AgentEvent::Thinking(_)
+            | AgentEvent::Notice(_)
+            | AgentEvent::Usage { .. } => None,
+        }
+    }
+}
+
+/// One stored trace row. `seq` is the order, never the wall clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub seq: i64,
+    pub turn_id: u64,
+    pub kind: String,
+    pub status: String,
+    pub failure: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub summary: String,
+    pub pid: Option<u32>,
     pub created_at: i64,
 }
 
@@ -455,6 +521,21 @@ CREATE TABLE IF NOT EXISTS messages(
 );
 CREATE INDEX IF NOT EXISTS messages_session_seq ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS sessions_workspace_updated ON sessions(workspace, updated_at DESC);
+CREATE TABLE IF NOT EXISTS agent_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    turn_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('tool','turn')),
+    status TEXT NOT NULL,
+    failure TEXT,
+    tool_call_id TEXT,
+    summary TEXT NOT NULL DEFAULT '',
+    pid INTEGER,
+    created_at INTEGER NOT NULL,
+    UNIQUE(session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS agent_events_session_seq ON agent_events(session_id, seq);
 ";
 
 #[derive(Debug)]
@@ -979,6 +1060,76 @@ impl SessionStore {
                 }
             }
         })
+    }
+
+    /// Append one trace row and return its per-session `seq`. `seq` is allocated
+    /// inside the insert's transaction, so two writers cannot share a number.
+    pub fn record_event(&self, session: i64, event: NewEvent<'_>) -> Result<i64, SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        // The last gate before the database: a caller that forgot to redact
+        // cannot store a credential or an unbounded payload.
+        let summary = crate::agent::events::bounded(
+            &crate::agent::security::redact(event.summary),
+            crate::agent::events::SUMMARY_LIMIT,
+        );
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let inserted = (|| {
+                connection.execute(
+                    "INSERT INTO agent_events(session_id, seq, turn_id, kind, status, failure, tool_call_id, summary, pid, created_at)
+                     SELECT ?1, COALESCE(MAX(seq), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                     FROM agent_events WHERE session_id = ?1",
+                    params![
+                        session,
+                        event.turn_id,
+                        event.kind,
+                        event.status,
+                        event.failure,
+                        event.tool_call_id,
+                        summary,
+                        event.pid,
+                        now
+                    ],
+                )?;
+                connection.query_row(
+                    "SELECT seq FROM agent_events WHERE id = last_insert_rowid()",
+                    [],
+                    |row| row.get(0),
+                )
+            })();
+            match inserted {
+                Ok(seq) => {
+                    connection.execute_batch("COMMIT")?;
+                    Ok(seq)
+                }
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    /// The stored trace for one session, in database order.
+    pub fn events(&self, session: i64) -> Result<Vec<StoredEvent>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT seq, turn_id, kind, status, failure, tool_call_id, summary, pid, created_at
+             FROM agent_events WHERE session_id = ?1 ORDER BY seq",
+        )?;
+        let rows = statement.query_map([session], |row| {
+            Ok(StoredEvent {
+                seq: row.get(0)?,
+                turn_id: row.get(1)?,
+                kind: row.get(2)?,
+                status: row.get(3)?,
+                failure: row.get(4)?,
+                tool_call_id: row.get(5)?,
+                summary: row.get(6)?,
+                pid: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// The single retry table: 3 attempts, 100/200 ms waits, one deadline
