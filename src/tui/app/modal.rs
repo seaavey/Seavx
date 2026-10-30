@@ -103,23 +103,14 @@ impl App<'_> {
         }
     }
 
-    /// Open the session picker from this store's listing for the current
-    /// workspace. Returns `false` when there is nothing to pick, so the caller
-    /// can say so instead of opening an empty modal.
-    pub fn open_session_picker(&mut self, store: &crate::session::SessionStore) -> bool {
-        let rows = match crate::cli::sessions::session_rows(store, &crate::session::workspace_key())
-        {
-            Ok(rows) if rows.is_empty() => {
-                self.push_notice("No sessions yet. Start one by sending a prompt.");
-                return false;
-            }
-            Ok(rows) => rows,
-            Err(error) => {
-                self.push_notice(format!("Sessions unavailable: {error}"));
-                return false;
-            }
-        };
-
+    /// Open the session picker on rows already read off the event loop.
+    /// Returns `false` when there is nothing to pick, so the caller can say so
+    /// instead of opening an empty modal.
+    pub fn show_session_picker(&mut self, rows: Vec<String>) -> bool {
+        if rows.is_empty() {
+            self.push_notice("No sessions yet. Start one by sending a prompt.");
+            return false;
+        }
         self.modal = Some(ModalSelection::Session { rows, selected: 0 });
         true
     }

@@ -946,8 +946,10 @@ fn the_resume_picker_lists_this_workspaces_sessions_newest_first() {
     let workspace = crate::session::workspace_key();
     let mut app = test_app();
 
+    // The rows the effect reads off the event loop, then hands to the app.
+    let rows = crate::cli::sessions::session_rows(&store, &workspace).unwrap();
     assert!(
-        !app.open_session_picker(&store),
+        !app.show_session_picker(rows),
         "an empty store opens no modal"
     );
     assert!(app.modal.is_none());
@@ -956,7 +958,8 @@ fn the_resume_picker_lists_this_workspaces_sessions_newest_first() {
         crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt).unwrap();
     }
 
-    assert!(app.open_session_picker(&store));
+    let rows = crate::cli::sessions::session_rows(&store, &workspace).unwrap();
+    assert!(app.show_session_picker(rows));
     let Some(ModalSelection::Session { rows, selected }) = app.modal.clone() else {
         panic!("expected the session picker, got {:?}", app.modal);
     };

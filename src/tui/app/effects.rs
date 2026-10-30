@@ -445,12 +445,19 @@ pub(super) fn apply_command_effect(
                 });
             }
         }
-        CommandEffect::OpenSessionPicker => match crate::session::SessionStore::open() {
-            Ok(store) => {
-                app.open_session_picker(&store);
-            }
-            Err(error) => app.push_notice(format!("Sessions unavailable: {error}")),
-        },
+        CommandEffect::OpenSessionPicker => {
+            // The listing is a SQLite read: same off-thread path as every other
+            // store call, so opening the picker cannot freeze the input thread.
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            let workspace = crate::session::workspace_key();
+            tokio::task::spawn_blocking(move || {
+                let rows = crate::session::SessionStore::open()
+                    .map_err(|error| error.to_string())
+                    .and_then(|store| crate::cli::sessions::session_rows(&store, &workspace));
+                let _ = tx.send(Action::SessionPickerOpened(rows));
+            });
+        }
         CommandEffect::RunUndo => {
             app.status = AgentState::Checking;
             let tx = tx.clone();

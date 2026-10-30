@@ -59,6 +59,8 @@ pub enum Action {
     /// `/sessions`: the numbered list, or the reason it could not be read.
     /// `/sessions <n>`: the session to open, or the refusal with its reason.
     SessionResume(Result<crate::session::LoadedSession, String>),
+    /// The picker's rows, read off the event loop.
+    SessionPickerOpened(Result<Vec<String>, String>),
     /// A tool call needs an answer. The worker blocks on `reply`; dropping it
     /// (quit, panic) resolves as a denial.
     /// A clarification, already persisted; the reply resolves it once.

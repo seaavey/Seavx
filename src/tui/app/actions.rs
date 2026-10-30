@@ -263,6 +263,15 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                 Err(error) => app.push_notice(error),
             }
         }
+        Action::SessionPickerOpened(result) => {
+            app.status = AgentState::Idle;
+            match result {
+                Ok(rows) => {
+                    app.show_session_picker(rows);
+                }
+                Err(error) => app.push_notice(format!("Sessions unavailable: {error}")),
+            }
+        }
         Action::TestProposed {
             command,
             evidence,
