@@ -28,7 +28,7 @@ fn fixture() -> (tempfile::TempDir, SessionStore) {
 fn list_renders_columns_and_an_empty_message() {
     let (_dir, store) = fixture();
 
-    let text = list_text(&store, "/x").unwrap();
+    let text = list_text(&store, "/x", false).unwrap();
     let header = text.lines().next().unwrap();
     assert!(
         header.starts_with("slug"),
@@ -44,7 +44,7 @@ fn list_renders_columns_and_an_empty_message() {
     assert!(!text.contains("elsewhere"), "workspace filtered: {text}");
 
     assert_eq!(
-        list_text(&store, "/nowhere").unwrap(),
+        list_text(&store, "/nowhere", false).unwrap(),
         "No sessions yet for /nowhere.\n"
     );
 
@@ -230,4 +230,54 @@ fn show_without_events_is_byte_identical_to_the_plain_transcript() {
     );
     assert!(!plain.contains("completed"), "{plain}");
     assert!(plain.contains("older prompt"), "{plain}");
+}
+
+#[test]
+fn fork_archive_and_search_are_reachable_from_the_cli() {
+    use crate::cli::sessions::search_text;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create("/ws", None, Some("token parser")).unwrap();
+    let message = genai::chat::ChatMessage::user("look at the lexer");
+    store
+        .record_message(id, &message, MessageStatus::Complete)
+        .unwrap();
+
+    let hits = search_text(&store, "/ws", "lexer", false).unwrap();
+    assert!(hits.contains("token parser"), "{hits}");
+    assert!(
+        search_text(&store, "/ws", "missing", false)
+            .unwrap()
+            .contains("No session matches")
+    );
+
+    store.archive("/ws", id, true).unwrap();
+    assert!(
+        list_text(&store, "/ws", false)
+            .unwrap()
+            .contains("No sessions yet")
+    );
+    assert!(
+        list_text(&store, "/ws", true)
+            .unwrap()
+            .contains("token parser")
+    );
+    assert!(
+        search_text(&store, "/ws", "lexer", false)
+            .unwrap()
+            .contains("No session matches")
+    );
+    assert!(
+        search_text(&store, "/ws", "lexer", true)
+            .unwrap()
+            .contains("token parser")
+    );
+
+    store.archive("/ws", id, false).unwrap();
+    assert!(
+        list_text(&store, "/ws", false)
+            .unwrap()
+            .contains("token parser")
+    );
 }

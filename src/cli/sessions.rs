@@ -10,7 +10,37 @@ use crate::session::{LoadedSession, SessionError, SessionStore, TurnState};
 #[derive(Subcommand, Debug)]
 pub enum SessionsCommand {
     /// List this workspace's sessions, newest first
-    List,
+    List {
+        /// Include archived sessions
+        #[arg(long)]
+        all: bool,
+    },
+    /// Copy a session's completed prefix into a new independent session
+    Fork {
+        /// Session id, `svx-…` (a bare number still works)
+        id: String,
+        /// Copy only up to this message sequence (default: the newest turn)
+        #[arg(long)]
+        at: Option<i64>,
+    },
+    /// Hide a session from the default list without deleting it
+    Archive {
+        /// Session id, `svx-…` (a bare number still works)
+        id: String,
+    },
+    /// Bring an archived session back into the default list
+    Unarchive {
+        /// Session id, `svx-…` (a bare number still works)
+        id: String,
+    },
+    /// Search this workspace's session titles and messages
+    Search {
+        /// Literal text to look for
+        query: String,
+        /// Include archived sessions
+        #[arg(long)]
+        all: bool,
+    },
     /// Print one session's transcript
     Show {
         /// Session id, `svx-…` (a bare number still works)
@@ -36,10 +66,40 @@ pub async fn run(command: SessionsCommand) -> anyhow::Result<()> {
     let workspace = crate::session::workspace_key();
 
     match command {
-        SessionsCommand::List => {
+        SessionsCommand::List { all } => {
             print!(
                 "{}",
-                list_text(&store, &workspace).map_err(anyhow::Error::msg)?
+                list_text(&store, &workspace, all).map_err(anyhow::Error::msg)?
+            );
+        }
+        SessionsCommand::Fork { id, at } => {
+            let id = resolve(&store, &id)?;
+            let forked = store.fork(&workspace, id, at).map_err(anyhow::Error::msg)?;
+            let loaded = store.load(forked).map_err(anyhow::Error::msg)?;
+            println!(
+                "Forked session {id} into {} ({} messages).",
+                loaded.slug,
+                loaded.messages.len()
+            );
+        }
+        SessionsCommand::Archive { id } => {
+            let id = resolve(&store, &id)?;
+            store
+                .archive(&workspace, id, true)
+                .map_err(anyhow::Error::msg)?;
+            println!("Archived session {id}. It is hidden, not deleted.");
+        }
+        SessionsCommand::Unarchive { id } => {
+            let id = resolve(&store, &id)?;
+            store
+                .archive(&workspace, id, false)
+                .map_err(anyhow::Error::msg)?;
+            println!("Unarchived session {id}.");
+        }
+        SessionsCommand::Search { query, all } => {
+            print!(
+                "{}",
+                search_text(&store, &workspace, &query, all).map_err(anyhow::Error::msg)?
             );
         }
         SessionsCommand::Show { id, events } => {
@@ -165,12 +225,18 @@ pub fn session_rows(store: &SessionStore, workspace: &str) -> Result<Vec<String>
 }
 
 /// `slug / age / msgs / state / title`, newest first; an empty workspace says so.
-pub fn list_text(store: &SessionStore, workspace: &str) -> Result<String, String> {
-    let summaries = store.list(workspace).map_err(|error| error.to_string())?;
+pub fn list_text(store: &SessionStore, workspace: &str, all: bool) -> Result<String, String> {
+    let summaries = store
+        .list_with_archived(workspace, all)
+        .map_err(|error| error.to_string())?;
     if summaries.is_empty() {
         return Ok(format!("No sessions yet for {workspace}.\n"));
     }
+    Ok(summary_table(&summaries))
+}
 
+/// The one table both `/sessions` and the search print.
+fn summary_table(summaries: &[crate::session::SessionSummary]) -> String {
     let now = crate::util::epoch_secs() as i64;
     let rows: Vec<[String; 5]> = summaries
         .iter()
@@ -212,7 +278,7 @@ pub fn list_text(store: &SessionStore, workspace: &str) -> Result<String, String
     for row in &rows {
         line([&row[0], &row[1], &row[2], &row[3], row[4].as_str()]);
     }
-    Ok(out)
+    out
 }
 
 /// The TUI's `/sessions` list: numbered in the order `resume <n>` reads.
@@ -271,6 +337,23 @@ pub fn resume_by_number(
 
 /// Full transcript with the header the spec asks for: id, title, model,
 /// payload format and usage.
+/// Search hits, in the same table the list uses.
+pub fn search_text(
+    store: &SessionStore,
+    workspace: &str,
+    query: &str,
+    all: bool,
+) -> Result<String, String> {
+    const LIMIT: usize = 50;
+    let summaries = store
+        .search(workspace, query, all, LIMIT)
+        .map_err(|error| error.to_string())?;
+    if summaries.is_empty() {
+        return Ok(format!("No session matches '{query}' in {workspace}.\n"));
+    }
+    Ok(summary_table(&summaries))
+}
+
 pub fn show_text(
     store: &SessionStore,
     workspace: &str,
