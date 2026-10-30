@@ -105,7 +105,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/skills",
-        usage: "/skills [list|show <name>|add <dir>|remove <name> --yes|path]",
+        usage: "/skills [list|show <name>|add <dir>|install <url> [name...]|remove <name> --yes|path]",
         summary: "List, inspect, install or remove skills",
         id: CommandId::Skills,
     },
@@ -187,6 +187,7 @@ pub enum SkillsAction {
     List,
     Show(String),
     Add(std::path::PathBuf),
+    Install { url: String, names: Vec<String> },
     Remove { name: String, confirmed: bool },
     Path,
 }
@@ -196,6 +197,7 @@ pub enum CommandEffect {
     Handled,
     SkillsAdd { dir: std::path::PathBuf },
     SkillsRemove { name: String },
+    SkillsFetch { url: String, names: Vec<String> },
     Quit,
     OpenModelPicker,
     RunDoctor { offline: bool },
@@ -297,6 +299,12 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             },
             ["add", dir] => SlashCommand::Skills {
                 action: SkillsAction::Add(std::path::PathBuf::from(dir)),
+            },
+            ["install", url, names @ ..] => SlashCommand::Skills {
+                action: SkillsAction::Install {
+                    url: (*url).to_string(),
+                    names: names.iter().map(|name| (*name).to_string()).collect(),
+                },
             },
             // Destructive: the flag is part of the grammar, not a later check.
             ["remove", name, "--yes"] => SlashCommand::Skills {
@@ -443,6 +451,7 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
                 }
                 // The copy runs off the UI thread; the notice comes back as an action.
                 SkillsAction::Add(dir) => CommandEffect::SkillsAdd { dir },
+                SkillsAction::Install { url, names } => CommandEffect::SkillsFetch { url, names },
                 // The grammar already refuses a removal without `--yes`.
                 SkillsAction::Remove {
                     name,

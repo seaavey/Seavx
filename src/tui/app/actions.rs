@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
 use super::store::lock_store;
-use super::{App, PendingPermission};
+use super::{App, ModalSelection, PendingPermission};
 use crate::tui::event::{Action, AgentState};
 
 /// Apply one result the loop did not route to a key or mouse handler.
@@ -152,6 +152,32 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                     .collect();
                 let _ = tx.send(Action::SkillsInstalledBatch(results));
             });
+        }
+        Action::SkillsFetched(result) => {
+            app.status = AgentState::Idle;
+            match result {
+                Ok(fetched) if fetched.candidates.is_empty() => {
+                    app.push_notice("No skills with a SKILL.md in that repository.")
+                }
+                Ok(fetched) => {
+                    let names: Vec<String> =
+                        fetched.candidates.iter().map(|c| c.name.clone()).collect();
+                    let descriptions: Vec<String> = fetched
+                        .candidates
+                        .iter()
+                        .map(|c| c.description.clone())
+                        .collect();
+                    let marked = vec![false; names.len()];
+                    app.pending_skills = Some(fetched);
+                    app.modal = Some(ModalSelection::Skills {
+                        names,
+                        descriptions,
+                        selected: 0,
+                        marked,
+                    });
+                }
+                Err(error) => app.push_notice(format!("Fetch failed: {error}")),
+            }
         }
         Action::SkillsInstalledBatch(results) => {
             app.status = AgentState::Idle;

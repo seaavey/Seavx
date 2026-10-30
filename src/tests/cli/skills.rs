@@ -381,7 +381,7 @@ fn fetch_of_a_directory_that_is_not_a_repository_is_an_error() {
     let plain = temp.path().join("plain");
     std::fs::create_dir_all(&plain).unwrap();
 
-    let error = fetch(&repo_url(&plain)).err().expect("an error");
+    let error = fetch(&repo_url(&plain)).expect_err("an error");
 
     assert!(
         error.contains(&repo_url(&plain)),

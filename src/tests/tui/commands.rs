@@ -369,6 +369,29 @@ fn parses_skills_actions() {
     assert_eq!(parse("/skills"), list);
     assert_eq!(parse("/skills list"), list);
     assert_eq!(
+        parse("/skills install https://github.com/anthropics/skills"),
+        Some(SlashCommand::Skills {
+            action: SkillsAction::Install {
+                url: "https://github.com/anthropics/skills".into(),
+                names: Vec::new(),
+            }
+        })
+    );
+    assert_eq!(
+        parse("/skills install https://example.test/repo pdf docx"),
+        Some(SlashCommand::Skills {
+            action: SkillsAction::Install {
+                url: "https://example.test/repo".into(),
+                names: vec!["pdf".into(), "docx".into()],
+            }
+        })
+    );
+    assert_eq!(
+        parse("/skills install"),
+        Some(SlashCommand::Unknown("/skills install".into())),
+        "a fetch needs a URL"
+    );
+    assert_eq!(
         parse("/skills path"),
         Some(SlashCommand::Skills {
             action: SkillsAction::Path

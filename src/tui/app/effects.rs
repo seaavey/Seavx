@@ -100,6 +100,38 @@ pub(super) fn apply_command_effect(
                 let _ = tx.send(Action::SkillsRemoved(result));
             });
         }
+        CommandEffect::SkillsFetch { url, names } => {
+            app.status = AgentState::Checking;
+            let tx = tx.clone();
+            let root = app.root.clone();
+            tokio::task::spawn_blocking(move || {
+                let fetched = match crate::cli::skills::fetch(&url) {
+                    Ok(fetched) => fetched,
+                    Err(error) => {
+                        let _ = tx.send(Action::SkillsFetched(Err(error)));
+                        return;
+                    }
+                };
+                if names.is_empty() {
+                    let _ = tx.send(Action::SkillsFetched(Ok(fetched)));
+                    return;
+                }
+                // A named install skips the picker, so it runs to completion here.
+                let results = names
+                    .iter()
+                    .map(
+                        |name| match fetched.candidates.iter().position(|c| &c.name == name) {
+                            Some(index) => (name.clone(), fetched.install(&root, index)),
+                            None => (
+                                name.clone(),
+                                Err(format!("{name} is not in this repository.")),
+                            ),
+                        },
+                    )
+                    .collect();
+                let _ = tx.send(Action::SkillsInstalledBatch(results));
+            });
+        }
         CommandEffect::RunCompact { instructions } => {
             let transcript = crate::tui::compact::transcript_from_segments(&app.segments);
             if crate::tui::compact::is_too_short(&transcript) {

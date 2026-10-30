@@ -210,16 +210,17 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 /// One skill found in a fetched repository, before the owner picks it.
+#[derive(Debug)]
 pub struct Candidate {
     pub name: String,
     // The picker shows this; `/skills install` is what fills it, next task.
-    #[cfg_attr(not(test), expect(dead_code, reason = "shown by /skills install next"))]
     pub description: String,
     pub source: PathBuf,
 }
 
 /// A fetched repository and the skills inside it. The checkout lives as long
 /// as this value, so a candidate can still be copied after the scan.
+#[derive(Debug)]
 pub struct Fetched {
     // Held only for its `Drop`: the candidates' sources live inside it.
     _checkout: Checkout,
@@ -238,6 +239,7 @@ impl Fetched {
 }
 
 /// A clone that deletes itself, so a fetched SKILL.md never outlives the pick.
+#[derive(Debug)]
 struct Checkout {
     dir: PathBuf,
 }
@@ -252,12 +254,6 @@ impl Drop for Checkout {
 ///
 /// `git` does the fetch: one feature does not buy a dependency. A URL that is
 /// not a repository is an error; a repository with no skill is an empty list.
-// `/skills install` calls this next task; `expect` fails loudly once it does,
-// so the fetch cannot quietly rot.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by /skills install next")
-)]
 pub fn fetch(url: &str) -> Result<Fetched, String> {
     let checkout = Checkout {
         dir: std::env::temp_dir().join(format!(

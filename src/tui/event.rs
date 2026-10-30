@@ -45,6 +45,7 @@ pub enum Action {
     SkillsInstallMarked(Vec<usize>),
     /// One row per picked skill: its name and where it landed, or why not.
     SkillsInstalledBatch(Vec<(String, Result<std::path::PathBuf, String>)>),
+    SkillsFetched(Result<crate::cli::skills::Fetched, String>),
     /// `/sessions`: the numbered list, or the reason it could not be read.
     /// `/sessions <n>`: the session to open, or the refusal with its reason.
     SessionResume(Result<crate::session::LoadedSession, String>),
