@@ -5,11 +5,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::tempdir;
 
-/// Changing the process umask is global, so the mode tests take turns.
+/// Changing the process umask is global, so the mode tests take turns. Both the
+/// guard and the lock are Unix-only: Windows has neither `mode_t` nor `umask`,
+/// and the mode tests are `#[cfg(unix)]`.
+#[cfg(unix)]
 static UMASK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(unix)]
 struct UmaskRestore(libc::mode_t);
 
+#[cfg(unix)]
 impl Drop for UmaskRestore {
     fn drop(&mut self) {
         // SAFETY: restoring the value this guard replaced.
