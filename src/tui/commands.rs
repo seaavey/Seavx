@@ -29,6 +29,7 @@ pub enum CommandId {
     Undo,
     Sessions,
     Resume,
+    Status,
     Exit,
 }
 
@@ -128,6 +129,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         id: CommandId::Resume,
     },
     CommandSpec {
+        name: "/status",
+        usage: "/status",
+        summary: "Show what the agent is doing right now",
+        id: CommandId::Status,
+    },
+    CommandSpec {
         name: "/exit",
         usage: "/exit",
         summary: "Quit Seavx agent TUI",
@@ -174,6 +181,8 @@ pub enum SlashCommand {
     },
     /// Restore files from the newest checkpoint.
     Undo,
+    /// Compact, read-only view of the current state.
+    Status,
     /// Open the session picker, or resume one by its listed number.
     Sessions {
         index: Option<u32>,
@@ -255,6 +264,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         CommandId::Exit => no_args(&args, trimmed, SlashCommand::Exit),
         CommandId::Init => no_args(&args, trimmed, SlashCommand::Init),
         CommandId::Undo => no_args(&args, trimmed, SlashCommand::Undo),
+        CommandId::Status => no_args(&args, trimmed, SlashCommand::Status),
         CommandId::Compact => SlashCommand::Compact {
             instructions: (!args.is_empty()).then(|| args.join(" ")),
         },
@@ -385,6 +395,37 @@ fn parse_config(args: &[&str], raw: &str) -> SlashCommand {
     }
 }
 
+/// One compact line per fact: what the agent is doing, which session it is
+/// doing it in, and whether persistence degraded. `/status` is not a trace
+/// viewer, so it never lists stored events, arguments or output.
+pub fn status_text(app: &App) -> String {
+    let state = match &app.status {
+        AgentState::Idle => "idle".to_string(),
+        AgentState::Thinking => "thinking".to_string(),
+        AgentState::Streaming => "streaming".to_string(),
+        AgentState::ExecutingTool(tool) => format!("executing {tool}"),
+        AgentState::Checking => "checking the model".to_string(),
+        AgentState::Compacting => "compacting".to_string(),
+    };
+    let mut lines = vec![format!("state: {state}")];
+    if let Some(pending) = &app.pending_permission {
+        lines.push(format!(
+            "waiting for permission: {} wants to {}",
+            pending.request.tool, pending.request.effect
+        ));
+    }
+    let session = match (app.session_id, app.session_title.as_deref()) {
+        (Some(id), Some(title)) => format!("{id} ({title})"),
+        (Some(id), None) => id.to_string(),
+        (None, _) => "none".to_string(),
+    };
+    lines.push(format!("session: {session}"));
+    if let Some(error) = &app.persistence_error {
+        lines.push(format!("persistence: degraded ({error})"));
+    }
+    lines.join("\n")
+}
+
 /// Apply a parsed command. Anything that needs the async event loop is
 /// returned as an effect instead of being performed here.
 pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
@@ -398,6 +439,11 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         // Mode switching reports its own refusal, so it skips the busy gate.
         SlashCommand::Plan { mode } => {
             app.request_mode(mode);
+            return CommandEffect::Handled;
+        }
+        // A running turn is exactly what the user is asking about.
+        SlashCommand::Status => {
+            app.push_notice(status_text(app));
             return CommandEffect::Handled;
         }
         _ => {}
@@ -494,9 +540,10 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
             CommandEffect::Handled
         }
         // Handled before the busy gate above.
-        SlashCommand::Help | SlashCommand::Exit | SlashCommand::Plan { .. } => {
-            CommandEffect::Handled
-        }
+        SlashCommand::Help
+        | SlashCommand::Exit
+        | SlashCommand::Plan { .. }
+        | SlashCommand::Status => CommandEffect::Handled,
     }
 }
 

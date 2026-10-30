@@ -273,6 +273,7 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/undo`                                       | Restore files from the newest checkpoint and remove it; repeat to walk back. A file edited after the agent wrote it is left alone and named, so undo never overwrites newer work.                                         |
 | `/sessions [number]`                          | Pick a stored session with the arrow keys, or resume one by its number directly.                                                                                                                                          |
 | `/resume [number]`                            | Alias for `/sessions`.                                                                                                                                                                                                    |
+| `/status`                                     | Show what the agent is doing right now: its state, the session, and whether persistence degraded. Works while a turn is running. No event history, arguments or output.                                                    |
 | `/exit`                                       | Quit the TUI.                                                                                                                                                                                                             |
 
 Permission keys, written by `/config set` and by the permission prompt itself:

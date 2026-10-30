@@ -97,6 +97,7 @@ fn every_registry_entry_parses_to_a_handled_command() {
         ("/undo", SlashCommand::Undo),
         ("/sessions", SlashCommand::Sessions { index: None }),
         ("/resume", SlashCommand::Sessions { index: None }),
+        ("/status", SlashCommand::Status),
         ("/exit", SlashCommand::Exit),
     ];
 
@@ -143,6 +144,7 @@ fn every_handled_command_appears_in_the_registry() {
         "/undo",
         "/sessions",
         "/resume",
+        "/status",
         "/exit",
     ];
     for name in handled {
@@ -223,6 +225,7 @@ fn the_palette_is_the_table() {
             "/undo",
             "/sessions",
             "/resume",
+            "/status",
             "/exit"
         ]
     );
@@ -666,4 +669,80 @@ fn the_readme_command_table_matches_the_registry() {
         names, registered,
         "the README command table and the registry drifted; the palette is generated from the registry"
     );
+}
+
+#[test]
+fn parses_status_without_arguments() {
+    assert_eq!(parse("/status"), Some(SlashCommand::Status));
+    assert_eq!(
+        parse("/status now"),
+        Some(SlashCommand::Unknown("/status now".into()))
+    );
+}
+
+#[test]
+fn status_reports_the_running_tool_and_the_session_without_history() {
+    let mut app = crate::tui::app::test_app();
+    app.status = AgentState::ExecutingTool("read_file(path=\"note.txt\")".into());
+    app.session_id = Some(7);
+    app.session_title = Some("Fix the parser".into());
+
+    let text = status_text(&app);
+    assert!(text.contains("read_file"), "{text}");
+    assert!(text.contains('7'), "{text}");
+    assert!(text.contains("Fix the parser"), "{text}");
+    // Compact state only: no event rows, no payloads, no transcript.
+    assert!(!text.contains("Tool:"), "{text}");
+    assert!(!text.contains("queued"), "{text}");
+    assert!(!text.contains("completed"), "{text}");
+}
+
+#[test]
+fn status_reports_a_pending_permission() {
+    let mut app = crate::tui::app::test_app();
+    let (reply, _answer) = tokio::sync::oneshot::channel();
+    app.pending_permission = Some(crate::tui::app::PendingPermission {
+        request: crate::agent::permissions::PermissionRequest::new(
+            crate::agent::permissions::ActionKind::Execute,
+            "run_command",
+            "cargo test",
+        ),
+        reply,
+    });
+
+    let text = status_text(&app);
+    assert!(text.contains("waiting for permission"), "{text}");
+    assert!(text.contains("run_command"), "{text}");
+}
+
+#[test]
+fn status_shows_persistence_only_when_degraded() {
+    let mut app = crate::tui::app::test_app();
+    app.session_id = Some(3);
+    let healthy = status_text(&app);
+    assert!(!healthy.contains("persistence"), "{healthy}");
+
+    app.persistence_error = Some("Session history disabled: busy".into());
+    let degraded = status_text(&app);
+    assert!(degraded.contains("persistence"), "{degraded}");
+    assert!(degraded.contains("busy"), "{degraded}");
+}
+
+#[test]
+fn status_never_reports_an_idle_app_as_busy_and_works_mid_turn() {
+    let mut app = crate::tui::app::test_app();
+    assert!(
+        execute(&mut app, SlashCommand::Status) == CommandEffect::Handled,
+        "an idle app answers /status"
+    );
+
+    // Busy is exactly when the user needs it: the busy gate must not swallow it.
+    app.status = AgentState::Thinking;
+    assert_eq!(
+        execute(&mut app, SlashCommand::Status),
+        CommandEffect::Handled
+    );
+    let last = app.segments.last().expect("a notice was pushed");
+    let text = format!("{last:?}");
+    assert!(text.contains("thinking"), "{text}");
 }
