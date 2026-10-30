@@ -251,6 +251,24 @@ fn the_footer_marks_an_unrecognised_model_as_assumed() {
 }
 
 #[test]
+fn the_footer_keeps_the_model_token_and_effort_columns_in_a_wide_frame() {
+    let mut app = test_app();
+    app.config.model = "deepseek-chat".to_string();
+    app.config.reasoning_effort = Some("high".to_string());
+    app.total_tokens = 1234;
+    app.prompt_tokens = 1234;
+
+    let mut terminal = Terminal::new(TestBackend::new(170, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let footer: String = (0..170).map(|x| buffer[(x, 23)].symbol()).collect();
+
+    assert!(footer.contains("deepseek-chat"), "{footer}");
+    assert!(footer.contains("~1k/128k"), "{footer}");
+    assert!(footer.contains("effort high"), "{footer}");
+}
+
+#[test]
 fn streamed_reasoning_deltas_stay_in_one_paragraph() {
     let mut app = test_app();
     // The engine emits one delta per token, none of them ending in a newline.

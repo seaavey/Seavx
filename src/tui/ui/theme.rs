@@ -7,7 +7,8 @@ pub(super) fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-/// Mode tag the header shows and the style that paints it.
+/// Mode tag the header shows, plus the style that paints mode text: the header
+/// tag and the footer's mode label.
 pub(super) fn mode_tag(mode: AgentMode) -> (&'static str, Style) {
     match mode {
         AgentMode::Build => ("[build]", dim()),
