@@ -1149,9 +1149,11 @@ async fn a_modal_owns_the_arrow_keys_before_the_transcript_does() {
     app.scroll = 7;
 
     // Regression: the transcript must not scroll while a picker owns the arrows.
+    // Shift+Up is the key the plain prompt would claim for scrolling, so a
+    // picker that lost the priority moves `app.scroll` instead of the cursor.
     super::keys::handle(
         &mut app,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
         &tx,
     )
     .await;
