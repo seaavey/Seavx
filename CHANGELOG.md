@@ -3,6 +3,61 @@
 All notable changes to Seavx are recorded here, grouped by category. One entry
 per landed change; no entry describes behaviour that is not in the code.
 
+## 0.1.3 — 2026-10-30
+
+### feature
+
+- Every tool call has a typed lifecycle event (`queued`, `running`, `completed`,
+  `failed`, `cancelled`) correlated by session, turn and provider call id, and
+  stored in one append-only `agent_events` table (schema v3). Summaries are
+  redacted and capped at 512 bytes; a permission denial is never recorded as a
+  completed call.
+- `/status` shows the current state, running tool, pending permission or
+  question and the active goal. It works mid-turn and never dumps event history
+  or raw arguments.
+- `/ask <question>` runs exactly one turn in the read-only Ask mode without
+  changing the standing Plan/Build selection. Answers cite `path:line`, and a
+  citation is only accepted when this turn's `read_file`/`search_files`
+  actually returned those lines.
+- `/review [working-tree|staged|commit <ref>|base <ref>]` resolves the diff
+  host-side (fixed arguments, no shell, 30 s timeout, 1 MiB cap, protected and
+  symlinked paths withheld and counted) and reviews it in a read-only mode. It
+  never stages, commits or writes.
+- Goals are durable (schema v4): `/goal <objective>`, `/goal edit`, `criteria
+  add|remove`, `task add|remove`, `approve`, `show`, `pause`, `resume`,
+  `cancel`, and `/tasks`. One active-or-blocked goal per workspace; completion
+  needs every criterion satisfied with evidence or waived with a reason.
+- `ask_user` gives the model one structured question (single, multi, free text).
+  The question is stored before it is shown (schema v5), survives a restart as
+  pending, and the recovery pass never fabricates an interrupted result for it.
+- `/steer <text>` reaches the running turn at its next safe boundary without
+  touching the cancellation token; `/queue <prompt>` holds one prompt until the
+  turn succeeds and drops it on cancel or failure. Both refuse a second request
+  while one is pending.
+- `/test` proposes the command the changed files actually justify, shows it,
+  and runs it only through the `run_command` permission prompt. Pass/fail comes
+  from the exit status; Cargo counts are parsed when present and reported as
+  unavailable when the output was truncated or unrecognised.
+- `/sessions fork <id> [--at <n>]`, `archive <id>`, `unarchive <id>` and
+  `find <text> [--all]` (schema v6: `parent_session_id`, `fork_seq`,
+  `archived_at`), plus `seavx sessions fork|archive|unarchive|search`. A fork
+  copies a completed prefix into an independent session; archiving hides a row
+  without deleting anything.
+- `/preset [name]` applies static prompt text from `.seavx/prompts/<name>.md`,
+  falling back to `~/.seavx/prompts/<name>.md`. Project presets shadow user
+  presets; traversal names, symlinks, non-regular and oversized files are
+  refused. A preset only fills the next prompt.
+
+### fix
+
+- The `/sessions` picker reads the store on the blocking pool instead of the
+  event thread, like every other store call.
+
+### tests
+
+- Session migrations are covered from the v1, v2, v3, v4 and v5 schemas and
+  from a database a real 0.1.2 binary wrote.
+
 ## 0.1.2 — 2026-10-30
 
 ### feature
