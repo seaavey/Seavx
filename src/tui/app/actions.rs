@@ -70,6 +70,12 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             app.status = AgentState::Idle;
             match result {
                 Ok(input) => {
+                    if input.withheld_paths > 0 {
+                        app.push_notice(format!(
+                            "{} path(s) withheld from this review for security.",
+                            input.withheld_paths
+                        ));
+                    }
                     let task = crate::agent::git_review::task_text(&input);
                     if let Some(request) = app.submit_turn(&task) {
                         let is_first_turn = app.session_title.is_none();

@@ -925,7 +925,7 @@ impl AgentRuntime {
                                 // Ask answers are shown once, after their
                                 // citations are validated; a delta would show
                                 // an unverified reference.
-                                if mode != AgentMode::Ask {
+                                if !matches!(mode, AgentMode::Ask | AgentMode::Review) {
                                     event_sink(AgentEvent::Token(token));
                                 }
                             }
@@ -1030,7 +1030,15 @@ impl AgentRuntime {
             let tool_calls = response.tool_calls();
             if tool_calls.is_empty() {
                 let final_text = response.clone().into_first_text().unwrap_or_default();
-                let final_text = if mode == AgentMode::Ask {
+                let final_text = if mode == AgentMode::Review {
+                    // A review answer is a report or an error; free prose is not
+                    // a clean result, so it fails the turn instead.
+                    let report = crate::agent::review::parse_report(&final_text)
+                        .map_err(|error| TurnError::Failed(std::io::Error::other(error).into()))?;
+                    let rendered = crate::agent::review::render_report(&report);
+                    event_sink(AgentEvent::Token(rendered.clone()));
+                    rendered
+                } else if mode == AgentMode::Ask {
                     let validated = sanitize_citations(&final_text, &evidence, &self.security);
                     if !validated.trim().is_empty() {
                         event_sink(AgentEvent::Token(validated.clone()));

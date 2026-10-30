@@ -1098,6 +1098,78 @@ mod engine_seam {
             "the previous turn's reads do not authorize this one: {second}"
         );
     }
+
+    async fn run_review(runtime: &AgentRuntime) -> (Result<String, String>, Vec<AgentEvent>) {
+        let mut events = Vec::new();
+        let outcome = runtime
+            .execute_task(
+                "review the working tree",
+                AgentMode::Review,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await;
+        (outcome.result.map_err(|error| error.to_string()), events)
+    }
+
+    #[tokio::test]
+    async fn a_review_answer_is_rendered_from_its_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_text(
+            "```json\n{\"target\":\"working-tree\",\"findings\":[{\"severity\":\"high\",\"title\":\"Unvalidated join\",\"impact\":\"reads outside the root\",\"remediation\":\"validate first\",\"path\":\"src/x.rs\",\"line_start\":12,\"confidence\":\"confirmed\"}],\"limitations\":[\"one file only\"]}\n```",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, events) = run_review(&runtime).await;
+        let answer = answer.expect("a report renders");
+
+        assert!(answer.contains("working-tree"), "{answer}");
+        assert!(
+            answer.contains("[high] Unvalidated join (confirmed)"),
+            "{answer}"
+        );
+        assert!(answer.contains("src/x.rs:12"), "{answer}");
+        assert!(answer.contains("one file only"), "{answer}");
+        assert!(answer.contains("No tests were run"), "{answer}");
+        let tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Token(token) => Some(token.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![answer.as_str()],
+            "the validated report is shown once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_review_answer_that_is_not_a_report_fails_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_text("Looks fine to me.")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let (answer, _) = run_review(&runtime).await;
+        let error = answer.expect_err("prose is not a clean review");
+        assert!(error.contains("not a valid report"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_is_never_a_clean_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("connection reset");
+        let runtime = runtime_with(&fake, temp.path());
+
+        let (answer, _) = run_review(&runtime).await;
+        assert!(answer.is_err(), "a provider failure cannot be clean");
+    }
 }
 
 #[cfg(test)]

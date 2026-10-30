@@ -9,6 +9,7 @@ pub mod models;
 pub mod patch;
 pub mod permissions;
 pub mod prompt;
+pub mod review;
 pub mod security;
 pub mod shell;
 pub mod skills;
