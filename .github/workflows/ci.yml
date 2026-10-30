@@ -50,9 +50,24 @@ jobs:
       - name: Cargo check
         run: cargo check --all-targets
 
+  check-macos:
+    name: Check (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache Action
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo check
+        run: cargo check --all-targets
+
   build:
     name: Build (${{ matrix.os_name }})
-    needs: [check-and-test, check-windows]
+    needs: [check-and-test, check-windows, check-macos]
     # Every push to master produces a downloadable build; PRs only run the checks.
     if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
@@ -76,6 +91,14 @@ jobs:
             platform: windows-x86_64
             exe: seavx.exe
             binary_name: seavx-windows-x86_64.exe
+          # `install.sh` maps Darwin-arm64 to `latest/macos/arm64`, which the
+          # worker resolves through `latest-macos-arm64.json`.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            os_name: macos
+            platform: macos-arm64
+            exe: seavx
+            binary_name: seavx-macos-arm64
     steps:
       - uses: actions/checkout@v4
 
