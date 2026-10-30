@@ -49,6 +49,10 @@ pub fn list_report_with_home(workspace: &Path, home: Option<&Path>) -> SkillsRep
         }
     }
 
+    // Sorted so the list reads the same on every filesystem: `read_dir` order is
+    // not stable, and an unsorted list made `/skills list` and its test flaky.
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+
     SkillsReport {
         skills,
         roots: manager.roots().to_vec(),
