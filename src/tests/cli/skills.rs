@@ -389,6 +389,57 @@ fn fetch_of_a_directory_that_is_not_a_repository_is_an_error() {
     );
 }
 
+/// A `Fetched` over a temp checkout, no git needed: the copy path is the test.
+fn fetched(temp: &Path, skills: &[(&str, &str)]) -> Fetched {
+    let checkout = temp.join("checkout");
+    let candidates = skills
+        .iter()
+        .map(|(name, description)| {
+            write_skill(&checkout, name, description);
+            Candidate {
+                name: name.to_string(),
+                description: description.to_string(),
+                source: checkout.join(name),
+            }
+        })
+        .collect();
+    Fetched {
+        _checkout: Checkout { dir: checkout },
+        candidates,
+    }
+}
+
+#[test]
+fn install_at_writes_into_the_root_it_is_given_and_refuses_an_existing_skill_there() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("global/skills");
+    let fetched = fetched(temp.path(), &[("demo", "A skill.")]);
+
+    let path = fetched.install_at(&root, 0).unwrap();
+
+    assert_eq!(path, root.join("demo"));
+    assert!(
+        path.join("SKILL.md").is_file(),
+        "the copy landed in the root"
+    );
+    let error = fetched.install_at(&root, 0).unwrap_err();
+    assert!(error.contains("already exists"), "{error}");
+}
+
+#[test]
+fn installing_into_a_home_root_leaves_the_workspace_root_empty() {
+    let (temp, workspace, home) = fixture();
+    let fetched = fetched(temp.path(), &[("demo", "A skill.")]);
+
+    let path = fetched.install_at(&home.join(".agents/skills"), 0).unwrap();
+
+    assert_eq!(path, home.join(".agents/skills/demo"));
+    assert!(
+        !workspace.join(".seavx/skills/demo").exists(),
+        "a global install never writes the workspace root"
+    );
+}
+
 #[test]
 fn a_refused_candidate_leaves_the_others_installable() {
     if !git_available() {

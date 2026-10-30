@@ -4,12 +4,13 @@
 //! shadow it, `show` prints one body, `path` reports the roots in precedence
 //! order.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::agent::skills::{SkillManager, scan_dir};
-use crate::cli::memory;
+use crate::cli::{memory, prompt};
 
 /// One skill, as `list` shows it: the winning copy and the roots behind it.
 pub struct SkillRow {
@@ -149,6 +150,12 @@ fn display_path(path: &Path) -> String {
 /// and a symlink anywhere in the source is refused rather than followed, so an
 /// install can never copy files from outside the directory the user pointed at.
 pub fn install(workspace: &Path, source: &Path) -> Result<PathBuf, String> {
+    install_into(&workspace.join(".seavx/skills"), source)
+}
+
+/// The copy routine behind [`install`] and [`Fetched::install_at`]: `root` is
+/// a skills directory itself, so the destination is `<root>/<name>`.
+fn install_into(root: &Path, source: &Path) -> Result<PathBuf, String> {
     if !source.is_dir() {
         return Err(format!("{} is not a directory.", source.display()));
     }
@@ -168,7 +175,7 @@ pub fn install(workspace: &Path, source: &Path) -> Result<PathBuf, String> {
         return Err(format!("{name:?} is not a usable skill name."));
     }
 
-    let destination = workspace.join(".seavx/skills").join(&name);
+    let destination = root.join(&name);
     if destination.exists() {
         return Err(format!("{} already exists.", destination.display()));
     }
@@ -228,13 +235,19 @@ pub struct Fetched {
 }
 
 impl Fetched {
-    /// Copy candidate `index` in, under [`install`]'s rules.
-    pub fn install(&self, workspace: &Path, index: usize) -> Result<PathBuf, String> {
+    /// Copy candidate `index` into `root` (a skills directory), under
+    /// [`install`]'s rules.
+    pub fn install_at(&self, root: &Path, index: usize) -> Result<PathBuf, String> {
         let candidate = self
             .candidates
             .get(index)
             .ok_or_else(|| format!("There is no skill at position {}.", index + 1))?;
-        install(workspace, &candidate.source)
+        install_into(root, &candidate.source)
+    }
+
+    /// The workspace's own root, the TUI's only destination.
+    pub fn install(&self, workspace: &Path, index: usize) -> Result<PathBuf, String> {
+        self.install_at(&workspace.join(".seavx/skills"), index)
     }
 }
 
@@ -380,12 +393,15 @@ pub enum SkillsCommand {
         /// Directory containing SKILL.md
         dir: std::path::PathBuf,
     },
-    /// Install skills from a git repository; without names it prints what the repository holds
+    /// Install skills from a git repository; on a terminal, pick them from a list
     Install {
         /// Repository URL, cloned with `git clone --depth 1`
         url: String,
-        /// Skill names to install; omit to list them instead
+        /// Skill names to install; omit to pick them from a list
         names: Vec<String>,
+        /// Install into ~/.agents/skills (every workspace) instead of .seavx/skills
+        #[arg(long)]
+        global: bool,
     },
     /// Delete the winning copy of a skill
     Remove {
@@ -410,7 +426,7 @@ pub fn run(command: Option<SkillsCommand>) -> anyhow::Result<()> {
             Ok(path) => println!("Installed skill at {}", path.display()),
             Err(error) => anyhow::bail!(error),
         },
-        SkillsCommand::Install { url, names } => {
+        SkillsCommand::Install { url, names, global } => {
             let fetched = match fetch(&url) {
                 Ok(fetched) => fetched,
                 Err(error) => anyhow::bail!(error),
@@ -419,20 +435,47 @@ pub fn run(command: Option<SkillsCommand>) -> anyhow::Result<()> {
                 println!("No skills with a SKILL.md in that repository.");
                 return Ok(());
             }
+            // A piped run never prompts: it prints the list like it always did.
+            if names.is_empty() && std::io::stdin().is_terminal() {
+                let items: Vec<(String, String)> = fetched
+                    .candidates
+                    .iter()
+                    .map(|candidate| {
+                        (
+                            candidate.name.clone(),
+                            first_sentence(&candidate.description),
+                        )
+                    })
+                    .collect();
+                let mut global = global;
+                let Some(indices) = prompt::pick_skills("Install", &items, &mut global) else {
+                    return Ok(());
+                };
+                let root = skills_root(&workspace, global)?;
+                let installed = install_each(&fetched, &root, &indices);
+                println!(
+                    "{installed} of {} skill(s) installed to {}",
+                    indices.len(),
+                    root.display()
+                );
+                return Ok(());
+            }
             if names.is_empty() {
                 for candidate in &fetched.candidates {
                     println!(
                         "- {}: {}",
                         candidate.name,
-                        super::skills::first_sentence(&candidate.description)
+                        first_sentence(&candidate.description)
                     );
                 }
                 println!(
-                    "\nInstall some by name: seavx skills install {} <name>...",
-                    url
+                    "\nInstall some by name: seavx skills install {} {}<name>...",
+                    url,
+                    if global { "--global " } else { "" }
                 );
                 return Ok(());
             }
+            let root = skills_root(&workspace, global)?;
             let mut failures = 0;
             for name in &names {
                 match fetched
@@ -440,7 +483,7 @@ pub fn run(command: Option<SkillsCommand>) -> anyhow::Result<()> {
                     .iter()
                     .position(|candidate| &candidate.name == name)
                 {
-                    Some(index) => match fetched.install(&workspace, index) {
+                    Some(index) => match fetched.install_at(&root, index) {
                         Ok(path) => println!("installed {name} at {}", path.display()),
                         Err(error) => {
                             failures += 1;
@@ -468,6 +511,32 @@ pub fn run(command: Option<SkillsCommand>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The root a CLI install writes to: `--global` means every workspace.
+fn skills_root(workspace: &Path, global: bool) -> anyhow::Result<PathBuf> {
+    if !global {
+        return Ok(workspace.join(".seavx/skills"));
+    }
+    crate::home::dir()
+        .map(|home| home.join(".agents/skills"))
+        .ok_or_else(|| anyhow::anyhow!("No home directory; cannot install globally."))
+}
+
+/// One line per picked skill; a refusal never stops the ones after it.
+fn install_each(fetched: &Fetched, root: &Path, indices: &[usize]) -> usize {
+    let mut installed = 0;
+    for &index in indices {
+        let name = &fetched.candidates[index].name;
+        match fetched.install_at(root, index) {
+            Ok(path) => {
+                installed += 1;
+                println!("installed {name} at {}", path.display());
+            }
+            Err(error) => println!("refused {name}: {error}"),
+        }
+    }
+    installed
 }
 
 #[cfg(test)]
