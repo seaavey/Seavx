@@ -50,14 +50,7 @@ impl ModelManager {
 
     /// Load models from cache if still valid within TTL
     pub fn get_cached_models(&self, domain_slug: &str) -> Option<Vec<String>> {
-        let path = self.cache_path(domain_slug);
-        if !path.exists() {
-            return None;
-        }
-
-        let content = std::fs::read_to_string(&path).ok()?;
-        let cache: ModelCache = serde_json::from_str(&content).ok()?;
-
+        let cache = self.read_cache(domain_slug)?;
         let now = epoch_secs();
 
         if now.saturating_sub(cache.fetched_at) < self.ttl.as_secs() {
@@ -65,6 +58,18 @@ impl ModelManager {
         } else {
             None // TTL expired
         }
+    }
+
+    /// Load the cached models whatever their age. The picker prefers a stale
+    /// list over none, while `fetch_or_cache_models` still refreshes on TTL
+    /// expiry: the two questions are different and so are the two methods.
+    pub fn get_cached_models_allow_stale(&self, domain_slug: &str) -> Option<Vec<String>> {
+        self.read_cache(domain_slug).map(|cache| cache.models)
+    }
+
+    fn read_cache(&self, domain_slug: &str) -> Option<ModelCache> {
+        let content = std::fs::read_to_string(self.cache_path(domain_slug)).ok()?;
+        serde_json::from_str(&content).ok()
     }
 
     /// Save fetched models into cache file
@@ -181,3 +186,7 @@ impl ModelManager {
         self.refresh_remote_models(base_url, api_key).await
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/core/models.rs"]
+mod tests;

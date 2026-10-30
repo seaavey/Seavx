@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::agent::engine::AgentMode;
@@ -329,34 +329,71 @@ pub fn render(app: &App, frame: &mut Frame) {
         frame.render_widget(Clear, area);
 
         match modal {
-            ModalSelection::Model { models, selected } => {
-                let items: Vec<ListItem> = models
+            ModalSelection::Model {
+                models,
+                query,
+                selected,
+            } => {
+                // The list is longer than the box: the items are plain text and
+                // the stateful render scrolls the window to the selected row.
+                // Without it the window stayed pinned to the first rows and the
+                // cursor walked off the bottom, so the picker looked frozen.
+                let visible = crate::tui::app::visible_models(models, query);
+                let items: Vec<ListItem> = visible
                     .iter()
-                    .enumerate()
-                    .map(|(i, m)| {
-                        let is_active = *m == app.config.model;
-                        let prefix = if i == *selected { "❯ " } else { "  " };
-                        let suffix = if is_active { " [active]" } else { "" };
-                        let style = if i == *selected {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
-                        } else if is_active {
+                    .map(|model| {
+                        let suffix = if model.as_str() == app.config.model {
+                            " [active]"
+                        } else {
+                            ""
+                        };
+                        let style = if model.as_str() == app.config.model {
                             Style::default().fg(Color::Cyan)
                         } else {
                             Style::default().fg(Color::White)
                         };
-                        ListItem::new(format!("{prefix}{m}{suffix}")).style(style)
+                        ListItem::new(format!("{model}{suffix}")).style(style)
                     })
                     .collect();
 
-                let list = List::new(items).block(
-                    Block::default()
-                        .title(" Select Model (↑/↓: move, Enter: choose, 'r': refresh /models, Esc: cancel) ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
-                );
-                frame.render_widget(list, area);
+                let title = if app.refreshing_models {
+                    // A spinner is the only sign of life while the gateway is
+                    // slow; without it the frozen picker reads as a hang.
+                    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                    let frame = FRAMES[(millis / 80) as usize % FRAMES.len()];
+                    format!(" Refreshing /models {frame} (Esc: close) ")
+                } else {
+                    // The filter is the picker's search box: type to narrow,
+                    // Backspace to widen.
+                    let filter = if query.is_empty() {
+                        "type to filter".to_string()
+                    } else {
+                        format!("filter: {query}")
+                    };
+                    format!(
+                        " Select Model {}/{} · {filter} · ↑/↓ move · ctrl+r refresh · Esc ",
+                        visible.len(),
+                        models.len()
+                    )
+                };
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .title(title)
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    )
+                    // A background, not just a color: the cursor must survive a
+                    // font that has no ❯ glyph.
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("❯ ");
+                let mut state = ListState::default().with_selected(Some(*selected));
+                frame.render_stateful_widget(list, area, &mut state);
             }
             ModalSelection::Effort {
                 model,
@@ -391,29 +428,28 @@ pub fn render(app: &App, frame: &mut Frame) {
                 frame.render_widget(list, area);
             }
             ModalSelection::Session { rows, selected } => {
+                // Same as the model picker: a long list scrolls with the cursor.
                 let items: Vec<ListItem> = rows
                     .iter()
-                    .enumerate()
-                    .map(|(i, row)| {
-                        let prefix = if i == *selected { "❯ " } else { "  " };
-                        let style = if i == *selected {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
-                        ListItem::new(format!("{prefix}{row}")).style(style)
-                    })
+                    .map(|row| ListItem::new(row.clone()).style(Style::default().fg(Color::White)))
                     .collect();
 
-                let list = List::new(items).block(
-                    Block::default()
-                        .title(" Select Session (↑/↓: move, Enter: open, Esc: cancel) ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
-                );
-                frame.render_widget(list, area);
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .title(" Select Session (↑/↓: move, Enter: open, Esc: cancel) ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("❯ ");
+                let mut state = ListState::default().with_selected(Some(*selected));
+                frame.render_stateful_widget(list, area, &mut state);
             }
         }
     }
@@ -537,6 +573,11 @@ fn build_transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     for segment in &app.segments {
         match segment {
             Segment::Text(text) => lines.extend(markdown::render(text, width)),
+            // A report keeps the shape it was printed in: markdown would fold
+            // every row into one re-wrapped paragraph.
+            Segment::Notice(text) => {
+                lines.extend(text.lines().map(|line| Line::from(line.to_string())));
+            }
             Segment::Thinking(text) => {
                 // Transcript blocks are history: only the status line animates.
                 lines.push(Line::from(vec![

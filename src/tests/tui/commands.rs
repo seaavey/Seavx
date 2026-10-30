@@ -35,7 +35,7 @@ fn busy_app_rejects_clear_but_allows_help_and_exit() {
     ));
     assert!(matches!(
         app.segments.last(),
-        Some(crate::tui::app::Segment::Text(text))
+        Some(crate::tui::app::Segment::Notice(text))
             if text.contains("Agent is busy, try again when it is idle.")
     ));
     assert!(matches!(
@@ -90,7 +90,7 @@ fn every_registry_entry_parses_to_a_handled_command() {
         ),
         ("/undo", SlashCommand::Undo),
         ("/sessions", SlashCommand::Sessions { index: None }),
-        ("/resume", SlashCommand::Resume),
+        ("/resume", SlashCommand::Sessions { index: None }),
         ("/exit", SlashCommand::Exit),
     ];
 
@@ -240,8 +240,8 @@ fn notices_strip_control_characters() {
     let mut app = crate::tui::app::test_app();
     app.push_notice("ok\u{1b}[31m red\u{7}\nnext");
     let text = match app.segments.last() {
-        Some(crate::tui::app::Segment::Text(text)) => text,
-        other => panic!("expected text segment, got {other:?}"),
+        Some(crate::tui::app::Segment::Notice(text)) => text,
+        other => panic!("expected notice segment, got {other:?}"),
     };
     assert!(!text.contains('\u{1b}'));
     assert!(!text.contains('\u{7}'));
@@ -317,8 +317,8 @@ fn config_rejects_api_key_writes() {
         },
     );
     let text = match app.segments.last() {
-        Some(crate::tui::app::Segment::Text(text)) => text,
-        other => panic!("expected text segment, got {other:?}"),
+        Some(crate::tui::app::Segment::Notice(text)) => text,
+        other => panic!("expected notice segment, got {other:?}"),
     };
     assert!(text.contains("setup providers"));
     assert!(!text.contains("sr-live-12345678"));
@@ -394,7 +394,7 @@ fn clear_and_new_are_the_same_command() {
         );
         assert!(app.segments.iter().any(|segment| matches!(
             segment,
-            crate::tui::app::Segment::Text(text) if text.contains("Agent is busy")
+            crate::tui::app::Segment::Notice(text) if text.contains("Agent is busy")
         )));
         assert_eq!(app.session_id, Some(9), "{name} changes nothing while busy");
     }
@@ -464,7 +464,7 @@ fn undo_is_refused_while_busy() {
     assert!(
         app.segments.iter().any(|segment| matches!(
             segment,
-            crate::tui::app::Segment::Text(text)
+            crate::tui::app::Segment::Notice(text)
                 if text.contains("Agent is busy, try again when it is idle.")
         )),
         "the refusal is explained"
@@ -482,7 +482,7 @@ fn fixture_store() -> (tempfile::TempDir, crate::session::SessionStore, String) 
 }
 
 #[test]
-fn sessions_lists_the_workspace_and_resumes_by_number() {
+fn sessions_opens_the_picker_and_resumes_a_number() {
     assert_eq!(
         parse("/sessions"),
         Some(SlashCommand::Sessions { index: None })
@@ -491,6 +491,26 @@ fn sessions_lists_the_workspace_and_resumes_by_number() {
         parse("/sessions 2"),
         Some(SlashCommand::Sessions { index: Some(2) })
     );
+    // The list is the picker now: no number means "let me choose".
+    let mut app = crate::tui::app::test_app();
+    assert_eq!(
+        execute(&mut app, SlashCommand::Sessions { index: None }),
+        CommandEffect::OpenSessionPicker
+    );
+    assert_eq!(
+        execute(&mut app, SlashCommand::Sessions { index: Some(2) }),
+        CommandEffect::RunSessions { number: 2 }
+    );
+    // `/resume` is the alias: same command, same arguments, same effect.
+    assert_eq!(
+        parse("/resume"),
+        Some(SlashCommand::Sessions { index: None })
+    );
+    assert_eq!(
+        parse("/resume 2"),
+        Some(SlashCommand::Sessions { index: Some(2) })
+    );
+    assert!(matches!(parse("/resume 0"), Some(SlashCommand::Unknown(_))));
     assert!(matches!(
         parse("/sessions 0"),
         Some(SlashCommand::Unknown(_))
@@ -560,17 +580,5 @@ fn the_readme_command_table_matches_the_registry() {
     assert_eq!(
         names, registered,
         "the README command table and the registry drifted; the palette is generated from the registry"
-    );
-}
-
-#[test]
-fn resume_opens_the_session_picker_and_takes_no_arguments() {
-    assert_eq!(parse("/resume"), Some(SlashCommand::Resume));
-    assert!(matches!(parse("/resume 2"), Some(SlashCommand::Unknown(_))));
-
-    let mut app = crate::tui::app::test_app();
-    assert_eq!(
-        execute(&mut app, SlashCommand::Resume),
-        CommandEffect::OpenSessionPicker
     );
 }

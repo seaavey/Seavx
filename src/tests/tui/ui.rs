@@ -338,3 +338,116 @@ fn a_pending_permission_renders_a_box_above_the_composer() {
         .expect("status bar");
     assert!(!row(status_y).contains("permission"), "{:?}", row(status_y));
 }
+
+#[test]
+fn the_model_picker_scrolls_the_list_to_the_selection() {
+    let mut app = test_app();
+    let models: Vec<String> = (0..40).map(|index| format!("model-{index}")).collect();
+    app.config.model = "model-30".to_string();
+    app.modal = Some(ModalSelection::Model {
+        models,
+        query: String::new(),
+        selected: 30,
+    });
+
+    let text = screen_of(&app);
+    assert!(
+        text.contains("model-30"),
+        "the selected row must be scrolled into view: {text}"
+    );
+    assert!(
+        !text.contains("model-0 ") && !text.contains("model-1 "),
+        "the window follows the selection instead of pinning to the top: {text}"
+    );
+
+    // The real cache holds 15 models in a 24-row terminal: the last one is the
+    // row that used to fall past the fold and stay unreachable.
+    let mut app = test_app();
+    let models: Vec<String> = (0..15).map(|index| format!("model-{index}")).collect();
+    app.modal = Some(ModalSelection::Model {
+        models,
+        query: String::new(),
+        selected: 14,
+    });
+    let text = screen_of(&app);
+    assert!(
+        text.contains("model-14"),
+        "the last model is reachable: {text}"
+    );
+}
+
+#[test]
+fn typing_narrows_the_model_picker_to_matching_rows() {
+    let mut app = test_app();
+    app.config.model = "alpha".to_string();
+    app.modal = Some(ModalSelection::Model {
+        models: ["alpha", "beta", "gamma"].map(str::to_string).to_vec(),
+        query: "et".to_string(),
+        selected: 0,
+    });
+
+    let text = screen_of(&app);
+    assert!(text.contains("beta"), "{text}");
+    assert!(
+        !text.contains("gamma"),
+        "the filter hides the rows that do not match: {text}"
+    );
+    assert!(
+        text.contains("Select Model 1/3"),
+        "the title says how many rows matched: {text}"
+    );
+    assert!(text.contains("filter: et"), "{text}");
+}
+
+#[test]
+fn a_notice_keeps_the_rows_it_was_printed_with() {
+    let mut app = test_app();
+    app.push_notice(
+        "Seavx configuration\n\nmodel             fake-model   (workspace)\nreasoning_effort  high         (default)\nsystem_prompt     default      (workspace)",
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String { (0..90).map(|x| buffer[(x, y)].symbol()).collect() };
+    let rows: Vec<String> = (0..24).map(row).collect();
+
+    let model_row = rows
+        .iter()
+        .find(|line| line.contains("fake-model"))
+        .expect("the model row is drawn");
+    assert!(
+        model_row.contains("(workspace)"),
+        "a row keeps its own origin: {model_row:?}"
+    );
+    let prompt_row = rows
+        .iter()
+        .find(|line| line.contains("system_prompt"))
+        .expect("the system_prompt row is drawn");
+    assert!(
+        prompt_row.contains("(workspace)"),
+        "markdown used to fold every row into one paragraph: {prompt_row:?}"
+    );
+}
+
+#[test]
+fn a_running_refresh_is_visible_in_the_picker_title() {
+    let mut app = test_app();
+    app.modal = Some(ModalSelection::Model {
+        models: vec!["alpha".to_string()],
+        query: String::new(),
+        selected: 0,
+    });
+    app.refreshing_models = true;
+
+    let busy = screen_of(&app);
+    assert!(
+        busy.contains("Refreshing /models"),
+        "a slow fetch says it is working instead of looking frozen: {busy}"
+    );
+
+    app.refreshing_models = false;
+    let idle = screen_of(&app);
+    assert!(idle.contains("Select Model"), "{idle}");
+    assert!(!idle.contains("Refreshing"), "{idle}");
+}

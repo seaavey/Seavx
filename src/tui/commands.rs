@@ -110,13 +110,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/sessions",
         usage: "/sessions [number]",
-        summary: "List this workspace's sessions and resume one",
+        summary: "Pick a stored session, or resume one by its number",
         id: CommandId::Sessions,
     },
     CommandSpec {
         name: "/resume",
-        usage: "/resume",
-        summary: "Pick a stored session and resume it",
+        usage: "/resume [number]",
+        summary: "Alias for /sessions",
         id: CommandId::Resume,
     },
     CommandSpec {
@@ -163,12 +163,10 @@ pub enum SlashCommand {
     },
     /// Restore files from the newest checkpoint.
     Undo,
-    /// List this workspace's sessions, or resume one by its listed number.
+    /// Open the session picker, or resume one by its listed number.
     Sessions {
         index: Option<u32>,
     },
-    /// Open the session picker: the same list as `/sessions`, chosen with arrows.
-    Resume,
     Unknown(String),
 }
 
@@ -180,7 +178,7 @@ pub enum CommandEffect {
     RunDoctor { offline: bool },
     RunCompact { instructions: Option<String> },
     RunUndo,
-    RunSessions { index: Option<u32> },
+    RunSessions { number: u32 },
     OpenSessionPicker,
 }
 
@@ -240,8 +238,8 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             ["--offline"] => SlashCommand::Doctor { offline: true },
             _ => SlashCommand::Unknown(trimmed.to_string()),
         },
-        CommandId::Resume => no_args(&args, trimmed, SlashCommand::Resume),
-        CommandId::Sessions => match args.as_slice() {
+        // One grammar for both spellings; `/resume` is the alias.
+        CommandId::Sessions | CommandId::Resume => match args.as_slice() {
             [] => SlashCommand::Sessions { index: None },
             [number] => match number.parse::<u32>() {
                 Ok(number) if number > 0 => SlashCommand::Sessions {
@@ -387,8 +385,11 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },
         SlashCommand::Undo => CommandEffect::RunUndo,
-        SlashCommand::Sessions { index } => CommandEffect::RunSessions { index },
-        SlashCommand::Resume => CommandEffect::OpenSessionPicker,
+        SlashCommand::Sessions { index } => match index {
+            // The picker is the list: no number means "let me choose".
+            None => CommandEffect::OpenSessionPicker,
+            Some(number) => CommandEffect::RunSessions { number },
+        },
         SlashCommand::Init => {
             match config::init_workspace(std::path::Path::new(".")) {
                 Ok((path, true)) => {

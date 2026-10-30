@@ -85,8 +85,12 @@ be resumed with its message order, tool calls and results intact. `seavx exec`
 stays session-free and writes nothing.
 
 - Location: `~/.seavx/sessions.db`, or `.seavx/sessions.db` in the workspace in
-  debug mode. The file is `0600` and its directory `0700`; a looser mode left by
-  an older install is tightened on start.
+  debug mode. Debug mode is `--debug` or `SEAVX_DEBUG=1`; nothing else — a debug
+  build is not a debug run, so `cargo run` keeps its data in `~/.seavx` like an
+  installed binary. Every TUI run records the state it resolved as
+  `SEAVX_DEBUG=true|false` in the workspace `.env`, rewriting that line and
+  leaving the rest of the file alone. The file is `0600` and its directory
+  `0700`; a looser mode left by an older install is tightened on start.
 - `journal_mode=WAL` with `synchronous=NORMAL`: a final message lost in an
   unclean shutdown is acceptable, a whole session is not. Move to `FULL` if that
   trade ever matters.
@@ -256,8 +260,8 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/doctor [--offline]`                         | Check config, key, endpoint, cache, workspace, memory, and skills. The session check opens the database read-only, never creates it, and warns when its schema version or payload format is not the one this build reads. |
 | `/memory [show\|project\|user\|skills\|path]` | Inspect persistent memory and installed skills.                                                                                                                                                                           |
 | `/undo`                                       | Restore files from the newest checkpoint and remove it; repeat to walk back. A file edited after the agent wrote it is left alone and named, so undo never overwrites newer work.                                         |
-| `/sessions [number]`                          | List this workspace's sessions and resume one by its listed number.                                                                                                                                                       |
-| `/resume`                                     | Pick a session from this workspace's list with the arrow keys and open it.                                                                                                                                                |
+| `/sessions [number]`                          | Pick a stored session with the arrow keys, or resume one by its number directly.                                                                                                                                          |
+| `/resume [number]`                            | Alias for `/sessions`.                                                                                                                                                                                                    |
 | `/exit`                                       | Quit the TUI.                                                                                                                                                                                                             |
 
 Permission keys, written by `/config set` and by the permission prompt itself:
@@ -324,7 +328,7 @@ query or userinfo.
   - `skill_write`: Create or fully rewrite a skill.
   - `skill_patch`: Exact string replacement inside an existing skill.
 - **Batched edits**: one `apply_patch` call writes all its files or none. Each file is capped at 16 MB, a batch at 64 files and 128 MB of staged bytes; the checkpoint store keeps the newest 200 batches and never evicts a live one. Batch atomicity holds while the process lives; a crash is reported at the next start (`batch interrupted: …`) and undone with `/undo`. Nothing is rolled back automatically. A journal that cannot be appended after a rename is a commit failure, not a staging one: the files already renamed are put back and the error says which. A checkpoint whose manifest can no longer be read is reported (`batch checkpoint … is unreadable`) instead of being skipped.
-- **Autonomous Self-Improvement**: Post-task workflow evaluator with ≥ 75% confidence singularity gate, persisting reusable workflows to `.seavx/skills/`.
+- **Autonomous Self-Improvement**: Post-task workflow evaluator with ≥ 75% confidence singularity gate, persisting reusable workflows to `.seavx/skills/`. Skills load from four roots in order — `.seavx/skills`, the repo's own `skills/`, `~/.seavx/skills`, `~/.agents/skills` — and a name found earlier shadows the same name later.
 
 ---
 

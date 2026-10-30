@@ -33,12 +33,13 @@ pub enum Action {
     /// Persistence degraded for the rest of the run; one notice, no retry.
     SessionFailed(String),
     DoctorDone(DoctorReport),
+    /// `/models` refresh finished: the fresh list, or why the gateway refused.
+    ModelsRefreshed(Result<Vec<String>, String>),
     CompactDone {
         result: Result<crate::tui::compact::CompactResult, String>,
     },
     UndoDone(Result<Vec<std::path::PathBuf>, String>),
     /// `/sessions`: the numbered list, or the reason it could not be read.
-    SessionsListed(Result<String, String>),
     /// `/sessions <n>`: the session to open, or the refusal with its reason.
     SessionResume(Result<crate::session::LoadedSession, String>),
     /// A tool call needs an answer. The worker blocks on `reply`; dropping it

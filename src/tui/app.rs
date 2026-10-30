@@ -82,7 +82,11 @@ fn scan_workspace_entries_at(root: &std::path::Path, query: &str) -> Vec<(bool, 
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
+    /// Agent output: rendered as markdown, so prose reflows to the pane.
     Text(String),
+    /// Command and system output (reports, listings, errors): plain text whose
+    /// newlines are the layout. Markdown would fold every row into a paragraph.
+    Notice(String),
     Thinking(String),
 }
 
@@ -98,6 +102,37 @@ fn prev_index(sel: usize, len: usize) -> usize {
 /// Wrap-around next index; no-op-safe when the list is empty.
 fn next_index(sel: usize, len: usize) -> usize {
     if sel + 1 >= len { 0 } else { sel + 1 }
+}
+
+/// Case-insensitive substring match for the model picker's filter.
+fn model_matches(name: &str, query: &str) -> bool {
+    query.is_empty() || name.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// The rows the model picker shows: the names containing the query. Rendering
+/// and Enter both read this, so the cursor always lands on the row on screen.
+pub fn visible_models<'a>(models: &'a [String], query: &str) -> Vec<&'a String> {
+    models
+        .iter()
+        .filter(|model| model_matches(model, query))
+        .collect()
+}
+
+/// The picker's search box: a printable key appends, Backspace deletes one
+/// character. `None` means the key is not text, so the caller keeps it.
+fn edit_query(query: &str, key: &KeyEvent) -> Option<String> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Backspace => {
+            let mut trimmed = query.to_string();
+            trimmed.pop();
+            Some(trimmed)
+        }
+        KeyCode::Char(c) => Some(format!("{query}{c}")),
+        _ => None,
+    }
 }
 
 fn is_mode_shortcut(key: &KeyEvent) -> bool {
@@ -122,6 +157,8 @@ fn edits_text(key: &KeyEvent) -> bool {
 pub enum ModalSelection {
     Model {
         models: Vec<String>,
+        /// Type-to-filter query, matched case-insensitively on the name.
+        query: String,
         selected: usize,
     },
     Effort {
@@ -180,6 +217,9 @@ pub struct App<'a> {
     pub config: crate::agent::engine::AgentConfig,
     pub mode: AgentMode,
     pub modal: Option<ModalSelection>,
+    /// A `/models` refresh is in flight in a worker; the picker shows a spinner
+    /// and a second `r` is ignored until the answer lands.
+    pub refreshing_models: bool,
     pub slash_selected: usize,
     pub at_selected: usize,
     /// `@` matches for the current query; rendering must not walk the workspace
@@ -348,6 +388,7 @@ impl<'a> App<'a> {
             config,
             mode: AgentMode::Build,
             modal: None,
+            refreshing_models: false,
             slash_selected: 0,
             at_selected: 0,
             at_cache: std::cell::RefCell::new(None),
@@ -389,6 +430,10 @@ impl<'a> App<'a> {
     /// Rebuild the transcript from stored rows, prefill the pending prompt and
     /// report what the resume budget left out.
     pub fn load_session(&mut self, session: crate::session::LoadedSession) {
+        // The load replaces the screen: the rows on it and the compaction
+        // summary belong to whatever session was open before this one.
+        self.clear_transcript();
+        self.read_only = None;
         self.session_id = Some(session.id);
         self.session_title = session.title.clone();
         self.total_tokens = session.total_tokens as i32;
@@ -413,6 +458,9 @@ impl<'a> App<'a> {
         if let Some(draft) = outcome.draft {
             self.push_text(&format!("User: {draft} (pending, not sent)\n\n"));
             self.set_input(&draft);
+        } else {
+            // A draft from the session that was open would otherwise ride along.
+            self.input = new_input();
         }
         self.scroll = self.line_count();
         self.auto_scroll = true;
@@ -427,6 +475,9 @@ impl<'a> App<'a> {
         self.read_only = None;
         // The compaction context belongs to the session that produced it.
         self.session_context = None;
+        // Usage is per session too, or the footer keeps the old count.
+        self.total_tokens = 0;
+        self.prompt_tokens = 0;
     }
 
     /// Enter: a slash line is a command, anything else is a turn. A bare `/`
@@ -597,10 +648,16 @@ impl<'a> App<'a> {
         self.auto_scroll = true;
     }
 
-    /// Append a command report, stripped of terminal control characters.
+    /// Append a command report, stripped of terminal control characters and kept
+    /// plain: a report is columns and rows, not markdown.
     pub fn push_notice(&mut self, text: impl Into<String>) {
         let text = crate::tui::commands::sanitize(&text.into());
-        self.push_text(&format!("\n{text}\n"));
+        self.revision += 1;
+        let framed = format!("\n{text}\n");
+        match self.segments.last_mut() {
+            Some(Segment::Notice(buf)) => buf.push_str(&framed),
+            _ => self.segments.push(Segment::Notice(framed)),
+        }
         self.scroll = self.line_count();
         self.auto_scroll = true;
     }
@@ -657,9 +714,74 @@ impl<'a> App<'a> {
             .unwrap_or(0);
         self.modal = Some(ModalSelection::Model {
             models,
+            query: String::new(),
             selected: current_idx,
         });
         true
+    }
+
+    /// Move the open model picker's cursor by one row, wrapping. Arrows and the
+    /// wheel both land here, so the cursor never leaves the filtered rows.
+    pub fn step_model_picker(&mut self, down: bool) {
+        let Some(ModalSelection::Model {
+            models,
+            query,
+            selected,
+        }) = self.modal.take()
+        else {
+            return;
+        };
+        let len = visible_models(&models, &query).len();
+        let selected = if down {
+            next_index(selected, len)
+        } else {
+            prev_index(selected, len)
+        };
+        self.modal = Some(ModalSelection::Model {
+            models,
+            query,
+            selected,
+        });
+    }
+
+    /// Land a finished `/models` refresh: the spinner stops and the picker shows
+    /// the new list. A picker closed while the fetch ran stays closed, and only
+    /// the toast reports the outcome.
+    pub fn models_refreshed(&mut self, result: Result<Vec<String>, String>) {
+        self.refreshing_models = false;
+        match result {
+            Ok(models) => {
+                let count = models.len();
+                // A refresh keeps the filter the user typed; the cursor follows
+                // the active model through the same filtered list. Only a model
+                // picker is replaced: an effort picker opened meanwhile stays.
+                let query = match &self.modal {
+                    Some(ModalSelection::Model { query, .. }) => Some(query.clone()),
+                    _ => None,
+                };
+                if let Some(query) = query {
+                    let selected = visible_models(&models, &query)
+                        .iter()
+                        .position(|model| **model == self.config.model)
+                        .unwrap_or(0);
+                    self.modal = Some(ModalSelection::Model {
+                        models,
+                        query,
+                        selected,
+                    });
+                }
+                self.toast = Some((
+                    format!("✓ Refreshed {count} models from gateway"),
+                    std::time::Instant::now(),
+                ));
+            }
+            Err(error) => {
+                self.toast = Some((
+                    format!("✗ Refresh failed: {error}"),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
     }
 
     /// Open the session picker from this store's listing for the current
@@ -686,13 +808,12 @@ impl<'a> App<'a> {
     /// Switch the model, optionally with a reasoning effort, and persist it.
     pub fn set_model(&mut self, target: &str, effort: Option<&str>) {
         let models = cached_models(self);
-        let resolved_model = if let Ok(num) = target.parse::<usize>()
-            && num > 0
-            && num <= models.len()
-        {
-            models[num - 1].clone()
-        } else {
-            target.to_string()
+        let resolved_model = match resolve_model_target(&models, target) {
+            Ok(model) => model,
+            Err(error) => {
+                self.push_notice(error);
+                return;
+            }
         };
 
         let config_path = crate::cli::config::workspace_config_path(std::path::Path::new("."));
@@ -930,6 +1051,7 @@ impl<'a> App<'a> {
             .iter()
             .map(|segment| match segment {
                 Segment::Text(text) => text.lines().count(),
+                Segment::Notice(text) => text.lines().count(),
                 Segment::Thinking(text) => text.lines().count() + 1,
             })
             .sum::<usize>() as u16
@@ -1090,8 +1212,8 @@ fn quit_shortcut(app: &mut App, key: &KeyEvent) -> bool {
 }
 
 /// Load one session off the event loop and hand it back as an action. Both
-/// `/sessions <n>` and the `/resume` picker go through here, so a number means
-/// the same thing in both.
+/// `/sessions <n>` and its picker go through here, so a number means the same
+/// thing in both.
 fn spawn_session_resume(app: &mut App, tx: &mpsc::UnboundedSender<Action>, number: u32) {
     app.status = AgentState::Checking;
     let tx = tx.clone();
@@ -1136,24 +1258,7 @@ fn apply_command_effect(
                 let _ = tx.send(Action::DoctorDone(report));
             });
         }
-        CommandEffect::RunSessions { index } => match index {
-            None => {
-                app.status = AgentState::Checking;
-                let tx = tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let result = crate::session::SessionStore::open()
-                        .map_err(|error| error.to_string())
-                        .and_then(|store| {
-                            crate::cli::sessions::numbered_list_text(
-                                &store,
-                                &crate::session::workspace_key(),
-                            )
-                        });
-                    let _ = tx.send(Action::SessionsListed(result));
-                });
-            }
-            Some(number) => spawn_session_resume(app, tx, number),
-        },
+        CommandEffect::RunSessions { number } => spawn_session_resume(app, tx, number),
         CommandEffect::OpenSessionPicker => match crate::session::SessionStore::open() {
             Ok(store) => {
                 app.open_session_picker(&store);
@@ -1230,6 +1335,8 @@ pub struct AtPopupLayout {
 }
 
 /// Cached models for the configured gateway; empty when the cache is cold.
+/// A cache past its TTL still answers: an old list beats an empty picker, and
+/// `seavx model` is what refreshes it.
 fn cached_models(app: &App) -> Vec<String> {
     let base_url = app
         .config
@@ -1238,8 +1345,27 @@ fn cached_models(app: &App) -> Vec<String> {
         .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
     let model_mgr = crate::agent::models::ModelManager::new(std::path::Path::new("."));
     model_mgr
-        .get_cached_models(&crate::agent::models::ModelManager::domain_slug(base_url))
+        .get_cached_models_allow_stale(&crate::agent::models::ModelManager::domain_slug(base_url))
         .unwrap_or_default()
+}
+
+/// Resolve a `/model` argument: a 1-based index into the cached list, or a
+/// literal model name. An index outside the list is an error, never a name —
+/// `/model 9` against three cached models must not save `model = "9"`.
+fn resolve_model_target(models: &[String], target: &str) -> Result<String, String> {
+    let Ok(number) = target.parse::<usize>() else {
+        return Ok(target.to_string());
+    };
+    number
+        .checked_sub(1)
+        .and_then(|index| models.get(index))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "No model number {number} in the cached list ({} known). Run `seavx model` to refresh it.",
+                models.len()
+            )
+        })
 }
 
 /// The store is behind a mutex: the connection is `Send` but not `Sync`, and
@@ -1546,6 +1672,22 @@ pub async fn start_tui(
                         }
                     }
 
+                    // An open picker owns the wheel: the transcript behind it
+                    // is not what the pointer is aiming at.
+                    if matches!(app.modal, Some(ModalSelection::Model { .. })) {
+                        match mouse.kind {
+                            crossterm::event::MouseEventKind::ScrollUp => {
+                                app.step_model_picker(false);
+                                continue;
+                            }
+                            crossterm::event::MouseEventKind::ScrollDown => {
+                                app.step_model_picker(true);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     match mouse.kind {
                         crossterm::event::MouseEventKind::ScrollUp => app.scroll_up(3),
                         crossterm::event::MouseEventKind::ScrollDown => app.scroll_down(3),
@@ -1582,67 +1724,57 @@ pub async fn start_tui(
                     // Modal Key Interceptor (Arrow selection + Enter)
                     if let Some(modal) = app.modal.clone() {
                         match modal {
-                            ModalSelection::Model { models, selected } => match key.code {
-                                KeyCode::Esc => {
-                                    app.modal = None;
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let new_sel = prev_index(selected, models.len());
+                            ModalSelection::Model {
+                                models,
+                                query,
+                                selected,
+                            } => {
+                                // Typing is the search box, so 'j'/'k' no longer
+                                // move: arrows do.
+                                if let Some(query) = edit_query(&query, &key) {
                                     app.modal = Some(ModalSelection::Model {
                                         models,
-                                        selected: new_sel,
+                                        query,
+                                        selected: 0,
                                     });
+                                    continue;
                                 }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let new_sel = next_index(selected, models.len());
-                                    app.modal = Some(ModalSelection::Model {
-                                        models,
-                                        selected: new_sel,
-                                    });
-                                }
-                                KeyCode::Char('r') | KeyCode::Char('R') => {
-                                    // Refresh live models from remote gateway with validation & toast
-                                    let base_url = app
-                                        .config
-                                        .base_url
-                                        .as_deref()
-                                        .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
-                                    let model_mgr = crate::agent::models::ModelManager::new(
-                                        std::path::Path::new("."),
-                                    );
-                                    match model_mgr
-                                        .refresh_remote_models(
-                                            base_url,
-                                            app.config.api_key.as_deref(),
-                                        )
-                                        .await
-                                    {
-                                        Ok(fresh) => {
-                                            let count = fresh.len();
-                                            let new_idx = fresh
-                                                .iter()
-                                                .position(|m| *m == app.config.model)
-                                                .unwrap_or(0);
-                                            app.modal = Some(ModalSelection::Model {
-                                                models: fresh,
-                                                selected: new_idx,
-                                            });
-                                            app.toast = Some((
-                                                format!("✓ Refreshed {count} models from gateway"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                        Err(err) => {
-                                            app.toast = Some((
-                                                format!("✗ Refresh failed: {err}"),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        app.modal = None;
                                     }
-                                }
-                                KeyCode::Enter => {
-                                    if !models.is_empty() && selected < models.len() {
-                                        let chosen_model = models[selected].clone();
+                                    KeyCode::Up => app.step_model_picker(false),
+                                    KeyCode::Down => app.step_model_picker(true),
+                                    KeyCode::Char('r')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                                            && !app.refreshing_models =>
+                                    {
+                                        // The fetch runs off the UI thread: awaiting it
+                                        // here froze the terminal for its whole timeout.
+                                        app.refreshing_models = true;
+                                        let base_url =
+                                            app.config.base_url.clone().unwrap_or_else(|| {
+                                                crate::agent::engine::DEFAULT_BASE_URL.to_string()
+                                            });
+                                        let api_key = app.config.api_key.clone();
+                                        let tx = tx.clone();
+                                        tokio::spawn(async move {
+                                            let model_mgr = crate::agent::models::ModelManager::new(
+                                                std::path::Path::new("."),
+                                            );
+                                            let outcome = model_mgr
+                                                .refresh_remote_models(
+                                                    &base_url,
+                                                    api_key.as_deref(),
+                                                )
+                                                .await;
+                                            let _ = tx.send(Action::ModelsRefreshed(outcome));
+                                        });
+                                    }
+                                    KeyCode::Enter => {
+                                        let chosen = visible_models(&models, &query)
+                                            .get(selected)
+                                            .map(|model| (*model).clone());
                                         let options = EFFORT_LEVELS.to_vec();
                                         let current_eff = app
                                             .config
@@ -1653,17 +1785,15 @@ pub async fn start_tui(
                                             .iter()
                                             .position(|o| *o == current_eff)
                                             .unwrap_or(0);
-                                        app.modal = Some(ModalSelection::Effort {
-                                            model: chosen_model,
+                                        app.modal = chosen.map(|model| ModalSelection::Effort {
+                                            model,
                                             options,
                                             selected: eff_sel,
                                         });
-                                    } else {
-                                        app.modal = None;
                                     }
+                                    _ => {}
                                 }
-                                _ => {}
-                            },
+                            }
                             ModalSelection::Effort {
                                 model,
                                 options,
@@ -1975,16 +2105,10 @@ pub async fn start_tui(
                     ));
                     app.pending_permission = Some(PendingPermission { request, reply });
                 }
+                Action::ModelsRefreshed(result) => app.models_refreshed(result),
                 Action::DoctorDone(report) => {
                     app.status = AgentState::Idle;
                     app.push_notice(crate::cli::doctor::render(&report));
-                }
-                Action::SessionsListed(result) => {
-                    app.status = AgentState::Idle;
-                    match result {
-                        Ok(text) => app.push_notice(text),
-                        Err(error) => app.push_notice(format!("Sessions unavailable: {error}")),
-                    }
                 }
                 Action::SessionResume(result) => {
                     app.status = AgentState::Idle;

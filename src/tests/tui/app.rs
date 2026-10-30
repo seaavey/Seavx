@@ -336,7 +336,7 @@ fn mode_change_is_rejected_while_busy_and_says_so() {
     assert_eq!(app.mode, AgentMode::Build);
     let notice = app.segments.iter().any(|segment| match segment {
         Segment::Text(text) => text.contains("Cannot switch mode"),
-        Segment::Thinking(_) => false,
+        Segment::Notice(_) | Segment::Thinking(_) => false,
     });
     assert!(
         notice,
@@ -449,7 +449,7 @@ fn transcript(app: &App) -> String {
     app.segments
         .iter()
         .map(|segment| match segment {
-            Segment::Text(text) => text.clone(),
+            Segment::Text(text) | Segment::Notice(text) => text.clone(),
             Segment::Thinking(text) => text.clone(),
         })
         .collect()
@@ -486,6 +486,167 @@ fn load_session_rebuilds_segments_in_order_and_reports_omissions() {
     assert!(question < answer, "segments keep stored order: {text}");
     assert_eq!(app.session_id, Some(7));
     assert_eq!(app.total_tokens, 42);
+}
+
+#[test]
+fn resuming_a_session_replaces_the_previous_screen_instead_of_appending_to_it() {
+    let mut app = test_app();
+    app.push_text("previous session output");
+    app.push_notice("previous compaction notice");
+    app.session_context = Some("old summary".to_string());
+    app.set_input("unsent draft from the old session");
+    app.read_only = Some("archived".to_string());
+
+    app.load_session(loaded(vec![
+        stored(1, "user", &genai::chat::ChatMessage::user("new question")),
+        stored(
+            2,
+            "assistant",
+            &genai::chat::ChatMessage::assistant("answer"),
+        ),
+    ]));
+
+    let text = transcript(&app);
+    assert!(text.contains("User: new question"), "{text}");
+    assert!(
+        !text.contains("previous session output") && !text.contains("previous compaction notice"),
+        "the resume starts on a clean screen: {text}"
+    );
+    assert!(
+        app.session_context.is_none(),
+        "the old summary is not the loaded session's"
+    );
+    assert!(app.read_only.is_none(), "a normal session is not read-only");
+    assert_eq!(typed(&app), "", "the old draft does not ride along");
+    assert_eq!(app.session_id, Some(7));
+}
+
+#[test]
+fn a_new_session_drops_the_previous_token_usage() {
+    let mut app = test_app();
+    app.load_session(loaded(vec![]));
+    assert_eq!(app.total_tokens, 42);
+
+    app.start_new_session();
+
+    assert_eq!((app.total_tokens, app.prompt_tokens), (0, 0));
+}
+
+#[test]
+fn typed_letters_are_the_model_filter_and_never_reach_the_row_list() {
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+    assert_eq!(
+        edit_query("", &key(KeyCode::Char('g'))),
+        Some("g".to_string())
+    );
+    assert_eq!(
+        edit_query("g", &key(KeyCode::Char('p'))),
+        Some("gp".to_string())
+    );
+    assert_eq!(
+        edit_query("gp", &key(KeyCode::Backspace)),
+        Some("g".to_string())
+    );
+    assert_eq!(
+        edit_query("", &key(KeyCode::Backspace)),
+        Some(String::new())
+    );
+    assert_eq!(
+        edit_query("g", &key(KeyCode::Up)),
+        None,
+        "arrows still move"
+    );
+    assert_eq!(
+        edit_query(
+            "g",
+            &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
+        ),
+        None,
+        "ctrl+r still refreshes instead of typing"
+    );
+
+    let models = ["openai_codex/gpt-6-luna", "claude-sonnet", "GPT-4o"]
+        .map(str::to_string)
+        .to_vec();
+    let visible = visible_models(&models, "GPT");
+    assert_eq!(
+        visible,
+        vec![&models[0], &models[2]],
+        "matching is case-insensitive and untrimmed"
+    );
+    assert!(
+        visible_models(&models, "").len() == 3,
+        "an empty query keeps every row"
+    );
+    assert!(visible_models(&models, "zen").is_empty());
+}
+
+#[test]
+fn stepping_the_model_picker_wraps_inside_the_filtered_rows() {
+    let mut app = test_app();
+    app.modal = picker(&["alpha", "beta", "gamma"], 2);
+
+    // The wheel and Down are the same call.
+    app.step_model_picker(true);
+    assert_eq!(selected_of(&app), 0, "the last row wraps to the first");
+    app.step_model_picker(false);
+    assert_eq!(selected_of(&app), 2, "and back up wraps to the last");
+
+    // One matching row: stepping cannot leave it.
+    app.modal = Some(ModalSelection::Model {
+        models: ["alpha", "beta", "gamma"].map(str::to_string).to_vec(),
+        query: "et".to_string(),
+        selected: 0,
+    });
+    for down in [true, false, true] {
+        app.step_model_picker(down);
+        assert_eq!(selected_of(&app), 0, "the only filtered row stays selected");
+    }
+
+    // No picker at all: the wheel is a no-op instead of a panic.
+    app.modal = None;
+    app.step_model_picker(true);
+}
+
+fn selected_of(app: &App) -> usize {
+    match &app.modal {
+        Some(ModalSelection::Model { selected, .. }) => *selected,
+        other => panic!("the model picker is open: {other:?}"),
+    }
+}
+
+#[test]
+fn a_refresh_keeps_the_filter_and_the_cursor_stays_inside_it() {
+    let mut app = test_app();
+    app.config.model = "beta".to_string();
+    app.modal = Some(ModalSelection::Model {
+        models: vec!["alpha".to_string()],
+        query: "et".to_string(),
+        selected: 0,
+    });
+
+    app.models_refreshed(Ok(vec![
+        "alpha".to_string(),
+        "beta".to_string(),
+        "gamma".to_string(),
+    ]));
+
+    match &app.modal {
+        Some(ModalSelection::Model {
+            models,
+            query,
+            selected,
+        }) => {
+            assert_eq!(query, "et", "the typed filter survives the refresh");
+            assert_eq!(models.len(), 3);
+            assert_eq!(
+                *selected, 0,
+                "beta is the only filtered row, so it is row 0"
+            );
+        }
+        other => panic!("the picker stays open: {other:?}"),
+    }
 }
 
 #[test]
@@ -845,4 +1006,92 @@ fn ctrl_c_needs_a_second_press_and_a_plain_key_is_not_a_shortcut() {
         &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
     ));
     assert!(!app.should_quit, "a bare d is still text");
+}
+
+#[test]
+fn model_index_outside_the_cached_list_is_an_error_not_a_name() {
+    let cached: Vec<String> = ["alpha", "beta"].iter().map(|m| m.to_string()).collect();
+
+    assert_eq!(resolve_model_target(&cached, "1").unwrap(), "alpha");
+    assert_eq!(resolve_model_target(&cached, "2").unwrap(), "beta");
+    assert_eq!(
+        resolve_model_target(&cached, "gpt-4o").unwrap(),
+        "gpt-4o",
+        "a name is never looked up in the cache"
+    );
+
+    for out_of_range in ["0", "3", "99"] {
+        assert!(
+            resolve_model_target(&cached, out_of_range).is_err(),
+            "`{out_of_range}` must not be saved as a model name"
+        );
+    }
+    assert!(
+        resolve_model_target(&[], "1").is_err(),
+        "a cold cache rejects every index"
+    );
+}
+
+fn picker(models: &[&str], selected: usize) -> Option<ModalSelection> {
+    Some(ModalSelection::Model {
+        models: models.iter().map(|model| model.to_string()).collect(),
+        query: String::new(),
+        selected,
+    })
+}
+
+#[test]
+fn a_finished_refresh_replaces_the_open_picker_and_stops_the_spinner() {
+    let mut app = test_app();
+    app.config.model = "beta".to_string();
+    app.modal = picker(&["alpha"], 0);
+    app.refreshing_models = true;
+
+    app.models_refreshed(Ok(vec!["alpha".to_string(), "beta".to_string()]));
+
+    assert!(!app.refreshing_models, "the spinner stops");
+    match &app.modal {
+        Some(ModalSelection::Model {
+            models, selected, ..
+        }) => {
+            assert_eq!(models, &["alpha", "beta"]);
+            assert_eq!(*selected, 1, "the active model is where the cursor lands");
+        }
+        other => panic!("the picker stays open: {other:?}"),
+    }
+    let (toast, _) = app.toast.clone().expect("the count is reported");
+    assert!(toast.starts_with('✓'), "{toast}");
+}
+
+#[test]
+fn a_refresh_that_lands_after_the_picker_closed_only_toasts() {
+    let mut app = test_app();
+    app.modal = None;
+    app.refreshing_models = true;
+
+    app.models_refreshed(Ok(vec!["alpha".to_string()]));
+
+    assert!(!app.refreshing_models);
+    assert!(
+        app.modal.is_none(),
+        "Esc keeps the picker closed instead of it popping back open"
+    );
+    assert!(app.toast.is_some());
+}
+
+#[test]
+fn a_failed_refresh_stops_the_spinner_and_says_why() {
+    let mut app = test_app();
+    app.modal = picker(&["alpha"], 0);
+    app.refreshing_models = true;
+
+    app.models_refreshed(Err("gateway returned error status: 429".to_string()));
+
+    assert!(!app.refreshing_models);
+    assert!(matches!(
+        app.modal,
+        Some(ModalSelection::Model { ref models, .. }) if models == &["alpha"]
+    ));
+    let (toast, _) = app.toast.clone().expect("the failure is reported");
+    assert!(toast.contains("429"), "{toast}");
 }

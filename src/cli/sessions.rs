@@ -136,7 +136,7 @@ async fn open_session(store: &SessionStore, workspace: &str, id: i64) -> anyhow:
     crate::tui::app::start_tui(None, Some(loaded)).await
 }
 
-/// One compact row per session, newest first: the `/resume` picker's rows.
+/// One compact row per session, newest first: the `/sessions` picker's rows.
 pub fn session_rows(store: &SessionStore, workspace: &str) -> Result<Vec<String>, String> {
     let summaries = store.list(workspace).map_err(|error| error.to_string())?;
     let now = crate::util::epoch_secs() as i64;

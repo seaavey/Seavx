@@ -82,6 +82,7 @@ pub fn transcript_from_segments(segments: &[Segment]) -> String {
         .iter()
         .map(|segment| match segment {
             Segment::Text(text) => text.clone(),
+            Segment::Notice(text) => text.clone(),
             Segment::Thinking(text) => format!("[reasoning]\n{text}"),
         })
         .collect::<Vec<_>>()

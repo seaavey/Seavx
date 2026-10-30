@@ -511,7 +511,9 @@ fn the_interrupted_notice_reaches_the_transcript() {
         .segments
         .iter()
         .filter_map(|segment| match segment {
-            crate::tui::app::Segment::Text(text) => Some(text.as_str()),
+            crate::tui::app::Segment::Text(text) | crate::tui::app::Segment::Notice(text) => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<String>();

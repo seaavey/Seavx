@@ -970,7 +970,9 @@ fn an_unparseable_payload_opens_the_session_read_only() {
         .segments
         .iter()
         .map(|segment| match segment {
-            crate::tui::app::Segment::Text(text) => text.clone(),
+            crate::tui::app::Segment::Text(text) | crate::tui::app::Segment::Notice(text) => {
+                text.clone()
+            }
             crate::tui::app::Segment::Thinking(text) => text.clone(),
         })
         .collect::<String>();
