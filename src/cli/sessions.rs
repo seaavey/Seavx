@@ -15,6 +15,9 @@ pub enum SessionsCommand {
     Show {
         /// Session id, `svx-…` (a bare number still works)
         id: String,
+        /// Append the stored execution trace, in order
+        #[arg(long)]
+        events: bool,
     },
     /// Open one session in the TUI
     Resume {
@@ -39,11 +42,11 @@ pub async fn run(command: SessionsCommand) -> anyhow::Result<()> {
                 list_text(&store, &workspace).map_err(anyhow::Error::msg)?
             );
         }
-        SessionsCommand::Show { id } => {
+        SessionsCommand::Show { id, events } => {
             let id = resolve(&store, &id)?;
             print!(
                 "{}",
-                show_text(&store, &workspace, id).map_err(anyhow::Error::msg)?
+                show_text(&store, &workspace, id, events).map_err(anyhow::Error::msg)?
             );
         }
         SessionsCommand::Export { id } => {
@@ -268,7 +271,12 @@ pub fn resume_by_number(
 
 /// Full transcript with the header the spec asks for: id, title, model,
 /// payload format and usage.
-pub fn show_text(store: &SessionStore, workspace: &str, id: i64) -> Result<String, String> {
+pub fn show_text(
+    store: &SessionStore,
+    workspace: &str,
+    id: i64,
+    events: bool,
+) -> Result<String, String> {
     let session = resume_target(store, workspace, id)?;
     let mut out = format!(
         "Session {} · {}\n",
@@ -287,6 +295,37 @@ pub fn show_text(store: &SessionStore, workspace: &str, id: i64) -> Result<Strin
     }
     out.push('\n');
     out.push_str(&crate::session::render_text(&session));
+
+    if events {
+        // The stored trace, in database order: safe metadata only, never the
+        // transcript bodies the rows already hold.
+        out.push_str("\nTrace:\n");
+        let stored = store.events(id).map_err(|error| error.to_string())?;
+        if stored.is_empty() {
+            out.push_str("(no events recorded)\n");
+        }
+        for event in stored {
+            out.push_str(&format!(
+                "{:>3} {} {}{}{}{}\n",
+                event.seq,
+                event.kind,
+                event.status,
+                event
+                    .failure
+                    .map(|failure| format!(" · {failure}"))
+                    .unwrap_or_default(),
+                event
+                    .tool_call_id
+                    .map(|call| format!(" {call}"))
+                    .unwrap_or_default(),
+                if event.summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", event.summary)
+                },
+            ));
+        }
+    }
     Ok(out)
 }
 

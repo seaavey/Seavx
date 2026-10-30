@@ -117,6 +117,7 @@ stays session-free and writes nothing.
 ```bash
 seavx sessions list          # slug, age, messages, state, title
 seavx sessions show svx-2f124b69   # full transcript
+seavx sessions show svx-2f124b69 --events  # transcript plus the stored tool/turn trace
 seavx sessions export svx-2f124b69 > session.json
 seavx sessions resume svx-2f124b69 # open the TUI with that session
 seavx resume                 # list them and pick a number
