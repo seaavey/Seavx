@@ -51,6 +51,7 @@ pub enum CommandId {
     Goal,
     Tasks,
     Test,
+    Preset,
     Steer,
     Queue,
     Status,
@@ -103,6 +104,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "/review [working-tree|staged|commit <ref>|base <ref>]",
         summary: "Review a git target and report findings, read-only",
         id: CommandId::Review,
+    },
+    CommandSpec {
+        name: "/preset",
+        usage: "/preset [name]",
+        summary: "List prompt presets, or put one in the next prompt",
+        id: CommandId::Preset,
     },
     CommandSpec {
         name: "/test",
@@ -223,6 +230,10 @@ pub enum SlashCommand {
         effort: Option<String>,
     },
     Clear,
+    /// List presets, or preview and apply one to the next prompt.
+    Preset {
+        name: Option<String>,
+    },
     /// Propose and, once permitted, run the workspace's test command.
     Test,
     /// Talk to the turn that is running; delivered at its next safe boundary.
@@ -445,6 +456,13 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         },
         CommandId::Ask => SlashCommand::Ask {
             question: args.join(" "),
+        },
+        CommandId::Preset => match args.as_slice() {
+            [] => SlashCommand::Preset { name: None },
+            [name] => SlashCommand::Preset {
+                name: Some((*name).to_string()),
+            },
+            _ => SlashCommand::Unknown(trimmed.to_string()),
         },
         CommandId::Test => SlashCommand::Test,
         CommandId::Steer => SlashCommand::Steer {
@@ -857,6 +875,42 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         // Handled above the busy gate; unreachable here, but the match must
         // still say so.
         SlashCommand::Steer { .. } | SlashCommand::Queue { .. } => CommandEffect::Handled,
+        SlashCommand::Preset { name } => {
+            // The workspace the session belongs to, not the process cwd.
+            let root = app.root.clone();
+            let root = root.as_path();
+            match name {
+                None => {
+                    let found = crate::agent::presets::list(root);
+                    if found.is_empty() {
+                        app.push_notice(
+                            "No presets yet. Add .seavx/prompts/<name>.md (project) or ~/.seavx/prompts/<name>.md (everywhere)."
+                                .to_string(),
+                        );
+                    } else {
+                        let names: Vec<String> = found
+                            .into_iter()
+                            .map(|(name, path)| format!("{name}  ({})", path.display()))
+                            .collect();
+                        app.push_notice(format!("Presets:\n{}", names.join("\n")));
+                    }
+                }
+                Some(name) => match crate::agent::presets::load(root, &name) {
+                    Ok(text) => {
+                        let preview: Vec<&str> = text.lines().take(3).collect();
+                        // The preset becomes the next prompt; it never reaches
+                        // the system prompt or the permission policy.
+                        app.set_input(&text);
+                        app.push_notice(format!(
+                            "Preset '{name}' loaded into the prompt:\n{}",
+                            preview.join("\n")
+                        ));
+                    }
+                    Err(error) => app.push_notice(error),
+                },
+            }
+            CommandEffect::Handled
+        }
         SlashCommand::Test => CommandEffect::RunTest,
         SlashCommand::Sessions { index } => match index {
             // The picker is the list: no number means "let me choose".

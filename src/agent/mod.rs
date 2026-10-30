@@ -8,6 +8,7 @@ pub mod git_review;
 pub mod models;
 pub mod patch;
 pub mod permissions;
+pub mod presets;
 pub mod prompt;
 pub mod questions;
 pub mod review;

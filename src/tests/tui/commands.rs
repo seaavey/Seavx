@@ -113,6 +113,7 @@ fn every_registry_entry_parses_to_a_handled_command() {
                 action: SkillsAction::List,
             },
         ),
+        ("/preset", SlashCommand::Preset { name: None }),
         ("/test", SlashCommand::Test),
         (
             "/steer",
@@ -259,6 +260,7 @@ fn the_palette_is_the_table() {
             "/plan",
             "/ask",
             "/review",
+            "/preset",
             "/test",
             "/steer",
             "/queue",
@@ -1130,4 +1132,43 @@ fn test_counts_come_from_cargos_summary_or_are_unavailable() {
     assert!(failed.contains("failed"), "{failed}");
     let unknown = test_report("cargo test", Some(0), output, true);
     assert!(unknown.contains("counts unavailable"), "{unknown}");
+}
+
+#[test]
+fn a_preset_lands_in_the_next_prompt_and_never_in_the_policy() {
+    use crate::agent::presets;
+
+    let root = tempfile::TempDir::new().unwrap();
+    let dir = presets::project_dir(root.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    // HOME is not moved: `load_in` takes the user directory explicitly.
+    std::fs::write(dir.join("triage.md"), "Triage the failing tests first.").unwrap();
+
+    let mut app = crate::tui::app::test_app();
+    app.root = root.path().to_path_buf();
+    let effect = execute(
+        &mut app,
+        SlashCommand::Preset {
+            name: Some("../outside".to_string()),
+        },
+    );
+    assert!(matches!(effect, CommandEffect::Handled));
+    assert!(
+        app.input.lines().join("").trim().is_empty(),
+        "a bad name changes nothing"
+    );
+
+    // A real preset is applied to the input, not to the system prompt.
+    let before = app.config.system_prompt.clone();
+    execute(
+        &mut app,
+        SlashCommand::Preset {
+            name: Some("triage".to_string()),
+        },
+    );
+    assert_eq!(app.input.lines(), vec!["Triage the failing tests first."]);
+    assert_eq!(
+        app.config.system_prompt, before,
+        "the system prompt is untouched"
+    );
 }

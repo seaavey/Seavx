@@ -138,7 +138,7 @@ impl App<'_> {
         self.history_draft.clear();
     }
 
-    pub(super) fn set_input(&mut self, text: &str) {
+    pub(crate) fn set_input(&mut self, text: &str) {
         self.ghost_typed = None;
         self.input = new_input();
         self.input.insert_str(text);
