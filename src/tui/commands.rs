@@ -16,7 +16,12 @@ use crate::tui::event::AgentState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalAction {
     New(String),
-    Edit,
+    /// Replace the draft's objective, or show it when no text is given.
+    Edit(Option<String>),
+    CriteriaAdd(String),
+    CriteriaRemove(usize),
+    TaskAdd(String),
+    TaskRemove(usize),
     Approve,
     Show(Option<i64>),
     Pause(Option<i64>),
@@ -158,7 +163,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/goal",
-        usage: "/goal <objective> | edit | approve | show | pause | resume | cancel [id]",
+        usage: "/goal <objective> | edit [text] | criteria add|remove <n|text> | task add|remove <n|text> | approve | show | pause | resume | cancel [id]",
         summary: "Draft, approve and track a durable goal",
         id: CommandId::Goal,
     },
@@ -361,7 +366,26 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
                 action: GoalAction::Show(None),
             },
             ["edit"] => SlashCommand::Goal {
-                action: GoalAction::Edit,
+                action: GoalAction::Edit(None),
+            },
+            ["edit", objective @ ..] => SlashCommand::Goal {
+                action: GoalAction::Edit(Some(objective.join(" "))),
+            },
+            ["criteria", "add", text @ ..] if !text.is_empty() => SlashCommand::Goal {
+                action: GoalAction::CriteriaAdd(text.join(" ")),
+            },
+            ["task", "add", text @ ..] if !text.is_empty() => SlashCommand::Goal {
+                action: GoalAction::TaskAdd(text.join(" ")),
+            },
+            [kind @ ("criteria" | "task"), "remove", number] => match number.parse::<usize>() {
+                Ok(index) if index > 0 => SlashCommand::Goal {
+                    action: if *kind == "criteria" {
+                        GoalAction::CriteriaRemove(index - 1)
+                    } else {
+                        GoalAction::TaskRemove(index - 1)
+                    },
+                },
+                _ => SlashCommand::Unknown(trimmed.to_string()),
             },
             ["approve"] => SlashCommand::Goal {
                 action: GoalAction::Approve,

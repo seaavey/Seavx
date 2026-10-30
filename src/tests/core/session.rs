@@ -1907,3 +1907,22 @@ fn tasks_are_the_plan_and_never_the_completion_gate() {
         "tasks never gate completion: {blocker}"
     );
 }
+
+#[test]
+fn a_draft_objective_can_be_edited_and_an_active_one_cannot() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create_goal("ws", None, "first wording").unwrap();
+
+    store
+        .set_goal_objective("ws", id, "second wording")
+        .unwrap();
+    assert_eq!(store.goal("ws", id).unwrap().objective, "second wording");
+
+    store.set_goal_state("ws", id, GoalState::Active).unwrap();
+    assert!(
+        store.set_goal_objective("ws", id, "third wording").is_err(),
+        "an approved goal is not editable"
+    );
+    assert_eq!(store.goal("ws", id).unwrap().objective, "second wording");
+}

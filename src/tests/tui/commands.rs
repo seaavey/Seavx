@@ -929,7 +929,7 @@ fn goal_parses_every_documented_form() {
         ("/goal", GoalAction::Show(None)),
         ("/goal show", GoalAction::Show(None)),
         ("/goal show 3", GoalAction::Show(Some(3))),
-        ("/goal edit", GoalAction::Edit),
+        ("/goal edit", GoalAction::Edit(None)),
         ("/goal approve", GoalAction::Approve),
         ("/goal pause", GoalAction::Pause(None)),
         ("/goal resume 2", GoalAction::Resume(Some(2))),
@@ -980,4 +980,32 @@ fn status_shows_the_goal_line_only_when_one_is_held() {
         "{}",
         status_text(&app)
     );
+}
+
+#[test]
+fn goal_editing_parses_and_stays_draft_only() {
+    for (input, action) in [
+        (
+            "/goal edit ship it",
+            GoalAction::Edit(Some("ship it".to_string())),
+        ),
+        (
+            "/goal criteria add tests pass",
+            GoalAction::CriteriaAdd("tests pass".to_string()),
+        ),
+        ("/goal criteria remove 2", GoalAction::CriteriaRemove(1)),
+        (
+            "/goal task add write code",
+            GoalAction::TaskAdd("write code".to_string()),
+        ),
+        ("/goal task remove 1", GoalAction::TaskRemove(0)),
+    ] {
+        assert_eq!(parse(input), Some(SlashCommand::Goal { action }), "{input}");
+    }
+    for bad in ["/goal criteria remove zero", "/goal task remove 0"] {
+        assert!(
+            matches!(parse(bad), Some(SlashCommand::Unknown(_))),
+            "{bad}"
+        );
+    }
 }

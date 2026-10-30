@@ -58,17 +58,87 @@ fn run_goal(
                 "Goal {id} drafted: {objective}\nUse /goal edit to add criteria and tasks, then /goal approve."
             ))
         }
-        GoalAction::Edit => {
+        GoalAction::Edit(objective) => {
+            let id = resolve(None)?;
             let goal = store
-                .goal(workspace, resolve(None)?)
+                .goal(workspace, id)
                 .map_err(|error| error.to_string())?;
-            Ok(format!(
-                "Goal {}: {}\nEdit is not interactive yet; the draft holds {} criteria and {} tasks.",
-                goal.id,
-                goal.objective,
-                goal.criteria.len(),
-                goal.tasks.len()
-            ))
+            let Some(objective) = objective else {
+                return Ok(format!(
+                    "Goal {}: {}\n{} criteria, {} tasks. Edit with /goal edit <text>, /goal criteria add <text>, /goal task add <text>.",
+                    goal.id,
+                    goal.objective,
+                    goal.criteria.len(),
+                    goal.tasks.len()
+                ));
+            };
+            let criteria: Vec<String> = goal.criteria.iter().map(|c| c.text.clone()).collect();
+            let tasks: Vec<String> = goal.tasks.iter().map(|t| t.title.clone()).collect();
+            store
+                .set_goal_objective(workspace, id, &objective)
+                .map_err(|error| error.to_string())?;
+            store
+                .set_goal_plan(workspace, id, &criteria, &tasks)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id} objective updated."))
+        }
+        GoalAction::CriteriaAdd(text) => {
+            let id = resolve(None)?;
+            let goal = store
+                .goal(workspace, id)
+                .map_err(|error| error.to_string())?;
+            let mut criteria: Vec<String> = goal.criteria.iter().map(|c| c.text.clone()).collect();
+            criteria.push(text);
+            let tasks: Vec<String> = goal.tasks.iter().map(|t| t.title.clone()).collect();
+            store
+                .set_goal_plan(workspace, id, &criteria, &tasks)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id}: {} criteria.", criteria.len()))
+        }
+        GoalAction::TaskAdd(text) => {
+            let id = resolve(None)?;
+            let goal = store
+                .goal(workspace, id)
+                .map_err(|error| error.to_string())?;
+            let criteria: Vec<String> = goal.criteria.iter().map(|c| c.text.clone()).collect();
+            let mut tasks: Vec<String> = goal.tasks.iter().map(|t| t.title.clone()).collect();
+            tasks.push(text);
+            store
+                .set_goal_plan(workspace, id, &criteria, &tasks)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id}: {} tasks.", tasks.len()))
+        }
+        GoalAction::CriteriaRemove(index) => {
+            let id = resolve(None)?;
+            let goal = store
+                .goal(workspace, id)
+                .map_err(|error| error.to_string())?;
+            let mut criteria: Vec<String> = goal.criteria.iter().map(|c| c.text.clone()).collect();
+            let tasks: Vec<String> = goal.tasks.iter().map(|t| t.title.clone()).collect();
+            if index >= criteria.len() {
+                return Err(format!("there is no criterion {}", index + 1));
+            }
+            criteria.remove(index);
+            store
+                .set_goal_plan(workspace, id, &criteria, &tasks)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id}: {} criteria.", criteria.len()))
+        }
+        GoalAction::TaskRemove(index) => {
+            let id = resolve(None)?;
+            let goal = store
+                .goal(workspace, id)
+                .map_err(|error| error.to_string())?;
+            let criteria: Vec<String> = goal.criteria.iter().map(|c| c.text.clone()).collect();
+            let mut tasks: Vec<String> = goal.tasks.iter().map(|t| t.title.clone()).collect();
+            if index >= tasks.len() {
+                return Err(format!("there is no task {}", index + 1));
+            }
+            tasks.remove(index);
+            store
+                .set_goal_plan(workspace, id, &criteria, &tasks)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id}: {} tasks.", tasks.len()))
         }
         GoalAction::Approve => {
             let id = resolve(None)?;

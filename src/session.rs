@@ -1531,6 +1531,52 @@ impl SessionStore {
         ids.into_iter().map(|id| self.goal(workspace, id)).collect()
     }
 
+    /// Replace a draft's objective. Only a draft is editable.
+    pub fn set_goal_objective(
+        &self,
+        workspace: &str,
+        id: i64,
+        objective: &str,
+    ) -> Result<(), SessionError> {
+        let now = crate::util::epoch_secs() as i64;
+        let objective = crate::agent::events::bounded(
+            &crate::agent::security::redact(objective),
+            crate::agent::events::SUMMARY_LIMIT,
+        );
+        if objective.trim().is_empty() {
+            return Err(SessionError::Refused(
+                "a goal needs an objective".to_string(),
+            ));
+        }
+        self.write(|connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let written = (|| {
+                let state = goal_state(connection, workspace, id)?;
+                if state != GoalState::Draft {
+                    return Err(SessionError::Refused(format!(
+                        "goal {id} is {}; only a draft can be edited",
+                        state.as_str()
+                    )));
+                }
+                connection.execute(
+                    "UPDATE goals SET objective = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![id, objective, now],
+                )?;
+                log_goal_event(
+                    connection,
+                    id,
+                    None,
+                    "goal",
+                    "draft",
+                    "objective edited",
+                    now,
+                )?;
+                Ok(())
+            })();
+            finish(connection, written)
+        })?
+    }
+
     /// Replace the draft's criteria and ordered tasks. Only a draft is editable.
     pub fn set_goal_plan(
         &self,
