@@ -1170,6 +1170,132 @@ mod engine_seam {
         let (answer, _) = run_review(&runtime).await;
         assert!(answer.is_err(), "a provider failure cannot be clean");
     }
+
+    /// Records what was asked and answers with a fixed value.
+    #[derive(Default)]
+    struct RecordingQuestioner {
+        asked: std::sync::Mutex<Vec<crate::agent::questions::QuestionRequest>>,
+        answer: Option<crate::agent::questions::QuestionAnswer>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::agent::questions::Questioner for RecordingQuestioner {
+        async fn ask(
+            &self,
+            request: crate::agent::questions::QuestionRequest,
+        ) -> crate::agent::questions::QuestionAnswer {
+            self.asked.lock().unwrap().push(request);
+            self.answer
+                .clone()
+                .unwrap_or(crate::agent::questions::QuestionAnswer::Answered(
+                    "b.rs".to_string(),
+                ))
+        }
+    }
+
+    fn ask_call(call_id: &str, question: &str) -> genai::chat::ToolCall {
+        serde_json::from_value(serde_json::json!({
+            "call_id": call_id,
+            "fn_name": "ask_user",
+            "fn_arguments": { "question": question, "kind": "text" },
+        }))
+        .unwrap()
+    }
+
+    fn tool_responses(messages: &[ChatMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .flat_map(|message| message.content.tool_responses())
+            .map(|response| response.call_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_question_is_answered_before_the_dependent_call_gets_a_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            ask_call("call_ask", "Which file should I change?"),
+            tool_call("call_read", "list_directory"),
+        ])));
+        fake.push(response(MessageContent::from_text("done")));
+        let questioner = std::sync::Arc::new(RecordingQuestioner::default());
+        let runtime = runtime_with(&fake, temp.path()).with_questioner(questioner.clone());
+
+        runtime
+            .execute_task(
+                "do it",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let asked = questioner.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1, "the host was asked exactly once");
+        assert_eq!(asked[0].question, "Which file should I change?");
+        assert_eq!(asked[0].call_id, "call_ask");
+
+        let last = fake.requests().last().cloned().unwrap();
+        assert_eq!(
+            tool_responses(&last),
+            vec!["call_ask".to_string(), "call_read".to_string()],
+            "one correlated result each, in call order"
+        );
+        let answer = last
+            .iter()
+            .flat_map(|message| message.content.tool_responses())
+            .find(|response| response.call_id == "call_ask")
+            .map(|response| response.content.clone())
+            .unwrap();
+        assert!(answer.contains("b.rs"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn without_a_human_the_question_returns_unavailable_and_the_turn_ends() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![ask_call(
+            "call_ask",
+            "Which file?",
+        )])));
+        fake.push(response(MessageContent::from_text(
+            "I could not determine that",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let answer = runtime
+            .execute_task(
+                "do it",
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+        assert_eq!(answer, "I could not determine that");
+
+        let last = fake.requests().last().cloned().unwrap();
+        let unavailable = last
+            .iter()
+            .flat_map(|message| message.content.tool_responses())
+            .find(|response| response.call_id == "call_ask")
+            .map(|response| response.content.clone())
+            .unwrap();
+        assert!(
+            unavailable.contains("No human is available"),
+            "{unavailable}"
+        );
+    }
 }
 
 #[cfg(test)]

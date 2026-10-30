@@ -675,6 +675,8 @@ pub struct AgentRuntime {
     registry: ToolRegistry,
     security: WorkspaceSecurity,
     config: AgentConfig,
+    /// Who answers `ask_user`. Headless runs keep the default: nobody.
+    questioner: std::sync::Arc<dyn crate::agent::questions::Questioner>,
 }
 
 impl AgentRuntime {
@@ -727,7 +729,18 @@ impl AgentRuntime {
             registry: ToolRegistry::with_default_tools(),
             security,
             config,
+            questioner: std::sync::Arc::new(crate::agent::questions::UnavailableQuestioner),
         }
+    }
+
+    /// Swap who answers `ask_user`. The TUI sets a human; `exec` keeps the
+    /// default, so a headless run never waits.
+    pub fn with_questioner(
+        mut self,
+        questioner: std::sync::Arc<dyn crate::agent::questions::Questioner>,
+    ) -> Self {
+        self.questioner = questioner;
+        self
     }
 
     /// Swap the provider seam; only tests use it, production always talks genai.
@@ -1162,51 +1175,68 @@ impl AgentRuntime {
                 }
 
                 lifecycle(ToolStatus::Running, None, None);
-                let (result_str, end) = match self.registry.get_for_mode(tool_name, mode) {
-                    Ok(tool) => {
-                        let args = call.fn_arguments.clone();
-                        let destination = tool.destination(&args, &self.security);
-                        let kind = effective_kind(
-                            crate::home::dir().as_deref(),
-                            &self.security,
-                            tool.classify(&args, &self.security),
-                            destination.as_deref(),
-                        );
-                        let detail = destination
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| args_summary.clone());
-                        match self.gate(confirm, kind, tool_name, &detail).await {
-                            Ok(()) => match tool.execute(args, &self.security, cancel).await {
-                                // A tool that returns after the cancel landed did
-                                // not complete: it was cut short, whatever the
-                                // command itself printed.
-                                Ok(res) => {
-                                    let end = if cancel.is_cancelled() {
-                                        ToolEnd::Cancelled
-                                    } else {
-                                        ToolEnd::Done
-                                    };
-                                    (res, end)
-                                }
-                                Err(err) => {
-                                    let message = format!("Error executing {tool_name}: {err}");
-                                    let end = if cancel.is_cancelled() {
-                                        ToolEnd::Cancelled
-                                    } else {
-                                        ToolEnd::Failed(FailureKind::for_tool_error(&message))
-                                    };
-                                    (message, end)
-                                }
-                            },
-                            Err(denied) => (denied, ToolEnd::Failed(FailureKind::PermissionDenied)),
+                let (result_str, end) = if tool_name == "ask_user" {
+                    // The engine asks the human itself: no later tool call runs
+                    // until the answer arrives, and no provider request starts.
+                    match crate::agent::questions::parse_request(&call_id, &call.fn_arguments) {
+                        Ok(request) => {
+                            let answer = self.questioner.ask(request).await;
+                            (answer.tool_result(), ToolEnd::Done)
                         }
+                        Err(error) => (
+                            format!("Error executing ask_user: {error}"),
+                            ToolEnd::Failed(FailureKind::Tool),
+                        ),
                     }
-                    // The tool exists but this mode does not export it: a
-                    // dispatch bug, not a tool that failed.
-                    Err(err) => (
-                        format!("Error executing {tool_name}: {err}"),
-                        ToolEnd::Failed(FailureKind::Internal),
-                    ),
+                } else {
+                    match self.registry.get_for_mode(tool_name, mode) {
+                        Ok(tool) => {
+                            let args = call.fn_arguments.clone();
+                            let destination = tool.destination(&args, &self.security);
+                            let kind = effective_kind(
+                                crate::home::dir().as_deref(),
+                                &self.security,
+                                tool.classify(&args, &self.security),
+                                destination.as_deref(),
+                            );
+                            let detail = destination
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| args_summary.clone());
+                            match self.gate(confirm, kind, tool_name, &detail).await {
+                                Ok(()) => match tool.execute(args, &self.security, cancel).await {
+                                    // A tool that returns after the cancel landed did
+                                    // not complete: it was cut short, whatever the
+                                    // command itself printed.
+                                    Ok(res) => {
+                                        let end = if cancel.is_cancelled() {
+                                            ToolEnd::Cancelled
+                                        } else {
+                                            ToolEnd::Done
+                                        };
+                                        (res, end)
+                                    }
+                                    Err(err) => {
+                                        let message = format!("Error executing {tool_name}: {err}");
+                                        let end = if cancel.is_cancelled() {
+                                            ToolEnd::Cancelled
+                                        } else {
+                                            ToolEnd::Failed(FailureKind::for_tool_error(&message))
+                                        };
+                                        (message, end)
+                                    }
+                                },
+                                Err(denied) => {
+                                    (denied, ToolEnd::Failed(FailureKind::PermissionDenied))
+                                }
+                            }
+                        }
+                        // The tool exists but this mode does not export it: a
+                        // dispatch bug, not a tool that failed.
+                        Err(err) => (
+                            format!("Error executing {tool_name}: {err}"),
+                            ToolEnd::Failed(FailureKind::Internal),
+                        ),
+                    }
                 };
                 let is_err = !matches!(end, ToolEnd::Done);
 

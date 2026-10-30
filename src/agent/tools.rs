@@ -437,6 +437,55 @@ struct RunCommandArgs {
     command: String,
 }
 
+/// The model-visible clarification tool. The engine intercepts it and asks the
+/// host [`crate::agent::questions::Questioner`]; executed on its own it can only
+/// answer "nobody is here", which is the honest headless result.
+pub struct AskUserTool;
+
+#[derive(Deserialize, JsonSchema)]
+// Fields exist for the exported schema; the engine parses the arguments.
+#[allow(dead_code)]
+struct AskUserArgs {
+    /// The question, in one or two sentences.
+    question: String,
+    /// `single`, `multi` or `text` (default).
+    kind: Option<String>,
+    /// Labels to choose from; required for `single` and `multi`.
+    options: Option<Vec<String>>,
+}
+
+#[async_trait]
+impl AgentTool for AskUserTool {
+    fn name(&self) -> &'static str {
+        "ask_user"
+    }
+
+    fn classify(&self, _args: &Value, _security: &WorkspaceSecurity) -> ActionKind {
+        ActionKind::Read
+    }
+
+    fn description(&self) -> &'static str {
+        "Ask the user one structured question and wait for the answer"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn parameters_schema(&self) -> Value {
+        schema::<AskUserArgs>()
+    }
+
+    async fn execute(
+        &self,
+        _args: Value,
+        _security: &WorkspaceSecurity,
+        _cancel: &CancelToken,
+    ) -> Result<String, String> {
+        Ok(crate::agent::questions::QuestionAnswer::Unavailable.tool_result())
+    }
+}
+
 /// The whole Ask tool set: workspace-bounded readers only. Shared by export and
 /// dispatch so the two cannot drift.
 pub const ASK_TOOLS: &[&str] = &["read_file", "list_directory", "search_files"];
