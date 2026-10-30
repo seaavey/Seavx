@@ -2252,3 +2252,240 @@ fn search_is_literal_bounded_and_workspace_scoped() {
     assert_eq!(store.search("ws", "parser", true, 10).unwrap().len(), 1);
     assert!(store.search("ws", "   ", false, 10).unwrap().is_empty());
 }
+
+/// The tables a schema-v4 binary wrote: the v2 transcript, the v3 ledger and
+/// the v4 goals block. Copied from that commit, not rebuilt from today's
+/// `SCHEMA`, so a missing migration step shows up as a failure here.
+const V4_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS sessions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL DEFAULT '',
+    workspace TEXT NOT NULL,
+    title TEXT,
+    model TEXT,
+    payload_format TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active','ended')),
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'complete'
+        CHECK(status IN ('complete','partial','cancelled','interrupted')),
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS messages_session_seq ON messages(session_id, seq);
+CREATE TABLE IF NOT EXISTS agent_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+    goal_id INTEGER REFERENCES goals(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    turn_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('tool','turn','goal','task')),
+    status TEXT NOT NULL,
+    failure TEXT,
+    tool_call_id TEXT,
+    summary TEXT NOT NULL DEFAULT '',
+    pid INTEGER,
+    created_at INTEGER NOT NULL,
+    UNIQUE(session_id, seq)
+);
+CREATE TABLE IF NOT EXISTS goals(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('draft','active','blocked','paused','completed','cancelled')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_criteria(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','satisfied','waived')),
+    evidence TEXT NOT NULL DEFAULT '',
+    waiver_reason TEXT,
+    UNIQUE(goal_id, position)
+);
+CREATE TABLE IF NOT EXISTS agent_tasks(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('pending','running','blocked','completed','cancelled')),
+    evidence TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    UNIQUE(goal_id, position)
+);
+";
+
+/// The one table schema v5 added.
+const V5_QUESTIONS: &str = "
+CREATE TABLE IF NOT EXISTS pending_questions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id INTEGER NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('single','multi','text')),
+    options TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL CHECK(state IN ('pending','answered','skipped','cancelled')),
+    answer TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    UNIQUE(workspace, session_id, turn_id, tool_call_id)
+);
+";
+
+/// One session, one message, one goal with a criterion and a task, two events.
+fn v4_fixture(path: &std::path::Path) -> u32 {
+    let user = serde_json::to_string(&ChatMessage::user("old goal prompt")).unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection.execute_batch(V4_SCHEMA).unwrap();
+    connection
+        .execute_batch("PRAGMA user_version = 4;")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions(slug, workspace, title, model, payload_format, status,
+                                  created_at, updated_at)
+             VALUES ('svx-v4', 'ws', 'v4 session', 'm', ?1, 'active', 1, 1)",
+            [PAYLOAD_FORMAT],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO messages(session_id, seq, role, status, payload, created_at)
+             VALUES (1, 1, 'user', 'complete', ?1, 1)",
+            [&user],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO goals(workspace, session_id, objective, status, created_at, updated_at)
+             VALUES ('ws', 1, 'ship v0.1.3', 'active', 2, 2)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO goal_criteria(goal_id, position, text, status, evidence)
+             VALUES (1, 0, 'every gate is green', 'satisfied', 'cargo test')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_tasks(goal_id, position, title, status, evidence, updated_at)
+             VALUES (1, 0, 'close the release', 'running', '', 2)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_events(session_id, goal_id, seq, turn_id, kind, status, summary, created_at)
+             VALUES (1, NULL, 1, 1, 'turn', 'completed', '', 3)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_events(session_id, goal_id, seq, turn_id, kind, status, summary, created_at)
+             VALUES (NULL, 1, 1, 0, 'goal', 'active', 'approved', 4)",
+            [],
+        )
+        .unwrap();
+    4
+}
+
+#[test]
+fn a_v4_database_fixture_migrates_to_v6_and_keeps_goals_tasks_and_events() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    assert_eq!(v4_fixture(&path), 4);
+
+    let store = SessionStore::open_at(&path).expect("a v4 file opens");
+    let version: u32 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
+
+    let goal = store.goal("ws", 1).expect("the goal survives");
+    assert_eq!(goal.objective, "ship v0.1.3");
+    assert_eq!(goal.state.as_str(), "active");
+    assert_eq!(goal.criteria.len(), 1);
+    assert_eq!(goal.criteria[0].text, "every gate is green");
+    assert_eq!(goal.criteria[0].evidence, "cargo test");
+    assert_eq!(goal.tasks.len(), 1);
+    assert_eq!(goal.tasks[0].title, "close the release");
+    assert_eq!(goal.tasks[0].state.as_str(), "running");
+
+    let session = store.load(1).expect("the transcript survives");
+    assert_eq!(session.slug, "svx-v4", "the slug is not rewritten");
+    assert_eq!(session.workspace, "ws");
+    assert_eq!(session.messages.len(), 1);
+    assert!(session.messages[0].payload.contains("old goal prompt"));
+
+    let events = store.events(1).unwrap();
+    assert_eq!(events.len(), 1, "the session ledger keeps one row");
+
+    // The rebuilt ledger admits the new `question` kind, so v5 can write it.
+    store
+        .connection
+        .execute(
+            "INSERT INTO agent_events(session_id, seq, turn_id, kind, status, created_at)
+             VALUES (1, 2, 1, 'question', 'completed', 5)",
+            [],
+        )
+        .expect("the v5 kind is allowed after the rebuild");
+}
+
+#[test]
+fn a_v5_database_fixture_migrates_to_v6_and_keeps_a_pending_question() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("sessions.db");
+    v4_fixture(&path);
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(V5_QUESTIONS).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 5;")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO pending_questions(workspace, session_id, turn_id, tool_call_id,
+                                               question, kind, options, state, created_at)
+                 VALUES ('ws', 1, 1, 'call-ask', 'Which branch?', 'single', '[\"main\",\"next\"]',
+                         'pending', 6)",
+                [],
+            )
+            .unwrap();
+    }
+
+    let store = SessionStore::open_at(&path).expect("a v5 file opens");
+    let open = store.open_questions("ws").expect("the question list reads");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].question, "Which branch?");
+    assert_eq!(
+        open[0].options,
+        vec!["main".to_string(), "next".to_string()]
+    );
+    assert_eq!(open[0].tool_call_id, "call-ask");
+    assert_eq!(open[0].state, QuestionState::Pending);
+    // The v4 rows are still there beside it.
+    assert_eq!(store.goal("ws", 1).unwrap().tasks.len(), 1);
+    assert_eq!(store.load(1).unwrap().messages.len(), 1);
+}
