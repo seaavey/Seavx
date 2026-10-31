@@ -297,7 +297,7 @@ fn empty_session_shows_splash_until_transcript_starts() {
 fn the_footer_marks_an_unrecognised_model_as_assumed() {
     // Wide enough that the hints do not clip the limit.
     let mut app = test_app();
-    app.config.model = "vendor/mystery-1".to_string();
+    app.config.model = Some("vendor/mystery-1".to_string());
     let mut terminal = Terminal::new(TestBackend::new(170, 24)).unwrap();
     terminal.draw(|frame| render(&app, frame)).unwrap();
     let text: String = terminal
@@ -310,7 +310,7 @@ fn the_footer_marks_an_unrecognised_model_as_assumed() {
     assert!(text.contains("/64k"), "the conservative default: {text}");
     assert!(text.contains("(assumed)"), "{text}");
 
-    app.config.model = "deepseek-chat".to_string();
+    app.config.model = Some("deepseek-chat".to_string());
     let mut terminal = Terminal::new(TestBackend::new(170, 24)).unwrap();
     terminal.draw(|frame| render(&app, frame)).unwrap();
     let text: String = terminal
@@ -327,7 +327,7 @@ fn the_footer_marks_an_unrecognised_model_as_assumed() {
 #[test]
 fn the_footer_keeps_the_model_token_and_effort_columns_in_a_wide_frame() {
     let mut app = test_app();
-    app.config.model = "deepseek-chat".to_string();
+    app.config.model = Some("deepseek-chat".to_string());
     app.config.reasoning_effort = Some("high".to_string());
     app.total_tokens = 1234;
     app.prompt_tokens = 1234;
@@ -472,7 +472,7 @@ fn a_pending_permission_renders_a_box_above_the_composer() {
 fn the_model_picker_scrolls_the_list_to_the_selection() {
     let mut app = test_app();
     let models: Vec<String> = (0..40).map(|index| format!("model-{index}")).collect();
-    app.config.model = "model-30".to_string();
+    app.config.model = Some("model-30".to_string());
     app.modal = Some(ModalSelection::Model {
         models,
         query: String::new(),
@@ -508,7 +508,7 @@ fn the_model_picker_scrolls_the_list_to_the_selection() {
 #[test]
 fn typing_narrows_the_model_picker_to_matching_rows() {
     let mut app = test_app();
-    app.config.model = "alpha".to_string();
+    app.config.model = Some("alpha".to_string());
     app.modal = Some(ModalSelection::Model {
         models: ["alpha", "beta", "gamma"].map(str::to_string).to_vec(),
         query: "et".to_string(),
@@ -562,6 +562,7 @@ fn a_notice_keeps_the_rows_it_was_printed_with() {
 #[test]
 fn a_running_refresh_is_visible_in_the_picker_title() {
     let mut app = test_app();
+    app.config.base_url = Some("https://gateway.test/v1/".to_string());
     app.modal = Some(ModalSelection::Model {
         models: vec!["alpha".to_string()],
         query: String::new(),
@@ -571,14 +572,14 @@ fn a_running_refresh_is_visible_in_the_picker_title() {
 
     let busy = screen_of(&app);
     assert!(
-        busy.contains("Refreshing /models"),
-        "a slow fetch says it is working instead of looking frozen: {busy}"
+        busy.contains("Fetching models from gateway.test"),
+        "a slow fetch names the host and says it is working: {busy}"
     );
 
     app.refreshing_models = false;
     let idle = screen_of(&app);
     assert!(idle.contains("Select Model"), "{idle}");
-    assert!(!idle.contains("Refreshing"), "{idle}");
+    assert!(!idle.contains("Fetching models"), "{idle}");
 }
 
 /// Border colour of the toast box whose body contains `msg`.

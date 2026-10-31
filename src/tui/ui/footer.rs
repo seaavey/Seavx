@@ -17,7 +17,7 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
     let effort_label = config.reasoning_effort.as_deref().unwrap_or("none");
 
     // One table, shared with the budget and `doctor`.
-    let limit = crate::agent::engine::model_context_limit(&config.model);
+    let limit = crate::agent::engine::model_context_limit(config.model_name());
     let max_context_limit = limit.tokens;
     let assumed = if limit.assumed { " (assumed)" } else { "" };
 
@@ -46,7 +46,7 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
             Span::styled(app.mode.label(), mode_style),
             separator.clone(),
             Span::styled(
-                config.model.as_str(),
+                config.model.as_deref().unwrap_or("no model"),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),

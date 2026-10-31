@@ -42,7 +42,8 @@ pub trait Summarizer: Send + Sync {
 }
 
 pub struct ModelSummarizer {
-    client: genai::Client,
+    /// `None` when the config named no provider: `summarize` reports it.
+    client: Option<genai::Client>,
     model: String,
     options: genai::chat::ChatOptions,
 }
@@ -51,8 +52,8 @@ impl ModelSummarizer {
     pub fn from_config(config: &AgentConfig) -> Self {
         let runtime = AgentRuntime::new(config.clone(), WorkspaceSecurity::new("."));
         Self {
-            client: runtime.client().clone(),
-            model: config.model.clone(),
+            client: runtime.client().cloned(),
+            model: config.model_name().to_string(),
             options: runtime.chat_options(),
         }
     }
@@ -62,8 +63,10 @@ impl ModelSummarizer {
 impl Summarizer for ModelSummarizer {
     async fn summarize(&self, prompt: String) -> Result<String, String> {
         let request = genai::chat::ChatRequest::from_user(prompt);
-        let response = self
-            .client
+        let Some(client) = &self.client else {
+            return Err("no provider configured: run `seavx setup`".to_string());
+        };
+        let response = client
             .exec_chat(&self.model, request, Some(&self.options))
             .await
             .map_err(|error| error.to_string())?;

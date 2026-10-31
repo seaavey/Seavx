@@ -1,16 +1,20 @@
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
+use clipboard::{Clipboard, SystemClipboard};
+
 use crate::agent::engine::AgentMode;
 use crate::tui::event::{Action, AgentState};
 
 mod actions;
+mod clipboard;
 mod completion;
 mod effects;
 mod input;
 mod keys;
 mod modal;
 mod mouse;
+mod paste;
 mod references;
 mod run;
 mod store;
@@ -102,6 +106,10 @@ pub struct App<'a> {
     /// agent's security policy both use.
     pub root: std::path::PathBuf,
     pub input: TextArea<'a>,
+    /// Injected so tests paste from a fake and production reads the real one.
+    pub clipboard: std::sync::Arc<dyn Clipboard>,
+    /// Images waiting on the next Enter; cleared by an accepted turn.
+    pub pending_attachments: Vec<crate::session::Attachment>,
     pub segments: Vec<Segment>,
     pub revision: u64,
     pub transcript_cache: std::cell::RefCell<Option<TranscriptCache>>,
@@ -188,6 +196,8 @@ pub struct TurnRequest {
     pub store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
     /// This turn's cancel handle, shared with the UI thread.
     pub cancel: crate::agent::cancel::CancelToken,
+    /// Images the turn carries; each becomes a `Binary` part of the user row.
+    pub attachments: Vec<crate::session::Attachment>,
 }
 
 /// What Enter does with the line in the prompt.
@@ -435,6 +445,8 @@ impl<'a> App<'a> {
                 .root()
                 .to_path_buf(),
             input: new_input(),
+            clipboard: std::sync::Arc::new(SystemClipboard::default()),
+            pending_attachments: Vec::new(),
             segments: Vec::new(),
             revision: 0,
             transcript_cache: std::cell::RefCell::new(None),

@@ -6,6 +6,9 @@ use crate::cli::doctor::DoctorReport;
 pub enum Action {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    /// Bracketed paste: text the terminal handed over as one string, never as
+    /// keystrokes, so a pasted newline cannot submit a turn.
+    Paste(String),
     AgentToken(String),
     /// One `/goal` or `/tasks` operation finished: its report, and the goal
     /// line `/status` should show from now on.

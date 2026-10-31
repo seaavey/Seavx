@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as CEvent, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -12,7 +13,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use tokio::sync::mpsc;
 
-use super::{App, actions, keys, mouse, run_agent_worker};
+use super::{App, actions, keys, mouse, paste, run_agent_worker};
 use crate::agent::engine::AgentMode;
 use crate::tui::app::ModalSelection;
 use crate::tui::event::{Action, AgentState};
@@ -40,13 +41,30 @@ pub(super) fn redraw_interval(app: &App) -> Duration {
     }
 }
 
+/// The events the loop acts on. Paste is data: with bracketed paste enabled the
+/// terminal hands over one string instead of a keystroke per character, which
+/// is what stopped a pasted newline from submitting a turn.
+pub(super) fn translate(event: CEvent) -> Option<Action> {
+    match event {
+        CEvent::Key(key) => Some(Action::Key(key)),
+        CEvent::Mouse(mouse) => Some(Action::Mouse(mouse)),
+        CEvent::Paste(text) => Some(Action::Paste(text)),
+        _ => None,
+    }
+}
+
 pub async fn start_tui(
     initial_prompt: Option<String>,
     loaded: Option<crate::session::LoadedSession>,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -67,14 +85,8 @@ pub async fn start_tui(
 
         let mut reader = EventStream::new();
         while let Some(Ok(event)) = reader.next().await {
-            match event {
-                CEvent::Key(key) => {
-                    let _ = input_tx.send(Action::Key(key));
-                }
-                CEvent::Mouse(mouse) => {
-                    let _ = input_tx.send(Action::Mouse(mouse));
-                }
-                _ => {}
+            if let Some(action) = translate(event) {
+                let _ = input_tx.send(action);
             }
         }
     });
@@ -125,6 +137,7 @@ pub async fn start_tui(
                             mouse::handle(&mut app, mouse, screen);
                         }
                         Action::Key(key) => keys::handle(&mut app, key, &tx).await,
+                        Action::Paste(text) => paste::handle(&mut app, &text),
                         action => actions::apply(&mut app, action, &tx),
                     }
                 }
@@ -141,7 +154,8 @@ pub async fn start_tui(
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
 

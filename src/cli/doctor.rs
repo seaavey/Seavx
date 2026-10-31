@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::agent::engine::{
-    AgentConfig, ConfigOrigin, ConfigReport, DEFAULT_BASE_URL, model_context_limit,
-    normalize_base_url,
+    AgentConfig, ConfigOrigin, ConfigReport, model_context_limit, normalize_base_url,
 };
 use crate::agent::models::{ModelCache, ModelManager};
 use crate::agent::skills::SkillManager;
@@ -68,18 +67,19 @@ pub async fn run_with_probe(options: DoctorOptions, probe: &dyn EndpointProbe) -
         options.home.as_deref(),
         |name| std::env::var(name).ok(),
     );
-    let (base_url, _) = normalize_base_url(config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL));
+    let base_url = config.base_url.as_deref().map(normalize_base_url);
 
     let checks = vec![
         binary_check(),
         config_check(&config_report),
         config_recovery_check(&config_report),
+        model_check(&config),
         secret_check(&config),
         context_check(&config),
         permissions_check(&config),
         stream_check(&config, options.offline),
-        endpoint_check(&options, &config, &base_url, probe).await,
-        cache_check(&options.workspace_root, &base_url),
+        endpoint_check(&options, &config, base_url.as_ref(), probe).await,
+        cache_check(&options.workspace_root, base_url.as_ref()),
         workspace_check(&options.workspace_root),
         session_check(&options),
         memory_check(&options),
@@ -132,13 +132,21 @@ fn config_check(report: &ConfigReport) -> CheckResult {
 
 /// The limit the budget uses, and whether it is this build's conservative guess.
 fn context_check(config: &AgentConfig) -> CheckResult {
-    let limit = model_context_limit(&config.model);
+    let limit = model_context_limit(config.model_name());
     let source = if limit.assumed {
         "assumed".to_string()
     } else {
-        config.model.clone()
+        config.model_name().to_string()
     };
     ok("context", format!("{} tokens ({source})", limit.tokens))
+}
+
+/// A turn cannot run without it: the engine refuses one before any request.
+fn model_check(config: &AgentConfig) -> CheckResult {
+    match config.model.as_deref() {
+        Some(model) => ok("model", model),
+        None => fail("model", crate::cli::config::MODEL_NOT_SET),
+    }
 }
 
 fn secret_check(config: &AgentConfig) -> CheckResult {
@@ -151,7 +159,7 @@ fn secret_check(config: &AgentConfig) -> CheckResult {
 async fn endpoint_check(
     options: &DoctorOptions,
     config: &AgentConfig,
-    base_url: &str,
+    base_url: Option<&(String, Vec<genai::adapter::AdapterKind>)>,
     probe: &dyn EndpointProbe,
 ) -> CheckResult {
     if options.offline {
@@ -161,6 +169,11 @@ async fn endpoint_check(
             detail: "offline".to_string(),
         };
     }
+    // No endpoint means nothing to dial and nothing to name: a check that
+    // invented a provider host here is what this phase removes.
+    let Some((base_url, _)) = base_url else {
+        return fail("endpoint", crate::cli::config::ENDPOINT_NOT_SET);
+    };
 
     let safe_url = redact_url(base_url);
     let api_key = config.api_key.as_deref().filter(|key| !key.is_empty());
@@ -179,7 +192,13 @@ async fn endpoint_check(
     }
 }
 
-fn cache_check(workspace_root: &Path, base_url: &str) -> CheckResult {
+fn cache_check(
+    workspace_root: &Path,
+    base_url: Option<&(String, Vec<genai::adapter::AdapterKind>)>,
+) -> CheckResult {
+    let Some((base_url, _)) = base_url else {
+        return warn("cache", crate::cli::config::ENDPOINT_NOT_SET);
+    };
     let slug = ModelManager::domain_slug(base_url);
     let path = workspace_root.join(format!(".seavx/cache/models-{slug}.json"));
 

@@ -29,7 +29,12 @@ impl App<'_> {
     pub fn enter_action(&mut self, line: &str) -> EnterAction {
         let prompt = line.trim();
         if prompt.is_empty() {
-            return EnterAction::Nothing;
+            // A pending image is enough to send.
+            return if self.pending_attachments.is_empty() {
+                EnterAction::Nothing
+            } else {
+                EnterAction::Turn(String::new())
+            };
         }
         if !prompt.starts_with('/') {
             return EnterAction::Turn(prompt.to_string());

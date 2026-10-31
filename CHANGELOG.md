@@ -3,6 +3,36 @@
 All notable changes to Seavx are recorded here, grouped by category. One entry
 per landed change; no entry describes behaviour that is not in the code.
 
+## Unreleased
+
+### fix
+
+- `Ctrl+V` and `Alt+V` paste text off the clipboard on every platform, read
+  on a worker thread with a 2 s deadline so an unresponsive owner app cannot
+  freeze the frame; an empty or failing clipboard says so instead of doing
+  nothing.
+- A paste lands in the composer instead of running as keystrokes: bracketed
+  paste arrives as one string, CRLF is normalized, C0 controls are stripped, and
+  text past the 256 KiB cap is truncated with a notice. Pasting three lines no
+  longer submits three turns.
+- Routing is decided by the config, never by the model id: only the adapters
+  `normalize_base_url` registers can be reached, so an id genai does not
+  recognise goes to the configured primary instead of the Ollama adapter's
+  `localhost:11434`, and a client that fails to build is reported instead of
+  being replaced by genai's built-in provider set.
+- A key with no endpoint is no longer a provider. `OPENAI_API_KEY` and
+  `ANTHROPIC_API_KEY` bind their own adapter; `SEAVX_API_KEY` alone, or a key
+  read from a file, refuses the first turn with
+  `no provider configured: run `seavx setup``.
+
+### breaking
+
+- A config that names no model is refused instead of calling a built-in one.
+  `model` is now optional, `seavx init` writes no `model` key, and a config that
+  relied on the built-in `openai/gpt-4o-mini` fails its first turn with
+  `no model configured: run `seavx setup`or`seavx model <name>``.
+`/config`, `/status`, `doctor`and the footer say`not set` instead of an id.
+
 ## 0.1.3 — 2026-10-30
 
 ### feature
@@ -24,7 +54,7 @@ per landed change; no entry describes behaviour that is not in the code.
   symlinked paths withheld and counted) and reviews it in a read-only mode. It
   never stages, commits or writes.
 - Goals are durable (schema v4): `/goal <objective>`, `/goal edit`, `criteria
-  add|remove`, `task add|remove`, `approve`, `show`, `pause`, `resume`,
+add|remove`, `task add|remove`, `approve`, `show`, `pause`, `resume`,
   `cancel`, and `/tasks`. One active-or-blocked goal per workspace; completion
   needs every criterion satisfied with evidence or waived with a reason.
 - `ask_user` gives the model one structured question (single, multi, free text).
@@ -35,7 +65,7 @@ per landed change; no entry describes behaviour that is not in the code.
   turn succeeds and drops it on cancel or failure. Both refuse a second request
   while one is pending.
 - `/test` proposes the command the changed files' manifest declares (`cargo
-  test` for a Cargo manifest, `npm test --silent` for a package manifest), shows
+test` for a Cargo manifest, `npm test --silent` for a package manifest), shows
   it, and runs it only after the permission matrix agrees: `deny` refuses, an
   already-permitted category runs, and only `ask` prompts. Pass/fail comes from
   the exit status; Cargo counts are parsed when present and reported as
@@ -58,7 +88,7 @@ per landed change; no entry describes behaviour that is not in the code.
 - The `/sessions` picker reads the store on the blocking pool instead of the
   event thread, like every other store call.
 - `/goal criteria satisfy <n> <evidence>` and `/goal criteria waive <n>
-  <reason>`: a goal carrying criteria could not be completed before, because
+<reason>`: a goal carrying criteria could not be completed before, because
   nothing in the shipped commands could move a criterion out of `pending`.
 - `/test` runs through the permission matrix with the command's real kind, so
   `tool_permissions = "deny"` refuses it instead of prompting and running.
@@ -87,7 +117,7 @@ per landed change; no entry describes behaviour that is not in the code.
   workspace still asks, a destructive call is still refused, and a configured
   `deny` is never lifted.
 - A tool call reads as a verb and its object (`⚡ run  cargo clippy
-  --all-targets`), not as the argument list the model wrote, on the live
+--all-targets`), not as the argument list the model wrote, on the live
   transcript, the session line and `sessions show`. The permission prompt names
   the category the `a` key records and states the effect in words instead of
   repeating the arguments after "wants to runs the command".

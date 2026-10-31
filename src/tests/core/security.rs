@@ -508,7 +508,7 @@ fn runtime_with(
     )
     .unwrap();
     let config = crate::agent::engine::AgentConfig {
-        model: "test-model".to_string(),
+        model: Some("test-model".to_string()),
         tool_permissions: mode.to_string(),
         permitted_actions: permitted.iter().map(|kind| kind.to_string()).collect(),
         ..Default::default()

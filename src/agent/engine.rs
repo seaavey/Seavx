@@ -116,19 +116,12 @@ pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx
 /// Turn budget a new config starts with. An existing file keeps its own value.
 pub const DEFAULT_MAX_TURNS: usize = 100;
 
-/// Model a new config starts with. An existing file keeps its own value.
-pub const DEFAULT_MODEL: &str = "openai/gpt-4o-mini";
-
-fn default_model() -> String {
-    DEFAULT_MODEL.to_string()
-}
-
 fn default_max_turns() -> usize {
     DEFAULT_MAX_TURNS
 }
 
-/// Endpoint used when the config does not set `base_url`.
-pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
+/// What a turn says when the config names no provider at all.
+const NO_PROVIDER: &str = "no provider configured: run `seavx setup`";
 
 /// Config keys that can appear in a config file, in display order.
 pub const CONFIG_KEYS: [&str; 9] = [
@@ -184,8 +177,8 @@ impl ConfigReport {
 pub struct AgentConfig {
     // Every field has a default so a hand-written file that sets only one key
     // is merged with the built-in values instead of failing to parse.
-    #[serde(default = "default_model")]
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
     #[serde(default)]
@@ -206,6 +199,11 @@ pub struct AgentConfig {
     /// Stream the answer instead of waiting for the whole response.
     #[serde(default = "default_stream")]
     pub stream: bool,
+    /// Which environment variable supplied `api_key`; `None` when the key came
+    /// from a file. A key with no endpoint names a provider only through this,
+    /// because a bare key's host is unknowable.
+    #[serde(skip)]
+    pub api_key_env: Option<&'static str>,
 }
 
 fn default_tool_permissions() -> String {
@@ -223,20 +221,35 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    /// The model id, or `""` when none is configured. An empty id never reaches
+    /// a request: `AgentRuntime::config_refusal` refuses that turn first.
+    pub fn model_name(&self) -> &str {
+        self.model.as_deref().unwrap_or_default()
+    }
+
     /// Build the built-in defaults from an injected environment, so tests
     /// never depend on the caller's real variables.
     fn from_env(env: impl Fn(&str) -> Option<String>) -> Self {
-        let model = env("SEAVX_MODEL").unwrap_or_else(default_model);
+        let model = env("SEAVX_MODEL");
         let base_url = env("SEAVX_BASE_URL");
-        let api_key = env("SEAVX_API_KEY")
-            .or_else(|| env("OPENAI_API_KEY"))
-            .or_else(|| env("ANTHROPIC_API_KEY"));
+        // The same precedence as before, now remembering which name won: a key
+        // is only a provider when its variable says which provider it is for.
+        let mut api_key = None;
+        let mut api_key_env = None;
+        for name in ["SEAVX_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"] {
+            if let Some(key) = env(name) {
+                api_key = Some(key);
+                api_key_env = Some(name);
+                break;
+            }
+        }
         let reasoning_effort = env("SEAVX_REASONING_EFFORT");
         Self {
             model,
             max_turns: DEFAULT_MAX_TURNS,
             base_url,
             api_key,
+            api_key_env,
             reasoning_effort,
             system_prompt: None,
             tool_permissions: default_tool_permissions(),
@@ -385,6 +398,20 @@ pub fn validate_base_url(input: &str) -> Result<String, String> {
     }
 }
 
+/// The registered adapters are the routing table. genai decides an adapter from
+/// the model id and falls back to its local-daemon adapter for anything it does
+/// not recognise, so a verdict this config never registered resolves to the
+/// configured primary instead of a host the user did not name.
+pub(crate) fn route_to_configured(
+    registered: &[AdapterKind],
+    requested: AdapterKind,
+) -> AdapterKind {
+    match registered.first() {
+        Some(&primary) if !registered.contains(&requested) => primary,
+        _ => requested,
+    }
+}
+
 impl AgentConfig {
     pub fn load(workspace_root: &Path) -> Self {
         Self::load_with_report(workspace_root).0
@@ -521,9 +548,12 @@ fn apply_env_overrides(
             continue;
         };
         match key {
-            "model" => config.model = value,
+            "model" => config.model = Some(value),
             "base_url" => config.base_url = Some(value),
-            "api_key" => config.api_key = Some(value),
+            "api_key" => {
+                config.api_key = Some(value);
+                config.api_key_env = Some(variable);
+            }
             "reasoning_effort" => config.reasoning_effort = Some(value),
             _ => {}
         }
@@ -756,8 +786,12 @@ fn report_cancelled(on_message: &mut impl FnMut(&ChatMessage, MessageStatus), re
 }
 
 pub struct AgentRuntime {
-    client: Client,
+    /// `None` when the config named no provider or the client failed to build:
+    /// every turn is then refused instead of reaching a default host.
+    client: Option<Client>,
     backend: Box<dyn ChatBackend>,
+    /// Why no turn can run, when that is known before the first request.
+    routing_error: Option<String>,
     summarizer: Option<std::sync::Arc<dyn crate::tui::compact::Summarizer>>,
     registry: ToolRegistry,
     security: WorkspaceSecurity,
@@ -777,43 +811,64 @@ impl AgentRuntime {
             .as_ref()
             .map(|k| AuthData::from_single(k.clone()));
 
+        // Only these adapters may ever be reached. An empty list means the
+        // config named no provider, and no request is attempted.
+        let mut registered: Vec<AdapterKind> = Vec::new();
+        let mut routing_error = None;
+
         if let Some(ref base_url) = config.base_url {
             let (normalized, adapters) = normalize_base_url(base_url);
             tracing::info!(base_url = %normalized, "Configured custom API endpoint");
 
             let endpoint = Endpoint::from_owned(normalized);
-            for adapter in adapters {
+            for adapter in &adapters {
                 if let Some(ref auth) = auth_data {
                     builder =
-                        builder.append_provider_config(adapter, (endpoint.clone(), auth.clone()));
+                        builder.append_provider_config(*adapter, (endpoint.clone(), auth.clone()));
                 } else {
-                    builder = builder.append_provider_config(adapter, endpoint.clone());
+                    builder = builder.append_provider_config(*adapter, endpoint.clone());
                 }
             }
-
-            // Custom gateway mapping: ensure unknown models map to OpenAI adapter instead of Ollama
-            builder = builder.with_model_mapper_fn(|model_iden: genai::ModelIden| {
-                if model_iden.adapter_kind == AdapterKind::Ollama {
-                    Ok(genai::ModelIden::new(
-                        AdapterKind::OpenAI,
-                        model_iden.model_name,
-                    ))
-                } else {
-                    Ok(model_iden)
-                }
-            });
+            registered = adapters;
         } else if let Some(ref auth) = auth_data {
-            builder = builder.append_provider_config(AdapterKind::OpenAI, auth.clone());
-            builder = builder.append_provider_config(AdapterKind::Anthropic, auth.clone());
+            // A key with no endpoint is a provider only when its variable names
+            // one; `SEAVX_API_KEY` and a key from a file have no host to call.
+            match config.api_key_env {
+                Some("OPENAI_API_KEY") => registered.push(AdapterKind::OpenAI),
+                Some("ANTHROPIC_API_KEY") => registered.push(AdapterKind::Anthropic),
+                _ => routing_error = Some(NO_PROVIDER.to_string()),
+            }
+            for adapter in &registered {
+                builder = builder.append_provider_config(*adapter, auth.clone());
+            }
+        } else {
+            routing_error = Some(NO_PROVIDER.to_string());
         }
 
-        let client = builder
-            .build()
-            .unwrap_or_else(|_| Client::new().expect("Failed to initialize genai Client"));
-        let backend = Box::new(GenaiBackend::new(client.clone()));
+        if !registered.is_empty() {
+            let routing = registered.clone();
+            builder = builder.with_model_mapper_fn(move |model_iden: genai::ModelIden| {
+                Ok(genai::ModelIden::new(
+                    route_to_configured(&routing, model_iden.adapter_kind),
+                    model_iden.model_name,
+                ))
+            });
+        }
+
+        let (client, build_error) = match builder.build() {
+            Ok(client) => (Some(client), None),
+            // genai reports the failure; installing its own provider set here is
+            // what used to point a misconfigured run at somebody else's host.
+            Err(error) => (None, Some(format!("no provider client: {error}"))),
+        };
+        let backend: Box<dyn ChatBackend> = match &client {
+            Some(client) => Box::new(GenaiBackend::new(client.clone())),
+            None => Box::new(GenaiBackend::unavailable()),
+        };
         Self {
             client,
             backend,
+            routing_error: routing_error.or(build_error),
             summarizer: None,
             registry: ToolRegistry::with_default_tools(),
             security,
@@ -866,8 +921,21 @@ impl AgentRuntime {
         self
     }
 
-    pub fn client(&self) -> &Client {
-        &self.client
+    /// The provider client, when the config named one. `None` means every turn
+    /// is refused, so a caller outside the turn loop skips its request.
+    pub fn client(&self) -> Option<&Client> {
+        self.client.as_ref()
+    }
+
+    /// The first reason no turn can run, if the config already decided one.
+    fn config_refusal(&self) -> Option<String> {
+        if let Some(reason) = &self.routing_error {
+            return Some(reason.clone());
+        }
+        self.config
+            .model
+            .is_none()
+            .then(|| "no model configured: run `seavx setup` or `seavx model <name>`".to_string())
     }
 
     /// Options for every request. Effort is always sent explicitly: with no effort in the
@@ -879,7 +947,7 @@ impl AgentRuntime {
             .reasoning_effort
             .as_deref()
             .and_then(parse_reasoning_effort)
-            .or_else(|| ReasoningEffort::from_model_name(&self.config.model).0);
+            .or_else(|| ReasoningEffort::from_model_name(self.config.model_name()).0);
 
         let options = ChatOptions::default()
             .with_capture_reasoning_content(true)
@@ -898,7 +966,7 @@ impl AgentRuntime {
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_task(
         &self,
-        task: &str,
+        user: ChatMessage,
         mode: AgentMode,
         history: Vec<ChatMessage>,
         confirm: &dyn Confirmer,
@@ -909,7 +977,7 @@ impl AgentRuntime {
         let mut turn = TurnState::new();
         let result = match self
             .run_turn(
-                task,
+                &user,
                 mode,
                 history,
                 confirm,
@@ -966,7 +1034,7 @@ impl AgentRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
-        task: &str,
+        user: &ChatMessage,
         mode: AgentMode,
         history: Vec<ChatMessage>,
         confirm: &dyn Confirmer,
@@ -978,6 +1046,11 @@ impl AgentRuntime {
         if cancel.is_cancelled() {
             // The same reporting path every other cancel uses.
             return Err(cancelled(turn_state));
+        }
+        // A config that names no provider is refused here, before the
+        // summarizer, the request log or any provider call.
+        if let Some(reason) = self.config_refusal() {
+            return Err(TurnError::Failed(std::io::Error::other(reason).into()));
         }
         // What this one Ask turn actually read. Not persisted, not shared with
         // the next turn: an answer may only cite its own turn's reads.
@@ -991,11 +1064,11 @@ impl AgentRuntime {
         };
         let retry_history = history.clone();
         let mut chat_req = self
-            .prepare_request(history, task, mode, &*summarizer, event_sink)
+            .prepare_request(history, user, mode, &*summarizer, event_sink)
             .await;
         let mut retry = RetryBudget::default();
 
-        tracing::info!(model = %self.config.model, "Starting Seavx agent task");
+        tracing::info!(model = %self.config.model_name(), "Starting Seavx agent task");
 
         let chat_options = self.chat_options();
 
@@ -1024,7 +1097,7 @@ impl AgentRuntime {
 
             // Log full request payload to .seavx/request.log
             Self::log_request_payload(
-                &self.config.model,
+                self.config.model_name(),
                 turn,
                 &chat_req,
                 &chat_options,
@@ -1059,7 +1132,7 @@ impl AgentRuntime {
                     };
                     self.backend
                         .stream(
-                            &self.config.model,
+                            self.config.model_name(),
                             chat_req.clone(),
                             Some(&chat_options),
                             &mut on_delta,
@@ -1067,7 +1140,11 @@ impl AgentRuntime {
                         .await
                 } else {
                     self.backend
-                        .send(&self.config.model, chat_req.clone(), Some(&chat_options))
+                        .send(
+                            self.config.model_name(),
+                            chat_req.clone(),
+                            Some(&chat_options),
+                        )
                         .await
                 }
             };
@@ -1107,7 +1184,7 @@ impl AgentRuntime {
                         Some(RetryTrigger::ReplayRejection) => chat_req = halve_turns(&chat_req),
                         Some(RetryTrigger::CapacityError) => {
                             chat_req = self
-                                .aggressive_request(&retry_history, task, mode, &*summarizer)
+                                .aggressive_request(&retry_history, user, mode, &*summarizer)
                                 .await
                         }
                         // The same request, unstreamed: nothing to rebuild.
@@ -1116,7 +1193,7 @@ impl AgentRuntime {
                     // A failure here is the turn's failure: it never buys a
                     // second retry.
                     let retry_send = self.backend.send(
-                        &self.config.model,
+                        self.config.model_name(),
                         chat_req.clone(),
                         Some(&chat_options),
                     );
@@ -1193,6 +1270,7 @@ impl AgentRuntime {
                 // Auto-Skill Evaluation: a completed task that ran at least two tools is a
                 // candidate workflow (a single call is not), regardless of how many turns it took.
                 if should_auto_distill(mode, steps.len()) {
+                    let task = user.content.first_text().unwrap_or_default();
                     self.auto_distill_skill(task, &steps, event_sink).await;
                 }
 
@@ -1386,7 +1464,7 @@ impl AgentRuntime {
 
         let forced = self
             .backend
-            .send(&self.config.model, forced_req, Some(&chat_options));
+            .send(self.config.model_name(), forced_req, Some(&chat_options));
         let response = match until_cancelled(cancel, forced).await {
             Some(result) => result?,
             None => {
@@ -1416,7 +1494,7 @@ impl AgentRuntime {
     pub(crate) async fn prepare_request(
         &self,
         history: Vec<ChatMessage>,
-        task: &str,
+        user: &ChatMessage,
         mode: AgentMode,
         summarizer: &dyn crate::tui::compact::Summarizer,
         event_sink: &mut impl FnMut(AgentEvent),
@@ -1425,9 +1503,9 @@ impl AgentRuntime {
             compact, estimate_tokens, keep_recent_budget, request_budget, window_start,
         };
 
-        let limit = model_context_limit(&self.config.model);
+        let limit = model_context_limit(self.config.model_name());
         let budget = request_budget(limit.tokens);
-        let request = self.chat_request(None, &history, task, mode);
+        let request = self.chat_request(None, &history, user, mode);
         if estimate_tokens(&request) <= budget {
             return request;
         }
@@ -1441,7 +1519,7 @@ impl AgentRuntime {
                     let candidate = self.chat_request(
                         Some(&compaction.summary),
                         &compaction.history,
-                        task,
+                        user,
                         mode,
                     );
                     let after = estimate_tokens(&candidate);
@@ -1460,7 +1538,7 @@ impl AgentRuntime {
                         event_sink(AgentEvent::Notice(format!(
                             "compaction failed ({error}); older turns dropped"
                         )));
-                        return self.chat_request(None, &history[split..], task, mode);
+                        return self.chat_request(None, &history[split..], user, mode);
                     }
                     break;
                 }
@@ -1470,12 +1548,12 @@ impl AgentRuntime {
 
         // Last resort: the newest turn alone, never truncated.
         let split = window_start(&history, 0);
-        let request = self.chat_request(None, &history[split..], task, mode);
+        let request = self.chat_request(None, &history[split..], user, mode);
         let estimate = estimate_tokens(&request);
         if estimate > budget {
             event_sink(AgentEvent::Notice(format!(
                 "{estimate} tokens exceeds the {budget} budget for {}; sending the newest turn anyway",
-                self.config.model
+                self.config.model_name()
             )));
         } else {
             event_sink(AgentEvent::Notice(
@@ -1489,7 +1567,7 @@ impl AgentRuntime {
         &self,
         summary: Option<&str>,
         history: &[ChatMessage],
-        task: &str,
+        user: &ChatMessage,
         mode: AgentMode,
     ) -> ChatRequest {
         let system_prompt = self
@@ -1511,7 +1589,8 @@ impl AgentRuntime {
         for message in history {
             request = request.append_message(message.clone());
         }
-        request.append_message(ChatMessage::user(task))
+        // The store's own row: one text part, one part per image.
+        request.append_message(user.clone())
     }
 
     /// The capacity-error retry: compact against 40 % of the budget, keep the
@@ -1519,21 +1598,21 @@ impl AgentRuntime {
     async fn aggressive_request(
         &self,
         history: &[ChatMessage],
-        task: &str,
+        user: &ChatMessage,
         mode: AgentMode,
         summarizer: &dyn crate::tui::compact::Summarizer,
     ) -> ChatRequest {
         use crate::agent::budget::{compact, request_budget, window_start};
 
-        let limit = model_context_limit(&self.config.model);
+        let limit = model_context_limit(self.config.model_name());
         let aggressive = request_budget(limit.tokens) * 40 / 100;
         match compact(history, aggressive, summarizer).await {
             Ok(compaction) => {
-                self.chat_request(Some(&compaction.summary), &compaction.history, task, mode)
+                self.chat_request(Some(&compaction.summary), &compaction.history, user, mode)
             }
             Err(_) => {
                 let split = window_start(history, 0);
-                self.chat_request(None, &history[split..], task, mode)
+                self.chat_request(None, &history[split..], user, mode)
             }
         }
     }
@@ -1682,11 +1761,14 @@ impl AgentRuntime {
             task, trace
         );
 
+        // No client means no provider: the evaluator is skipped, not retried.
+        let Some(client) = &self.client else {
+            return;
+        };
         let req = ChatRequest::from_user(prompt);
         let options = self.chat_options();
-        let res = match self
-            .client
-            .exec_chat(&self.config.model, req, Some(&options))
+        let res = match client
+            .exec_chat(self.config.model_name(), req, Some(&options))
             .await
         {
             Ok(res) => res,

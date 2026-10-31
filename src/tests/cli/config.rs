@@ -143,7 +143,7 @@ fn set_on_missing_file_writes_a_loadable_config() {
 
     let (config, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
     assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
-    assert_eq!(config.model, "new-model");
+    assert_eq!(config.model.as_deref(), Some("new-model"));
     assert_eq!(config.max_turns, 100, "new files default to 100 turns");
 }
 
@@ -158,7 +158,7 @@ fn a_partial_config_file_is_merged_with_defaults() {
     let (config, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
     assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
     assert_eq!(config.api_key.as_deref(), Some("sr-live-12345678"));
-    assert_eq!(config.model, crate::agent::engine::DEFAULT_MODEL);
+    assert_eq!(config.model, None, "a config that names no model has none");
     assert_eq!(
         config.max_turns,
         crate::agent::engine::DEFAULT_MAX_TURNS,
@@ -284,10 +284,11 @@ fn config_writer_preserves_comments_and_unknown_keys() {
 
     // The whole-config write used by `seavx model`/`seavx setup` keeps them too.
     let config = crate::agent::engine::AgentConfig {
-        model: "third".to_string(),
+        model: Some("third".to_string()),
         max_turns: 11,
         base_url: None,
         api_key: None,
+        api_key_env: None,
         tool_permissions: "ask".to_string(),
         permitted_actions: Vec::new(),
         reasoning_effort: None,
@@ -523,10 +524,11 @@ const MALFORMED: &str = "model = \"unterminated\n";
 
 fn agent_config(model: &str) -> AgentConfig {
     AgentConfig {
-        model: model.to_string(),
+        model: Some(model.to_string()),
         max_turns: 100,
         base_url: None,
         api_key: None,
+        api_key_env: None,
         reasoning_effort: Some("high".to_string()),
         system_prompt: None,
         tool_permissions: "ask".to_string(),
@@ -548,7 +550,7 @@ fn setup_repairs_an_unparsable_config() {
     assert_eq!(fs::read_to_string(&preserved).unwrap(), MALFORMED);
     let (loaded, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
     assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
-    assert_eq!(loaded.model, "repaired");
+    assert_eq!(loaded.model.as_deref(), Some("repaired"));
 }
 
 #[test]
@@ -565,7 +567,7 @@ fn model_repairs_an_unparsable_config() {
     assert_eq!(fs::read_to_string(&preserved).unwrap(), MALFORMED);
     let (loaded, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
     assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
-    assert_eq!(loaded.model, "flag-model");
+    assert_eq!(loaded.model.as_deref(), Some("flag-model"));
     assert_eq!(loaded.reasoning_effort.as_deref(), Some("high"));
 }
 
@@ -790,4 +792,66 @@ fn an_existing_value_of_one_thousand_is_kept() {
         "the user's value is never rewritten: {text}"
     );
     assert_eq!(AgentConfig::load(temp.path()).max_turns, 1000);
+}
+
+/// A config that names no model must say so, not borrow a built-in id.
+#[test]
+fn a_config_without_a_model_names_no_model() {
+    let temp = tempdir().unwrap();
+    let (config, report) =
+        AgentConfig::load_with_report_home(temp.path(), Some(temp.path()), |_| None);
+
+    assert_eq!(config.model, None, "a config with no model has none");
+    assert_eq!(
+        render_value(&config, &report, ConfigKey::Model),
+        "model = not set (run seavx setup) (default)",
+        "a config with no model must not invent one"
+    );
+}
+
+#[test]
+fn setup_rejects_an_empty_endpoint() {
+    assert!(
+        crate::agent::engine::validate_base_url("").is_err(),
+        "a blank endpoint is refused before anything is written"
+    );
+
+    let temp = tempdir().unwrap();
+    let (path, _) = init_workspace(temp.path()).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("base_url"),
+        "a new config must not name an endpoint: {text}"
+    );
+}
+
+#[test]
+fn a_new_config_writes_no_model() {
+    let temp = tempdir().unwrap();
+    let (path, created) = init_workspace(temp.path()).unwrap();
+    assert!(created);
+
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("model"),
+        "a new config must not name a model: {text}"
+    );
+    let config = AgentConfig::load(temp.path());
+    assert_eq!(config.model, None);
+}
+
+#[test]
+fn unset_model_returns_to_unset() {
+    let temp = tempdir().unwrap();
+    let (path, _) = init_workspace(temp.path()).unwrap();
+    set_value(&path, ConfigKey::Model, "chosen-model").unwrap();
+    assert_eq!(
+        AgentConfig::load(temp.path()).model.as_deref(),
+        Some("chosen-model")
+    );
+
+    assert!(unset_value(&path, ConfigKey::Model).unwrap());
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("model"), "{text}");
+    assert_eq!(AgentConfig::load(temp.path()).model, None);
 }

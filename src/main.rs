@@ -200,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
             let mut streamed = false;
             let result = runtime
                 .execute_task(
-                    &task,
+                    genai::chat::ChatMessage::user(&task),
                     agent::engine::AgentMode::Build,
                     Vec::new(),
                     &agent::permissions::DenyingConfirmer,

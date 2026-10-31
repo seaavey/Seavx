@@ -10,7 +10,11 @@ pub fn line(label: &str, current: &str) -> anyhow::Result<String> {
     }
     io::stdout().flush()?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    // EOF is not a blank answer: a retry loop that read it as one would ask
+    // forever, and an empty line is how a user says "keep the current value".
+    if io::stdin().read_line(&mut input)? == 0 {
+        anyhow::bail!("no more input on stdin while asking for {label}");
+    }
     let input = input.trim();
     Ok(if input.is_empty() {
         current.to_string()

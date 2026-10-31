@@ -145,8 +145,8 @@ mod test_cases {
         assert_eq!(url, "http://custom-proxy.internal:8080/v1/");
 
         // Domain already having /v1
-        let (url, adapters) = normalize_base_url("https://api.openai.com/v1");
-        assert_eq!(url, "https://api.openai.com/v1/");
+        let (url, adapters) = normalize_base_url("https://openai.example/v1");
+        assert_eq!(url, "https://openai.example/v1/");
         assert!(adapters.contains(&AdapterKind::OpenAI));
     }
 
@@ -226,7 +226,7 @@ mod test_cases {
         let _ = std::fs::write(seavx_dir.join("config.toml"), toml_content);
 
         let config = crate::agent::engine::AgentConfig::load(&temp_dir);
-        assert_eq!(config.model, "test-model-xyz");
+        assert_eq!(config.model.as_deref(), Some("test-model-xyz"));
         assert_eq!(config.max_turns, 42);
         assert_eq!(config.api_key.as_deref(), Some("secret-test-key"));
 
@@ -610,10 +610,11 @@ mod engine_seam {
 
     fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path) -> AgentRuntime {
         let mut config = AgentConfig::load(workspace);
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
         let security = WorkspaceSecurity::new(workspace);
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         AgentRuntime::with_backend(config, security, Box::new(backend.clone()))
     }
 
@@ -635,7 +636,7 @@ mod engine_seam {
         let mut reported: Vec<ChatMessage> = Vec::new();
         let answer = runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 history,
                 &DenyingConfirmer,
@@ -687,7 +688,7 @@ mod engine_seam {
         ];
         runtime
             .execute_task(
-                "now",
+                genai::chat::ChatMessage::user("now"),
                 AgentMode::Build,
                 history,
                 &DenyingConfirmer,
@@ -769,7 +770,7 @@ mod engine_seam {
         let mut events = Vec::new();
         runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::new(),
                 &DenyingConfirmer,
@@ -828,7 +829,7 @@ mod engine_seam {
         let mut events = Vec::new();
         runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::new(),
                 &DenyingConfirmer,
@@ -866,7 +867,7 @@ mod engine_seam {
         let mut events = Vec::new();
         runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::new(),
                 &DenyingConfirmer,
@@ -900,7 +901,7 @@ mod engine_seam {
         let mut events = Vec::new();
         runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Plan,
                 Vec::new(),
                 &AllowingConfirmer,
@@ -932,7 +933,7 @@ mod engine_seam {
         let mut events = Vec::new();
         let outcome = runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::new(),
                 &DenyingConfirmer,
@@ -972,7 +973,7 @@ mod engine_seam {
             let mut events = Vec::new();
             let outcome = runtime
                 .execute_task(
-                    "do it",
+                    genai::chat::ChatMessage::user("do it"),
                     AgentMode::Build,
                     Vec::new(),
                     &AllowingConfirmer,
@@ -1016,7 +1017,7 @@ mod engine_seam {
         let mut reported: Vec<ChatMessage> = Vec::new();
         let answer = runtime
             .execute_task(
-                question,
+                genai::chat::ChatMessage::user(question),
                 AgentMode::Ask,
                 Vec::new(),
                 &DenyingConfirmer,
@@ -1167,7 +1168,7 @@ mod engine_seam {
         let mut events = Vec::new();
         let outcome = runtime
             .execute_task(
-                "review the working tree",
+                genai::chat::ChatMessage::user("review the working tree"),
                 AgentMode::Review,
                 Vec::new(),
                 &DenyingConfirmer,
@@ -1288,7 +1289,7 @@ mod engine_seam {
 
         runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1335,7 +1336,7 @@ mod engine_seam {
 
         let answer = runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1390,7 +1391,7 @@ mod engine_seam {
 
         runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1497,7 +1498,7 @@ mod context_budget {
 
     fn runtime(workspace: &std::path::Path) -> AgentRuntime {
         let mut config = AgentConfig::load(workspace);
-        config.model = "deepseek-chat".to_string(); // 128k window
+        config.model = Some("deepseek-chat".to_string()); // 128k window
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
         AgentRuntime::new(config, WorkspaceSecurity::new(workspace))
@@ -1539,7 +1540,7 @@ mod context_budget {
         let request = runtime
             .prepare_request(
                 over_budget_history(),
-                "current task",
+                &genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 &summarizer,
                 &mut sink,
@@ -1595,7 +1596,7 @@ mod context_budget {
         let request = runtime
             .prepare_request(
                 over_budget_history(),
-                "current task",
+                &genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 &summarizer,
                 &mut sink,
@@ -1639,7 +1640,7 @@ mod context_budget {
         let request = runtime
             .prepare_request(
                 over_budget_history(),
-                "current task",
+                &genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 &summarizer,
                 &mut sink,
@@ -1682,7 +1683,7 @@ mod context_budget {
         let request: ChatRequest = runtime
             .prepare_request(
                 history,
-                "current task",
+                &genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 &summarizer,
                 &mut sink,
@@ -1739,10 +1740,11 @@ mod retry_budget {
         stream: bool,
     ) -> AgentRuntime {
         let mut config = AgentConfig::load(workspace);
-        config.model = "deepseek-chat".to_string();
+        config.model = Some("deepseek-chat".to_string());
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
         config.stream = stream;
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         AgentRuntime::with_backend(
             config,
             WorkspaceSecurity::new(workspace),
@@ -1774,7 +1776,7 @@ mod retry_budget {
 
         let answer = runtime
             .execute_task(
-                "current task",
+                genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1818,7 +1820,7 @@ mod retry_budget {
 
         let error = runtime
             .execute_task(
-                "current task",
+                genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1847,7 +1849,7 @@ mod retry_budget {
 
         let error = runtime
             .execute_task(
-                "current task",
+                genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1929,9 +1931,10 @@ mod repeated_actions {
         }
 
         let mut config = AgentConfig::load(temp.path());
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 10;
         config.system_prompt = Some("system prompt".to_string());
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         let runtime = AgentRuntime::with_backend(
             config,
             WorkspaceSecurity::new(temp.path()),
@@ -1941,7 +1944,7 @@ mod repeated_actions {
         let mut messages: Vec<(String, crate::session::MessageStatus)> = Vec::new();
         let result = runtime
             .execute_task(
-                "look around",
+                genai::chat::ChatMessage::user("look around"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1991,9 +1994,10 @@ mod repeated_actions {
         }
 
         let mut config = AgentConfig::load(temp.path());
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 10;
         config.system_prompt = Some("system prompt".to_string());
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         let runtime = AgentRuntime::with_backend(
             config,
             WorkspaceSecurity::new(temp.path()),
@@ -2003,7 +2007,7 @@ mod repeated_actions {
         let mut last = String::new();
         let result = runtime
             .execute_task(
-                "look around",
+                genai::chat::ChatMessage::user("look around"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -2046,16 +2050,17 @@ mod transcript_redaction {
         fake.push(response(MessageContent::from_text("done")));
 
         let mut config = AgentConfig::load(temp.path());
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         let runtime =
             AgentRuntime::with_backend(config, WorkspaceSecurity::new(temp.path()), Box::new(fake));
 
         let mut seen: Vec<String> = Vec::new();
         let answer = runtime
             .execute_task(
-                "look around",
+                genai::chat::ChatMessage::user("look around"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -2096,9 +2101,10 @@ mod backend_seam {
         fake.push(response(MessageContent::from_text("through the seam")));
 
         let mut config = AgentConfig::load(temp.path());
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 2;
         config.system_prompt = Some("system prompt".to_string());
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         let runtime = AgentRuntime::with_backend(
             config,
             WorkspaceSecurity::new(temp.path()),
@@ -2107,7 +2113,7 @@ mod backend_seam {
 
         let answer = runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -2121,5 +2127,152 @@ mod backend_seam {
 
         assert_eq!(answer, "through the seam");
         assert_eq!(fake.requests().len(), 1, "exactly one backend call");
+    }
+
+    /// The config's registered adapters are the routing table: an id genai does
+    /// not recognise must not reach the Ollama adapter's localhost default.
+    #[tokio::test]
+    async fn a_configured_gateway_never_routes_to_ollama() {
+        use crate::agent::engine::{AgentConfig, AgentRuntime, normalize_base_url};
+
+        let base_url = "https://gateway.example/v1/";
+        let (_, adapters) = normalize_base_url(base_url);
+        let config = AgentConfig {
+            base_url: Some(base_url.to_string()),
+            api_key: Some("sk-test".to_string()),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(config, WorkspaceSecurity::new("."));
+
+        let target = runtime
+            .client()
+            .expect("the config named a gateway")
+            .resolve_service_target("totally-unlisted-model")
+            .await
+            .expect("an unlisted id resolves against the configured gateway");
+
+        assert_eq!(
+            target.model.adapter_kind, adapters[0],
+            "a model the provider does not list resolves to the primary registered adapter"
+        );
+    }
+
+    #[test]
+    fn routing_never_leaves_the_registered_adapters() {
+        use crate::agent::engine::route_to_configured;
+        use genai::adapter::AdapterKind;
+
+        let both = [AdapterKind::Anthropic, AdapterKind::OpenAI];
+        assert_eq!(
+            route_to_configured(&both, AdapterKind::Ollama),
+            AdapterKind::Anthropic,
+            "an unrecognised id goes to the configured primary"
+        );
+        assert_eq!(
+            route_to_configured(&[AdapterKind::OpenAI], AdapterKind::Anthropic),
+            AdapterKind::OpenAI
+        );
+        assert_eq!(
+            route_to_configured(&both, AdapterKind::Anthropic),
+            AdapterKind::Anthropic,
+            "a registered verdict is left alone"
+        );
+        assert_eq!(
+            route_to_configured(&[AdapterKind::OpenAI], AdapterKind::OpenAI),
+            AdapterKind::OpenAI
+        );
+        // No table cannot route: the verdict comes back instead of a panic, and
+        // a runtime with no provider is refused before any of this runs.
+        assert_eq!(
+            route_to_configured(&[], AdapterKind::Ollama),
+            AdapterKind::Ollama
+        );
+    }
+
+    /// No model means no request: the refusal names the command that fixes it.
+    #[tokio::test]
+    async fn a_config_without_a_model_fails_before_the_provider() {
+        use crate::agent::cancel::TurnStatus;
+        use crate::agent::permissions::DenyingConfirmer;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        let config = AgentConfig {
+            model: None,
+            base_url: Some("https://gateway.test/v1/".to_string()),
+            api_key: None,
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let outcome = runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("hi"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await;
+
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        let error = outcome.result.unwrap_err().to_string();
+        assert!(error.contains("no model configured"), "{error}");
+        assert!(error.contains("seavx setup"), "{error}");
+        assert_eq!(
+            fake.requests().len(),
+            0,
+            "a config with no model must not reach a provider"
+        );
+    }
+
+    /// A key whose host is unknown is not a provider: the turn is refused, and
+    /// nothing is sent anywhere.
+    #[tokio::test]
+    async fn a_key_without_an_endpoint_refuses_the_turn() {
+        use crate::agent::cancel::TurnStatus;
+        use crate::agent::permissions::DenyingConfirmer;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        let config = AgentConfig {
+            model: Some("fake-model".to_string()),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            api_key_env: Some("SEAVX_API_KEY"),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let outcome = runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("hi"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await;
+
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        let error = outcome.result.unwrap_err().to_string();
+        assert!(error.contains("seavx setup"), "{error}");
+        assert_eq!(
+            fake.requests().len(),
+            0,
+            "no request may reach a host the config did not name"
+        );
     }
 }

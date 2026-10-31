@@ -60,10 +60,9 @@ pub async fn providers() -> anyhow::Result<()> {
 
     let model_mgr = crate::agent::models::ModelManager::new(&std::path::PathBuf::from("."));
     let mut available_models: Vec<String> = Vec::new();
-    let mut url_default = config
-        .base_url
-        .clone()
-        .unwrap_or_else(|| crate::agent::engine::DEFAULT_BASE_URL.to_string());
+    // Pre-filled only from the configured value: with nothing configured the
+    // prompt starts empty and an empty answer is refused by the validator.
+    let mut url_default = config.base_url.clone().unwrap_or_default();
     let mut key_default = config.api_key.clone().unwrap_or_default();
 
     // Ask the endpoint for its model list, so a wrong URL or key fails here instead of in the TUI.
@@ -135,15 +134,29 @@ pub async fn providers() -> anyhow::Result<()> {
     screen(&config_path, &rows);
     let efforts = crate::agent::engine::EFFORT_LEVELS.join("|");
     let model = if available_models.is_empty() || !io::stdin().is_terminal() {
-        let typed = prompt::line("Model", &config.model)?;
-        if !available_models.is_empty() && !available_models.contains(&typed) {
-            println!("warning: '{typed}' is not in the endpoint's model list");
+        let typed = prompt::line("Model", config.model.as_deref().unwrap_or_default())?;
+        // The same gate `seavx model <name>` uses: a piped run cannot say yes,
+        // and an interactive one is asked instead of warned.
+        let host = crate::agent::models::ModelManager::domain_slug(&base_url);
+        let interactive = io::stdin().is_terminal();
+        match crate::cli::model::model_gate(interactive, &host, &available_models, &typed) {
+            crate::cli::model::ModelGate::Writable => {}
+            crate::cli::model::ModelGate::Ask(question) => {
+                let answer = prompt::line(&question, "")?;
+                let answer = answer.trim().to_ascii_lowercase();
+                if answer != "y" && answer != "yes" {
+                    anyhow::bail!("nothing written");
+                }
+            }
+            crate::cli::model::ModelGate::Refused(reason) => {
+                anyhow::bail!("{reason}; nothing written")
+            }
         }
         typed
     } else {
         // The endpoint answered, so the choice is its list: a typed default here
         // is how a model the gateway does not serve gets saved.
-        prompt::pick("Model", &available_models, Some(&config.model))
+        prompt::pick("Model", &available_models, config.model.as_deref())
             .ok_or_else(|| anyhow::anyhow!("cancelled; nothing written"))?
     };
 
@@ -170,7 +183,7 @@ pub async fn providers() -> anyhow::Result<()> {
     };
 
     config.base_url = Some(stored_url);
-    config.model = model;
+    config.model = Some(model);
     if !api_key.is_empty() {
         config.api_key = Some(api_key);
     }
@@ -199,7 +212,7 @@ pub async fn providers() -> anyhow::Result<()> {
                 crate::cli::config::redact_url(config.base_url.as_deref().unwrap_or_default()),
             ),
             ("protocols", protocols),
-            ("model", config.model.clone()),
+            ("model", crate::cli::config::model_label(&config)),
             (
                 "api key",
                 mask(config.api_key.as_deref().unwrap_or_default()),

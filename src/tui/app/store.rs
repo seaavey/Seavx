@@ -116,7 +116,8 @@ impl App<'_> {
     /// written by the worker, so the UI thread never waits on SQLite.
     pub fn submit_turn(&mut self, prompt: &str) -> Option<TurnRequest> {
         let prompt = prompt.trim().to_string();
-        if prompt.is_empty() {
+        // An image alone is a turn: only a turn with neither half is a no-op.
+        if prompt.is_empty() && self.pending_attachments.is_empty() {
             return None;
         }
         if let Some(reason) = self.read_only.clone() {
@@ -132,11 +133,18 @@ impl App<'_> {
             return None;
         }
 
-        self.remember_prompt(&prompt);
+        if !prompt.is_empty() {
+            self.remember_prompt(&prompt);
+        }
+        let attachments = std::mem::take(&mut self.pending_attachments);
         if !self.segments.is_empty() {
             self.push_text("\n\n");
         }
-        self.push_text(&format!("User: {prompt}\n\n"));
+        let mut row = format!("User: {prompt}");
+        for (index, attachment) in attachments.iter().enumerate() {
+            row.push_str(&format!("\n[{}]", attachment.summary(index + 1)));
+        }
+        self.push_text(&format!("{row}\n\n"));
         self.scroll = self.max_scroll();
         self.auto_scroll = true;
         self.status = AgentState::Thinking;
@@ -155,6 +163,7 @@ impl App<'_> {
             turn_id: self.turn_id,
             store: self.store.clone(),
             cancel: self.cancel.clone(),
+            attachments,
         })
     }
 

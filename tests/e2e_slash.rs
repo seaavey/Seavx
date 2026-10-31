@@ -313,3 +313,27 @@ fn read_only_slash_commands_run_a_whole_session_without_writing_a_config() {
     let status = tui.exit();
     assert!(status.success(), "/exit returned {status}");
 }
+
+/// A cold cache is not a dead end: `/model` asks the configured endpoint, and a
+/// fetch that cannot connect names the host instead of a dead-end sentence.
+#[test]
+fn a_cold_model_picker_names_the_unreachable_host() {
+    let home = tempfile::tempdir().expect("temp home");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    fs::create_dir_all(workspace_root(workspace.path())).expect("config dir");
+    fs::write(
+        workspace_root(workspace.path()).join("config.toml"),
+        "base_url = \"http://127.0.0.1:9/v1/\"\nmax_turns = 3\n",
+    )
+    .expect("write config");
+
+    let mut tui = Tui::start(workspace.path(), home.path());
+    tui.wait_for_screen(READY);
+
+    tui.run("/model");
+
+    // The fetch cannot connect, and the notice names the host it tried.
+    // No `/exit` here: the picker owns the keyboard while it is open, and this
+    // test is about the notice, not the teardown. `Drop` kills the child.
+    tui.wait_for_screen("127.0.0.1:");
+}

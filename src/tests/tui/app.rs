@@ -628,7 +628,7 @@ fn selected_of(app: &App) -> usize {
 #[test]
 fn a_refresh_keeps_the_filter_and_the_cursor_stays_inside_it() {
     let mut app = test_app();
-    app.config.model = "beta".to_string();
+    app.config.model = Some("beta".to_string());
     app.modal = Some(ModalSelection::Model {
         models: vec!["alpha".to_string()],
         query: "et".to_string(),
@@ -691,9 +691,15 @@ fn a_pending_turn_is_prefilled_shown_once_and_replayed_never() {
         .submit_turn(&app.input_text())
         .expect("one request for the submitted prompt");
     assert_eq!(request.prompt, "left hanging");
-    let (new_id, history) =
-        crate::session::prepare_turn(&store, &workspace, "fake-model", Some(id), &request.prompt)
-            .unwrap();
+    let (new_id, history) = crate::session::prepare_turn(
+        &store,
+        &workspace,
+        "fake-model",
+        Some(id),
+        &request.prompt,
+        &[],
+    )
+    .unwrap();
     assert_eq!(new_id, id);
     assert!(history.is_empty(), "the unanswered rows are never replayed");
 
@@ -731,6 +737,7 @@ fn clear_starts_a_new_session_and_keeps_the_old_one_loadable() {
         "fake-model",
         None,
         &first.prompt,
+        &[],
     )
     .unwrap();
     app.session_id = Some(first_id);
@@ -748,6 +755,7 @@ fn clear_starts_a_new_session_and_keeps_the_old_one_loadable() {
         "fake-model",
         app.session_id,
         &second.prompt,
+        &[],
     )
     .unwrap();
     assert_ne!(first_id, second_id);
@@ -784,6 +792,7 @@ fn resending_a_pending_prompt_creates_one_row_and_one_request() {
         "fake-model",
         app.session_id,
         &request.prompt,
+        &[],
     )
     .unwrap();
     assert_eq!(same_id, id);
@@ -958,7 +967,7 @@ fn the_resume_picker_lists_this_workspaces_sessions_newest_first() {
     assert!(app.modal.is_none());
 
     for prompt in ["first prompt", "second prompt"] {
-        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt).unwrap();
+        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt, &[]).unwrap();
     }
 
     let rows = crate::cli::sessions::session_rows(&store, &workspace).unwrap();
@@ -1222,7 +1231,7 @@ fn picker(models: &[&str], selected: usize) -> Option<ModalSelection> {
 #[test]
 fn a_finished_refresh_replaces_the_open_picker_and_stops_the_spinner() {
     let mut app = test_app();
-    app.config.model = "beta".to_string();
+    app.config.model = Some("beta".to_string());
     app.modal = picker(&["alpha"], 0);
     app.refreshing_models = true;
 
@@ -2059,4 +2068,93 @@ fn expired_toast_returns_to_the_idle_redraw_interval() {
         run::redraw_interval(&app),
         std::time::Duration::from_secs(1)
     );
+}
+
+#[test]
+fn a_cold_cache_opens_a_fetching_picker() {
+    let mut app = test_app();
+    app.config.base_url = Some("https://phase3-cold-cache.invalid/v1/".to_string());
+
+    assert!(
+        !app.open_model_picker(),
+        "an empty cache asks the caller to start the fetch"
+    );
+    match &app.modal {
+        Some(ModalSelection::Model { models, .. }) => {
+            assert!(models.is_empty(), "nothing cached is nothing to list")
+        }
+        _ => panic!("the picker opens while its list arrives"),
+    }
+
+    app.models_refreshed(Ok(vec!["model-one".to_string(), "model-two".to_string()]));
+
+    match &app.modal {
+        Some(ModalSelection::Model { models, .. }) => assert_eq!(models.len(), 2),
+        _ => panic!("the fetched list fills the open picker"),
+    }
+}
+
+#[test]
+fn an_unreachable_endpoint_reports_the_host() {
+    let mut app = test_app();
+    app.config.base_url = Some("https://phase3-unreachable.invalid/v1/".to_string());
+    assert!(!app.open_model_picker());
+
+    app.models_refreshed(Err("connection refused".to_string()));
+
+    assert!(
+        app.modal.is_none(),
+        "an empty picker has nothing left to show"
+    );
+    let named = app.segments.iter().any(|segment| match segment {
+        Segment::Notice(text) => text.contains("phase3-unreachable.invalid"),
+        _ => false,
+    });
+    assert!(named, "the failure names the host, not a generic message");
+}
+
+#[test]
+fn picker_without_an_endpoint_fetches_nothing() {
+    let mut app = test_app();
+    app.config.base_url = None;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.spawn_model_refresh(&tx);
+
+    assert!(
+        !app.refreshing_models,
+        "no endpoint means no spinner and no fetch"
+    );
+    let named = app.segments.iter().any(|segment| match segment {
+        Segment::Notice(text) => text.contains("no endpoint configured"),
+        _ => false,
+    });
+    assert!(named, "the refusal says what to run");
+}
+
+/// A picker owns the keyboard while it is open: typing edits its filter and
+/// never reaches the prompt behind it.
+#[tokio::test]
+async fn typing_with_the_picker_open_stays_in_the_filter() {
+    let mut app = test_app();
+    app.modal = Some(ModalSelection::Model {
+        models: vec!["model-a".to_string()],
+        query: String::new(),
+        selected: 0,
+    });
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    for character in "/exit".chars() {
+        super::keys::handle(&mut app, KeyEvent::from(KeyCode::Char(character)), &tx).await;
+    }
+
+    assert_eq!(
+        typed(&app),
+        "",
+        "the prompt behind the picker must stay empty"
+    );
+    match &app.modal {
+        Some(ModalSelection::Model { query, .. }) => assert_eq!(query, "/exit"),
+        _ => panic!("the picker stays open while its filter is edited"),
+    }
 }

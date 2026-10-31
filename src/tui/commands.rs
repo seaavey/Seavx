@@ -722,7 +722,15 @@ pub fn status_text(app: &App) -> String {
         AgentState::Checking => "checking the model".to_string(),
         AgentState::Compacting => "compacting".to_string(),
     };
-    let mut lines = vec![format!("state: {state}")];
+    let mut lines = vec![
+        format!("state: {state}"),
+        // The model is what a turn is spent on: `/status` names it or says it
+        // is missing, in which case every turn is refused.
+        format!(
+            "model: {}",
+            app.config.model.as_deref().unwrap_or("not set")
+        ),
+    ];
     if let Some(pending) = &app.pending_permission {
         lines.push(format!(
             "waiting for permission: {} ({})",
@@ -1041,7 +1049,10 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
             match config::init_workspace(std::path::Path::new(".")) {
                 Ok((path, true)) => {
                     app.config = AgentConfig::load(std::path::Path::new("."));
-                    app.push_notice(format!("Created default config at {}", path.display()));
+                    app.push_notice(format!(
+                        "Created default config at {} — no model yet: run `seavx setup`",
+                        path.display()
+                    ));
                 }
                 Ok((path, false)) => {
                     app.push_notice(format!("Config already exists at {}", path.display()));

@@ -386,7 +386,11 @@ pub(super) fn apply_command_effect(
         CommandEffect::Handled => {}
         CommandEffect::Quit => app.should_quit = true,
         CommandEffect::OpenModelPicker => {
-            app.open_model_picker();
+            // Nothing cached is not a dead end: the picker opens empty and the
+            // provider's list arrives as an action.
+            if !app.open_model_picker() {
+                app.spawn_model_refresh(tx);
+            }
         }
         CommandEffect::RunDoctor { offline } => {
             app.status = AgentState::Checking;

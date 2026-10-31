@@ -615,7 +615,7 @@ fn fixture_store() -> (tempfile::TempDir, crate::session::SessionStore, String) 
     let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
     let workspace = "test-workspace".to_string();
     for prompt in ["first prompt", "second prompt"] {
-        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt).unwrap();
+        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt, &[]).unwrap();
     }
     (temp, store, workspace)
 }

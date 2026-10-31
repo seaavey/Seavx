@@ -194,6 +194,7 @@ pub async fn run_agent_worker(
             mut store,
             cancel,
             steer,
+            attachments,
         } = request;
         let mut session_id = session_id;
 
@@ -205,9 +206,10 @@ pub async fn run_agent_worker(
                 crate::session::prepare_turn(
                     &guard,
                     &crate::session::workspace_key(),
-                    &config.model,
+                    config.model.as_deref().unwrap_or_default(),
                     session_id,
                     &prompt,
+                    &attachments,
                 )
             };
             match prepared {
@@ -226,12 +228,14 @@ pub async fn run_agent_worker(
         }
 
         // Generate quick concise title only on the first turn of the session
-        if is_first_turn {
+        if is_first_turn
+            && !prompt.trim().is_empty()
+            && let Some(client_clone) = runtime.client().cloned()
+        {
             let title_tx = tx.clone();
             let title_session = session_id;
             let title_prompt = prompt.clone();
-            let client_clone = runtime.client().clone();
-            let model_name = config.model.clone();
+            let model_name = config.model.clone().unwrap_or_default();
             let title_options = runtime.chat_options();
             tokio::spawn(async move {
                 let req = genai::chat::ChatRequest::from_user(format!(
@@ -273,9 +277,10 @@ pub async fn run_agent_worker(
             turn_id,
         )));
         let task = crate::tui::compact::build_agent_task(&prompt, session_context.as_deref());
+        let user = crate::session::user_message(&task, &attachments);
         let result = runtime
             .execute_task(
-                &task,
+                user,
                 mode,
                 history,
                 &TuiConfirmer::new(tx.clone()),

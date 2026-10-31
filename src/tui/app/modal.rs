@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, ModalSelection};
+use crate::tui::event::Action;
 
 /// Wrap-around previous index; no-op-safe when the list is empty.
 pub(super) fn prev_index(sel: usize, len: usize) -> usize {
@@ -17,19 +18,23 @@ pub(super) fn next_index(sel: usize, len: usize) -> usize {
 }
 
 impl App<'_> {
-    /// Open the cached-model picker. Returns `false` when the cache is empty.
+    /// Open the cached-model picker. Returns `false` when the cache is empty and
+    /// a fetch is needed: the modal is open and empty, so the caller starts the
+    /// same refresh `ctrl+r` runs.
     pub fn open_model_picker(&mut self) -> bool {
         let models = cached_models(self);
         if models.is_empty() {
-            self.set_text("No cached models found. Run `seavx model` once to populate cache.");
-            self.scroll = 0;
-            self.auto_scroll = true;
+            self.modal = Some(ModalSelection::Model {
+                models,
+                query: String::new(),
+                selected: 0,
+            });
             return false;
         }
 
         let current_idx = models
             .iter()
-            .position(|m| *m == self.config.model)
+            .position(|m| Some(m.as_str()) == self.config.model.as_deref())
             .unwrap_or(0);
         self.modal = Some(ModalSelection::Model {
             models,
@@ -148,6 +153,28 @@ impl App<'_> {
         });
     }
 
+    /// Fetch the endpoint's model list off the UI thread. `ctrl+r` and a cold
+    /// picker both come through here; nothing awaits the request.
+    pub fn spawn_model_refresh(&mut self, tx: &tokio::sync::mpsc::UnboundedSender<Action>) {
+        let Some(base_url) = self.config.base_url.clone() else {
+            if let Some(ModalSelection::Model { .. }) = self.modal {
+                self.modal = None;
+            }
+            self.push_notice("no endpoint configured: run `seavx setup`");
+            return;
+        };
+        self.refreshing_models = true;
+        let api_key = self.config.api_key.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let model_mgr = crate::agent::models::ModelManager::new(std::path::Path::new("."));
+            let outcome = model_mgr
+                .refresh_remote_models(&base_url, api_key.as_deref())
+                .await;
+            let _ = tx.send(Action::ModelsRefreshed(outcome));
+        });
+    }
+
     /// Land a finished `/models` refresh: the spinner stops and the picker shows
     /// the new list. A picker closed while the fetch ran stays closed, and only
     /// the toast reports the outcome.
@@ -166,7 +193,7 @@ impl App<'_> {
                 if let Some(query) = query {
                     let selected = visible_models(&models, &query)
                         .iter()
-                        .position(|model| **model == self.config.model)
+                        .position(|model| Some(model.as_str()) == self.config.model.as_deref())
                         .unwrap_or(0);
                     self.modal = Some(ModalSelection::Model {
                         models,
@@ -180,10 +207,27 @@ impl App<'_> {
                 ));
             }
             Err(error) => {
-                self.toast = Some((
-                    format!("✗ Refresh failed: {error}"),
-                    std::time::Instant::now(),
-                ));
+                // A picker opened with nothing cached was waiting for this list:
+                // it has nothing to show, so it closes and the host is named.
+                let empty_picker = matches!(
+                    &self.modal,
+                    Some(ModalSelection::Model { models, .. }) if models.is_empty()
+                );
+                if empty_picker {
+                    self.modal = None;
+                    let host = self
+                        .config
+                        .base_url
+                        .as_deref()
+                        .map(crate::agent::models::ModelManager::domain_slug)
+                        .unwrap_or_else(|| "no endpoint".to_string());
+                    self.push_notice(format!("{host}: {error}"));
+                } else {
+                    self.toast = Some((
+                        format!("✗ Refresh failed: {error}"),
+                        std::time::Instant::now(),
+                    ));
+                }
             }
         }
     }
@@ -210,6 +254,25 @@ impl App<'_> {
                 return;
             }
         };
+        // A literal name is only writable when the cached list holds it; with no
+        // list at all, the picker is the way to fetch one.
+        if target.parse::<usize>().is_err()
+            && (models.is_empty()
+                || crate::agent::models::check_model(&models, &resolved_model)
+                    == crate::agent::models::ModelCheck::NotListed)
+        {
+            let host = self
+                .config
+                .base_url
+                .as_deref()
+                .map(crate::agent::models::ModelManager::domain_slug)
+                .unwrap_or_else(|| "no endpoint".to_string());
+            self.push_notice(format!(
+                "'{resolved_model}' is not in the {} models {host} lists; run /model to pick one",
+                models.len()
+            ));
+            return;
+        }
 
         let config_path = crate::cli::config::workspace_config_path(std::path::Path::new("."));
         // One write: the model and the effort change together or not at all.
@@ -224,7 +287,7 @@ impl App<'_> {
 
         let mut message = format!(
             "Switched model to: {}\nEffort: {}\nSaved to .seavx/config.toml",
-            self.config.model,
+            self.config.model.as_deref().unwrap_or("not set"),
             self.config.reasoning_effort.as_deref().unwrap_or("none")
         );
         for error in errors {
@@ -298,11 +361,11 @@ pub(super) fn edit_query(query: &str, key: &KeyEvent) -> Option<String> {
 /// A cache past its TTL still answers: an old list beats an empty picker, and
 /// `seavx model` is what refreshes it.
 fn cached_models(app: &App) -> Vec<String> {
-    let base_url = app
-        .config
-        .base_url
-        .as_deref()
-        .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
+    // No endpoint configured is no cache to read: the picker says so instead of
+    // listing whatever a default host would have.
+    let Some(base_url) = app.config.base_url.as_deref() else {
+        return Vec::new();
+    };
     let model_mgr = crate::agent::models::ModelManager::new(std::path::Path::new("."));
     model_mgr
         .get_cached_models_allow_stale(&crate::agent::models::ModelManager::domain_slug(base_url))

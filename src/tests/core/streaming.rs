@@ -126,10 +126,11 @@ impl ChatBackend for FakeBackend {
 
 fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path, stream: bool) -> AgentRuntime {
     let mut config = AgentConfig::load(workspace);
-    config.model = "fake-model".to_string();
+    config.model = Some("fake-model".to_string());
     config.max_turns = 4;
     config.stream = stream;
     let security = WorkspaceSecurity::new(workspace);
+    config.base_url = Some("https://gateway.test/v1/".to_string());
     AgentRuntime::with_backend(config, security, Box::new(backend.clone()))
 }
 
@@ -151,7 +152,7 @@ async fn a_stream_that_fails_before_the_first_chunk_falls_back_once() {
 
     let answer = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
@@ -178,7 +179,7 @@ async fn a_stream_that_fails_after_one_chunk_is_not_retried() {
     let mut reported = Vec::new();
     let error = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
@@ -216,7 +217,7 @@ async fn streamed_reasoning_is_not_repeated_by_the_captured_copy() {
     let mut events: Vec<crate::agent::events::AgentEvent> = Vec::new();
     let answer = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
@@ -253,7 +254,7 @@ async fn the_fallback_consumes_the_single_retry() {
 
     let error = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
@@ -282,7 +283,7 @@ async fn stream_false_skips_the_stream_attempt() {
 
     let answer = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,

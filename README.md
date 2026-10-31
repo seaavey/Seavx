@@ -237,13 +237,14 @@ seavx init
 Configuration resides in `.seavx/config.toml`:
 
 ```toml
-model = "openai/gpt-4o-mini"
 max_turns = 100
-base_url = "https://api.openai.com/v1/"
+base_url = "https://your-gateway.example/v1/"
 api_key = "sk-..."
 reasoning_effort = "highx"
 stream = true
 ```
+
+No value here is built in: the endpoint and the model both come from `seavx setup` (or `seavx model`). A config that names no model is refused rather than sent to a provider you did not choose.
 
 `base_url` accepts any OpenAI-compatible endpoint. When a gateway routes several providers, prefix the model with its route (`<provider>/<model>`) and point `base_url` at that gateway.
 
@@ -252,7 +253,7 @@ stream = true
 ```bash
 seavx model
 # Or directly:
-seavx model openai/gpt-4o-mini --effort highx
+seavx model <provider>/<model> --effort highx
 ```
 
 ### TUI Slash Commands

@@ -10,6 +10,22 @@ pub struct ModelCache {
     pub models: Vec<String>,
 }
 
+/// Whether a name the user wants to write is in the list the provider returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCheck {
+    Listed,
+    NotListed,
+}
+
+/// One comparison, used by every surface that writes a model id.
+pub fn check_model(list: &[String], name: &str) -> ModelCheck {
+    if list.iter().any(|model| model == name) {
+        ModelCheck::Listed
+    } else {
+        ModelCheck::NotListed
+    }
+}
+
 pub struct ModelManager {
     cache_dir: PathBuf,
     ttl: Duration,
