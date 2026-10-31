@@ -4,7 +4,6 @@ use crate::cli::doctor::DoctorReport;
 
 #[derive(Debug)]
 pub enum Action {
-    Tick,
     Key(KeyEvent),
     Mouse(MouseEvent),
     AgentToken(String),

@@ -39,8 +39,7 @@ fn task_state_after_turn(status: crate::agent::cancel::TurnStatus) -> Option<Tas
 /// Apply one result the loop did not route to a key or mouse handler.
 pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Action>) {
     match action {
-        // Routed by `run`: the loop needs the terminal for these three.
-        Action::Tick => {}
+        // Routed by `run`: the loop needs the terminal for these two.
         Action::Key(_) => {}
         Action::Mouse(_) => {}
         Action::AgentToken(token) => {

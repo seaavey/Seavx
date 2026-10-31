@@ -14,8 +14,31 @@ use tokio::sync::mpsc;
 
 use super::{App, actions, keys, mouse, run_agent_worker};
 use crate::agent::engine::AgentMode;
-use crate::tui::event::Action;
+use crate::tui::app::ModalSelection;
+use crate::tui::event::{Action, AgentState};
 use crate::tui::ui;
+
+pub(super) fn redraw_interval(app: &App) -> Duration {
+    if app.status != AgentState::Idle
+        || app.refreshing_models
+        || matches!(
+            app.modal.as_ref(),
+            Some(ModalSelection::Effort { options, selected, .. })
+                if options.get(*selected) == Some(&"max")
+        )
+    {
+        Duration::from_millis(16)
+    } else if let Some((_, instant)) = &app.toast {
+        let remaining = Duration::from_secs(3).saturating_sub(instant.elapsed());
+        if remaining.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            remaining
+        }
+    } else {
+        Duration::from_secs(1)
+    }
+}
 
 pub async fn start_tui(
     initial_prompt: Option<String>,
@@ -56,18 +79,6 @@ pub async fn start_tui(
         }
     });
 
-    // 60 FPS tick timer for smooth redraws
-    let tick_tx = tx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(16));
-        loop {
-            interval.tick().await;
-            if tick_tx.send(Action::Tick).is_err() {
-                break;
-            }
-        }
-    });
-
     let mut app = App::new();
 
     // One store handle for the run; a store that cannot open degrades to one
@@ -104,17 +115,21 @@ pub async fn start_tui(
         app.sync_history();
         terminal.draw(|frame| ui::render(&app, frame))?;
 
-        if let Some(action) = rx.recv().await {
-            match action {
-                Action::Tick => {}
-                Action::Mouse(mouse) => {
-                    let size = terminal.size().unwrap_or_default();
-                    let screen = Rect::new(0, 0, size.width, size.height);
-                    mouse::handle(&mut app, mouse, screen);
+        tokio::select! {
+            action = rx.recv() => {
+                if let Some(action) = action {
+                    match action {
+                        Action::Mouse(mouse) => {
+                            let size = terminal.size().unwrap_or_default();
+                            let screen = Rect::new(0, 0, size.width, size.height);
+                            mouse::handle(&mut app, mouse, screen);
+                        }
+                        Action::Key(key) => keys::handle(&mut app, key, &tx).await,
+                        action => actions::apply(&mut app, action, &tx),
+                    }
                 }
-                Action::Key(key) => keys::handle(&mut app, key, &tx).await,
-                action => actions::apply(&mut app, action, &tx),
             }
+            _ = tokio::time::sleep(redraw_interval(&app)) => {}
         }
     }
 

@@ -2003,3 +2003,60 @@ fn a_draft_goal_can_be_planned_then_approved_through_the_commands() {
     );
     assert!(start.is_some(), "approval hands back the turn text to run");
 }
+
+#[test]
+fn test_tui_redraw_interval_tracks_live_animation_work() {
+    let mut app = test_app();
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_secs(1)
+    );
+
+    app.status = AgentState::Thinking;
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_millis(16)
+    );
+
+    app.status = AgentState::Idle;
+    app.refreshing_models = true;
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_millis(16)
+    );
+
+    app.refreshing_models = false;
+    app.modal = Some(ModalSelection::Effort {
+        model: "test".to_string(),
+        options: crate::agent::engine::EFFORT_LEVELS.to_vec(),
+        selected: crate::agent::engine::EFFORT_LEVELS
+            .iter()
+            .position(|level| *level == "max")
+            .unwrap(),
+    });
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_millis(16)
+    );
+
+    if let Some(ModalSelection::Effort { selected, .. }) = app.modal.as_mut() {
+        *selected = 0;
+    }
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_secs(1)
+    );
+}
+
+#[test]
+fn expired_toast_returns_to_the_idle_redraw_interval() {
+    let mut app = test_app();
+    app.toast = Some((
+        "expired".to_string(),
+        std::time::Instant::now() - std::time::Duration::from_secs(4),
+    ));
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_secs(1)
+    );
+}
