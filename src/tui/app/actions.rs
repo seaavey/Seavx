@@ -5,6 +5,19 @@ use super::{App, ModalSelection, PendingPermission, PendingQuestion};
 use crate::agent::events::ToolStatus;
 use crate::tui::event::{Action, AgentState};
 
+/// The matrix answer for the command `/test` proposes: the same `decide` the
+/// agent loop uses, so `tool_permissions` governs both. Kept out of the spawn so
+/// the policy is testable without a terminal.
+pub(super) fn test_verdict(
+    config: &crate::agent::engine::AgentConfig,
+    kind: crate::agent::permissions::ActionKind,
+) -> crate::agent::permissions::Verdict {
+    use crate::agent::permissions::{PermissionMode, decide, parse_mode, parse_permitted};
+    let mode = parse_mode(&config.tool_permissions).unwrap_or(PermissionMode::Ask);
+    let permitted = parse_permitted(&config.permitted_actions).unwrap_or_default();
+    decide(mode, &permitted, kind)
+}
+
 /// Apply one result the loop did not route to a key or mouse handler.
 pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Action>) {
     match action {
@@ -279,33 +292,45 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
         } => {
             app.status = AgentState::Idle;
             app.push_notice(format!(
-                "Proposed: {command}\n{evidence} ({changed} changed file(s)). Press y to run it."
+                "Proposed: {command}\n{evidence} ({changed} changed file(s))."
             ));
-            // The same permission prompt the agent uses: `/test` never runs a
-            // command the user did not approve.
-            let (reply, answer) = tokio::sync::oneshot::channel();
-            app.pending_permission = Some(PendingPermission {
-                request: crate::agent::permissions::PermissionRequest::new(
-                    crate::agent::permissions::ActionKind::Write,
-                    "run_command",
-                    &command,
-                ),
-                reply,
-            });
             let tx = tx.clone();
             tokio::spawn(async move {
-                use crate::agent::permissions::Answer;
-                let allowed = matches!(
-                    answer.await,
-                    Ok(Answer::Once | Answer::Category | Answer::Unrestricted)
-                );
-                if !allowed {
-                    let _ = tx.send(Action::TestDone(format!(
-                        "`{command}` not run: permission denied."
-                    )));
-                    return;
-                }
+                use crate::agent::permissions::Verdict;
+
                 let security = crate::agent::security::WorkspaceSecurity::new(".");
+                // The command is classified as what it is, and the matrix — not
+                // this handler — decides whether it may run at all.
+                let kind = crate::agent::shell::classify(&command, &security).kind;
+                let config = crate::agent::engine::AgentConfig::load(security.root());
+                match test_verdict(&config, kind) {
+                    Verdict::Deny => {
+                        let _ = tx.send(Action::TestDone(format!(
+                            "`{command}` not run: tool_permissions denies {}.",
+                            kind.name()
+                        )));
+                        return;
+                    }
+                    Verdict::Allow => {}
+                    Verdict::Ask => {
+                        let path = crate::cli::config::workspace_config_path(security.root());
+                        let confirm = crate::tui::app::TuiConfirmer::new(tx.clone());
+                        if let Err(denied) = crate::agent::permissions::approve(
+                            &confirm,
+                            kind,
+                            "run_command",
+                            &command,
+                            &path,
+                        )
+                        .await
+                        {
+                            let _ =
+                                tx.send(Action::TestDone(format!("`{command}` not run: {denied}")));
+                            return;
+                        }
+                    }
+                }
+
                 let cancel = crate::agent::cancel::CancelToken::new();
                 use crate::agent::tools::AgentTool;
                 let run = crate::agent::tools::RunCommandTool

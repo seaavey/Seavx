@@ -1821,3 +1821,41 @@ fn criteria_can_be_satisfied_or_waived_so_a_goal_reaches_completed() {
         vec![CriterionState::Satisfied, CriterionState::Waived]
     );
 }
+
+#[test]
+fn the_test_command_is_vetted_by_the_permission_matrix() {
+    use crate::agent::engine::AgentConfig;
+    use crate::agent::permissions::{ActionKind, Verdict};
+
+    let mut config = AgentConfig {
+        tool_permissions: "deny".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::actions::test_verdict(&config, ActionKind::Execute),
+        Verdict::Deny,
+        "tool_permissions = deny must refuse the command /test proposes"
+    );
+
+    config.tool_permissions = "ask".to_string();
+    assert_eq!(
+        super::actions::test_verdict(&config, ActionKind::Execute),
+        Verdict::Ask
+    );
+
+    config.permitted_actions = vec!["execute".to_string()];
+    assert_eq!(
+        super::actions::test_verdict(&config, ActionKind::Execute),
+        Verdict::Allow,
+        "an already-permitted category is not asked again"
+    );
+
+    // The command is classified as what it is. Labelling it a write is what
+    // let a `deny` policy through before.
+    let temp = tempfile::tempdir().unwrap();
+    let security = crate::agent::security::WorkspaceSecurity::new(temp.path());
+    assert_eq!(
+        crate::agent::shell::classify("cargo test", &security).kind,
+        ActionKind::Execute
+    );
+}

@@ -3,9 +3,7 @@ use crate::agent::cancel::{CancelToken, Cleanup, TurnState, TurnStatus};
 use crate::agent::events::{
     AgentEvent, FailureKind, SUMMARY_LIMIT, ToolEvent, ToolStatus, bounded,
 };
-use crate::agent::permissions::{
-    self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
-};
+use crate::agent::permissions::{self, ActionKind, Confirmer, PermissionMode, Verdict};
 use crate::agent::prompt::{ASK_POLICY, PLAN_POLICY, REVIEW_POLICY, load_system_prompt};
 use crate::agent::security::{self, WorkspaceSecurity};
 use crate::agent::tools::ToolRegistry;
@@ -1486,36 +1484,8 @@ impl AgentRuntime {
             Verdict::Ask => {}
         }
 
-        let answer = confirm
-            .confirm(PermissionRequest::new(kind, tool, detail))
-            .await;
         let path = crate::cli::config::workspace_config_path(self.security.root());
-        match answer {
-            Answer::Once => Ok(()),
-            Answer::Category => match crate::cli::config::append_permitted(&path, kind) {
-                Ok(kinds) => {
-                    tracing::info!(action = %kind.name(), ?kinds, "permitted action recorded");
-                    Ok(())
-                }
-                // The user answered; a config that cannot record it must not
-                // turn an approval into a denial.
-                Err(error) => {
-                    tracing::warn!(%error, action = %kind.name(), "could not record permitted action");
-                    Ok(())
-                }
-            },
-            Answer::Unrestricted => {
-                if let Err(error) = crate::cli::config::set_value(
-                    &path,
-                    crate::cli::config::ConfigKey::ToolPermissions,
-                    "allow",
-                ) {
-                    tracing::warn!(%error, "could not persist tool_permissions");
-                }
-                Ok(())
-            }
-            Answer::Deny => Err(denied()),
-        }
+        permissions::approve(confirm, kind, tool, detail, &path).await
     }
 
     /// An invalid mode asks rather than allowing: a broken config must not widen
