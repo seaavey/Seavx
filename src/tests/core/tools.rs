@@ -647,6 +647,76 @@ async fn a_background_child_does_not_hold_the_turn_open() {
     assert!(!result.contains("timed out"), "{result}");
 }
 
+#[test]
+fn a_run_command_shows_the_command_and_not_its_argument_list() {
+    let args = json!({ "command": "cargo clippy --all-targets", "timeout": 400 });
+    assert_eq!(
+        describe_call("run_command", &args),
+        "cargo clippy --all-targets"
+    );
+    assert_eq!(
+        call_label("run_command", "cargo clippy --all-targets"),
+        "run  cargo clippy --all-targets"
+    );
+}
+
+#[test]
+fn a_file_tool_shows_its_path_and_a_search_shows_what_it_looked_for() {
+    assert_eq!(
+        describe_call("read_file", &json!({ "path": "src/main.rs", "limit": 40 })),
+        "src/main.rs"
+    );
+    // No path means the workspace root, which is the whole name of the call.
+    assert_eq!(describe_call("list_directory", &json!({})), ".");
+    assert_eq!(
+        describe_call(
+            "search_files",
+            &json!({ "pattern": "fn main", "path": "src" })
+        ),
+        "\"fn main\" in src"
+    );
+}
+
+#[test]
+fn a_multi_file_patch_is_counted_rather_than_listed() {
+    let one = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+    assert_eq!(
+        describe_call("apply_patch", &json!({ "patch": one })),
+        "src/a.rs"
+    );
+
+    let two = format!("{one}{}", one.replace("a.rs", "b.rs"));
+    assert_eq!(
+        describe_call("apply_patch", &json!({ "patch": two })),
+        "2 files"
+    );
+}
+
+#[test]
+fn a_call_stays_on_one_line_and_an_unknown_tool_still_shows_what_it_carries() {
+    assert_eq!(
+        describe_call(
+            "run_command",
+            &json!({ "command": "cd /tmp\n  && cargo test" })
+        ),
+        "cd /tmp && cargo test"
+    );
+
+    let long = describe_call("run_command", &json!({ "command": "x".repeat(400) }));
+    assert_eq!(long.chars().count(), 121, "clipped and marked: {long}");
+    assert!(long.ends_with('…'), "{long}");
+
+    let unknown = describe_call("some_future_tool", &json!({ "path": "a.rs", "deep": true }));
+    assert!(
+        unknown.contains("path=\"a.rs\"") && unknown.contains("deep=true"),
+        "{unknown}"
+    );
+    assert_eq!(
+        call_label("some_future_tool", "a.rs"),
+        "some_future_tool  a.rs"
+    );
+}
+
 #[tokio::test]
 async fn undo_refuses_a_file_the_user_edited_after_the_write() {
     let (_temp, root, security) = prepare().await;

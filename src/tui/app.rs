@@ -490,9 +490,11 @@ impl<'a> App<'a> {
         if self.mode == mode {
             // A repeat is information, not a refusal: say what is already true.
             let label = match mode {
-                AgentMode::Plan => "Plan mode is already active",
                 AgentMode::Build => "Build mode is already active",
-                // Never reachable: `App.mode` only ever holds Build or Plan.
+                AgentMode::Plan => "Plan mode is already active",
+                AgentMode::AcceptEdits => "Accept-edits mode is already active",
+                AgentMode::Auto => "Auto mode is already active",
+                // Never reachable: the standing selection is one of the four.
                 AgentMode::Ask => "Ask is one turn at a time",
                 AgentMode::Review => "Review is one turn at a time",
             };
@@ -504,13 +506,9 @@ impl<'a> App<'a> {
         }
     }
 
-    pub fn toggle_mode(&mut self) {
-        let next = match self.mode {
-            AgentMode::Build => AgentMode::Plan,
-            // The standing mode is never Ask: it lasts one turn.
-            AgentMode::Plan | AgentMode::Ask | AgentMode::Review => AgentMode::Build,
-        };
-        self.request_mode(next);
+    /// `ctrl+tab` walks build, plan, accept-edits, auto and starts over.
+    pub fn cycle_mode(&mut self) {
+        self.request_mode(self.mode.next_standing());
     }
 
     fn push_mode_notice(&mut self, text: &str) {

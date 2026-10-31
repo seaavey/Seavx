@@ -1,3 +1,4 @@
+use crate::agent::engine::AgentMode;
 use crate::agent::security::{WorkspaceSecurity, check_file};
 
 /// Fixture: one workspace holding every protected class the policy names, plus
@@ -526,6 +527,7 @@ async fn global_writes_ask_in_every_mode() {
     let confirmer = RecordingConfirmer::new(Answer::Once);
     runtime
         .gate(
+            AgentMode::Build,
             &confirmer,
             ActionKind::GlobalWrite,
             "save_memory",
@@ -544,6 +546,7 @@ async fn global_writes_ask_in_every_mode() {
     let confirmer = RecordingConfirmer::new(Answer::Once);
     let error = runtime
         .gate(
+            AgentMode::Build,
             &confirmer,
             ActionKind::GlobalWrite,
             "save_memory",
@@ -559,6 +562,7 @@ async fn global_writes_ask_in_every_mode() {
     let confirmer = RecordingConfirmer::new(Answer::Deny);
     let error = runtime
         .gate(
+            AgentMode::Build,
             &confirmer,
             ActionKind::GlobalWrite,
             "skill_write",
@@ -577,6 +581,7 @@ async fn category_and_unrestricted_persist_through_the_one_writer() {
     let (dir, runtime) = runtime_with("ask", &[]);
     runtime
         .gate(
+            AgentMode::Build,
             &RecordingConfirmer::new(Answer::Category),
             ActionKind::Network,
             "run_command",
@@ -590,6 +595,7 @@ async fn category_and_unrestricted_persist_through_the_one_writer() {
 
     runtime
         .gate(
+            AgentMode::Build,
             &RecordingConfirmer::new(Answer::Unrestricted),
             ActionKind::Execute,
             "run_command",
@@ -834,7 +840,13 @@ async fn a_workspace_write_asks_before_anything_is_written() {
     let (_dir, runtime) = runtime_with("ask", &[]);
     let confirmer = RecordingConfirmer::new(Answer::Once);
     runtime
-        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .gate(
+            AgentMode::Build,
+            &confirmer,
+            ActionKind::Write,
+            "write_file",
+            "src/lib.rs",
+        )
         .await
         .expect("an approval lets the write through");
     let seen = confirmer.seen();
@@ -850,7 +862,13 @@ async fn a_workspace_write_asks_before_anything_is_written() {
     let (_dir, runtime) = runtime_with("ask", &[]);
     let confirmer = RecordingConfirmer::new(Answer::Deny);
     let error = runtime
-        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .gate(
+            AgentMode::Build,
+            &confirmer,
+            ActionKind::Write,
+            "write_file",
+            "src/lib.rs",
+        )
         .await
         .unwrap_err();
     assert!(error.contains("Permission denied"), "{error}");
@@ -859,7 +877,13 @@ async fn a_workspace_write_asks_before_anything_is_written() {
     let (_dir, runtime) = runtime_with("ask", &["write"]);
     let confirmer = RecordingConfirmer::new(Answer::Deny);
     runtime
-        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .gate(
+            AgentMode::Build,
+            &confirmer,
+            ActionKind::Write,
+            "write_file",
+            "src/lib.rs",
+        )
         .await
         .expect("a lifted kind does not ask");
     assert!(confirmer.seen().is_empty());
@@ -868,10 +892,114 @@ async fn a_workspace_write_asks_before_anything_is_written() {
     let (_dir, runtime) = runtime_with("allow", &[]);
     let confirmer = RecordingConfirmer::new(Answer::Deny);
     runtime
-        .gate(&confirmer, ActionKind::Write, "write_file", "src/lib.rs")
+        .gate(
+            AgentMode::Build,
+            &confirmer,
+            ActionKind::Write,
+            "write_file",
+            "src/lib.rs",
+        )
         .await
         .expect("allow mode writes without a question");
     assert!(confirmer.seen().is_empty());
+}
+
+#[tokio::test]
+async fn accept_edits_lifts_only_the_write_and_auto_lifts_every_ask() {
+    use crate::agent::permissions::{ActionKind, Answer};
+
+    // Accept-edits: a workspace write runs, a command still asks.
+    let (_dir, runtime) = runtime_with("ask", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    runtime
+        .gate(
+            AgentMode::AcceptEdits,
+            &confirmer,
+            ActionKind::Write,
+            "write_file",
+            "src/lib.rs",
+        )
+        .await
+        .expect("accept-edits writes without a question");
+    assert!(confirmer.seen().is_empty());
+    let error = runtime
+        .gate(
+            AgentMode::AcceptEdits,
+            &confirmer,
+            ActionKind::Execute,
+            "run_command",
+            "make",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("Permission denied"), "{error}");
+    assert_eq!(confirmer.seen().len(), 1, "a command still asks once");
+
+    // Auto: a command runs unasked.
+    let (_dir, runtime) = runtime_with("ask", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    runtime
+        .gate(
+            AgentMode::Auto,
+            &confirmer,
+            ActionKind::Execute,
+            "run_command",
+            "make",
+        )
+        .await
+        .expect("auto runs without a question");
+    assert!(confirmer.seen().is_empty());
+
+    // Auto never lifts a configured deny, and the matrix keeps its two floors.
+    let (_dir, runtime) = runtime_with("deny", &[]);
+    let error = runtime
+        .gate(
+            AgentMode::Auto,
+            &RecordingConfirmer::new(Answer::Once),
+            ActionKind::Execute,
+            "run_command",
+            "make",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("Permission denied"), "{error}");
+
+    let (_dir, runtime) = runtime_with("ask", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Deny);
+    let error = runtime
+        .gate(
+            AgentMode::Auto,
+            &confirmer,
+            ActionKind::GlobalWrite,
+            "save_memory",
+            "~/.seavx/USER.md",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        confirmer.seen().len(),
+        1,
+        "auto still asks for a global write"
+    );
+    assert!(error.contains("outside the workspace"), "{error}");
+
+    let (_dir, runtime) = runtime_with("ask", &[]);
+    let confirmer = RecordingConfirmer::new(Answer::Once);
+    let error = runtime
+        .gate(
+            AgentMode::Auto,
+            &confirmer,
+            ActionKind::Destructive,
+            "run_command",
+            "git reset --hard",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        confirmer.seen().is_empty(),
+        "a destructive call is never asked"
+    );
+    assert!(error.contains("destroy data"), "{error}");
 }
 
 #[test]

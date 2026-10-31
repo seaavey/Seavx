@@ -725,8 +725,9 @@ pub fn status_text(app: &App) -> String {
     let mut lines = vec![format!("state: {state}")];
     if let Some(pending) = &app.pending_permission {
         lines.push(format!(
-            "waiting for permission: {} wants to {}",
-            pending.request.tool, pending.request.effect
+            "waiting for permission: {} ({})",
+            pending.request.effect,
+            pending.request.kind.name()
         ));
     }
     if let Some(pending) = &app.pending_question {

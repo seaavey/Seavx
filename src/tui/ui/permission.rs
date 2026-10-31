@@ -91,13 +91,6 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
         let body = vec![
             Line::from(vec![
                 Span::raw(" "),
-                Span::styled(
-                    request.tool.clone(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  ", theme::dim()),
                 Span::styled(request.effect.clone(), Style::default().fg(Color::White)),
             ]),
             Line::from(vec![
@@ -114,7 +107,7 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
         ];
         let block = Block::default()
             .title(Span::styled(
-                " permission ",
+                format!(" permission · {} ", request.kind.name()),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

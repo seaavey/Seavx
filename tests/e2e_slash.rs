@@ -200,6 +200,28 @@ fn workspace_root(workspace: &Path) -> std::path::PathBuf {
 }
 
 #[test]
+fn the_mode_shortcut_cycles_the_header_in_a_real_terminal() {
+    let home = tempfile::tempdir().expect("temp home");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+
+    let mut tui = Tui::start(workspace.path(), home.path());
+    tui.wait_for_screen(READY);
+    tui.wait_for_screen("[build]");
+
+    // Ctrl+Tab arrives as `CSI 9;5u` on a terminal that speaks the kitty
+    // protocol, which the TUI asks for on start; `ESC [ Z` is the Shift+Tab
+    // sequence every terminal sends and the same handler owns both.
+    tui.press("\x1b[9;5u");
+    tui.wait_for_screen("[plan]");
+    tui.press("\x1b[Z");
+    tui.wait_for_screen("[accept-edits]");
+    tui.press("\x1b[Z");
+    tui.wait_for_screen("[auto]");
+
+    assert!(tui.exit().success(), "the TUI exits cleanly after a cycle");
+}
+
+#[test]
 fn slash_commands_that_write_land_on_disk_and_the_tui_exits_cleanly() {
     let home = tempfile::tempdir().expect("temp home");
     let workspace = tempfile::tempdir().expect("temp workspace");

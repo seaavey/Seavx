@@ -11,11 +11,15 @@ use crate::tui::event::{Action, AgentState};
 /// the policy is testable without a terminal.
 pub(super) fn test_verdict(
     config: &crate::agent::engine::AgentConfig,
+    mode: crate::agent::engine::AgentMode,
     kind: crate::agent::permissions::ActionKind,
 ) -> crate::agent::permissions::Verdict {
     use crate::agent::permissions::{PermissionMode, decide, parse_mode, parse_permitted};
-    let mode = parse_mode(&config.tool_permissions).unwrap_or(PermissionMode::Ask);
+    let configured = parse_mode(&config.tool_permissions).unwrap_or(PermissionMode::Ask);
     let permitted = parse_permitted(&config.permitted_actions).unwrap_or_default();
+    // The standing mode widens the configured policy exactly as it does for the
+    // agent loop, so `/test` never asks in a mode that stopped asking.
+    let (mode, permitted) = crate::agent::engine::mode_permissions(mode, configured, permitted);
     decide(mode, &permitted, kind)
 }
 
@@ -152,12 +156,16 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             }
         }
         Action::AgentTool(tool) => {
-            let label = format!("{}({})", tool.name, tool.summary);
+            // The verb and the one thing it touches, never the raw argument
+            // list the model wrote.
+            let label = crate::agent::tools::call_label(&tool.name, &tool.summary);
             match tool.status {
                 ToolStatus::Queued => {
                     app.status = AgentState::ExecutingTool(label.clone());
-                    // Clean compact Hermes-style tool call indicator without brackets
-                    app.push_text(&format!("\n⚡ {label}\n\n"));
+                    app.push_text(&format!(
+                        "\n⚡ {}\n\n",
+                        crate::agent::events::bounded(&label, 96)
+                    ));
                 }
                 ToolStatus::Running => app.status = AgentState::ExecutingTool(label),
                 // The outcome line: the status word is the ledger's, so a denied
@@ -261,9 +269,11 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             app.status = AgentState::Idle;
         }
         Action::PermissionAsk { request, reply } => {
+            // The category is named because `a` records exactly that one.
             app.push_notice(format!(
-                "Permission required: {} wants to {}.\n  y = once  ·  a = this category  ·  u = unrestricted  ·  n = deny",
-                request.tool, request.effect
+                "Permission required ({}): {}.\n  y = once  ·  a = this category  ·  u = unrestricted  ·  n = deny",
+                request.kind.name(),
+                request.effect
             ));
             app.pending_permission = Some(PendingPermission { request, reply });
         }
@@ -317,6 +327,9 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                 "Proposed: {command}\n{evidence} ({changed} changed file(s))."
             ));
             let tx = tx.clone();
+            // Copied before the spawn: the standing mode is what the matrix this
+            // command runs against is widened by.
+            let mode = app.mode;
             tokio::spawn(async move {
                 use crate::agent::permissions::Verdict;
 
@@ -325,7 +338,7 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                 // this handler — decides whether it may run at all.
                 let kind = crate::agent::shell::classify(&command, &security).kind;
                 let config = crate::agent::engine::AgentConfig::load(security.root());
-                match test_verdict(&config, kind) {
+                match test_verdict(&config, mode, kind) {
                     Verdict::Deny => {
                         let _ = tx.send(Action::TestDone(format!(
                             "`{command}` not run: tool_permissions denies {}.",

@@ -861,7 +861,12 @@ fn render_message(message: &ChatMessage) -> String {
         }
     }
     for call in message.content.tool_calls() {
-        out.push_str(&format!("⚡ {}({})\n\n", call.fn_name, call.fn_arguments));
+        // The same words the live transcript uses: a verb and its object.
+        let detail = crate::agent::tools::describe_call(&call.fn_name, &call.fn_arguments);
+        out.push_str(&format!(
+            "⚡ {}\n\n",
+            crate::agent::tools::call_label(&call.fn_name, &detail)
+        ));
     }
     for response in message.content.tool_responses() {
         out.push_str(&format!("{}\n\n", response.content.trim()));

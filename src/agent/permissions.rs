@@ -38,15 +38,16 @@ impl ActionKind {
         }
     }
 
-    /// One-line effect sentence for the prompt, or for a denial message.
+    /// One-line effect, phrased to follow `wants to` in the prompt and
+    /// `Permission denied:` in a refusal.
     pub fn effect(self, detail: &str) -> String {
         match self {
-            ActionKind::Read => format!("reads {detail}"),
-            ActionKind::Write => format!("writes {detail} inside the workspace"),
-            ActionKind::GlobalWrite => format!("writes {detail} outside the workspace"),
-            ActionKind::Execute => format!("runs the command {detail}"),
-            ActionKind::Network => format!("reaches the network: {detail}"),
-            ActionKind::Destructive => format!("could destroy data: {detail}"),
+            ActionKind::Read => format!("read {detail}"),
+            ActionKind::Write => format!("write {detail} inside the workspace"),
+            ActionKind::GlobalWrite => format!("write {detail} outside the workspace"),
+            ActionKind::Execute => format!("run {detail}"),
+            ActionKind::Network => format!("reach the network at {detail}"),
+            ActionKind::Destructive => format!("destroy data in {detail}"),
         }
     }
 }

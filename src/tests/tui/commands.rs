@@ -828,7 +828,8 @@ fn status_reports_a_pending_permission() {
 
     let text = status_text(&app);
     assert!(text.contains("waiting for permission"), "{text}");
-    assert!(text.contains("run_command"), "{text}");
+    assert!(text.contains("run cargo test"), "{text}");
+    assert!(text.contains("(execute)"), "{text}");
 }
 
 #[test]

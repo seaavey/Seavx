@@ -1380,7 +1380,7 @@ impl ToolRegistry {
             .tools
             .values()
             .filter(|tool| match mode {
-                AgentMode::Build => true,
+                AgentMode::Build | AgentMode::AcceptEdits | AgentMode::Auto => true,
                 AgentMode::Plan => tool.is_read_only(),
                 // Narrower than Plan on purpose: `skill_view` reads skill roots
                 // outside the workspace, and every Ask citation must be
@@ -1409,7 +1409,7 @@ impl ToolRegistry {
             .ok_or_else(|| format!("Tool '{name}' not found."))?;
 
         match mode {
-            AgentMode::Build => {}
+            AgentMode::Build | AgentMode::AcceptEdits | AgentMode::Auto => {}
             AgentMode::Plan if !tool.is_read_only() => {
                 return Err(format!("Tool '{name}' is disabled in Plan Mode."));
             }
@@ -1425,6 +1425,108 @@ impl ToolRegistry {
         }
 
         Ok(tool)
+    }
+}
+
+/// How much of one argument the screen shows. The stored summary allows far
+/// more, so a long command still lands in the session in full.
+const DETAIL_LIMIT: usize = 120;
+
+/// The one thing a call acts on, in words a person reads: a command, a path, a
+/// question. The raw argument list the model wrote never reaches the screen.
+pub fn describe_call(name: &str, args: &Value) -> String {
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let detail = match name {
+        "run_command" => text("command"),
+        "read_file" | "write_file" | "edit_file" => text("path"),
+        // No path means the workspace root, which is what the tool lists.
+        "list_directory" => Some(text("path").unwrap_or_else(|| ".".to_string())),
+        // The pattern is what a reader scans for; the path says where it ran.
+        "search_files" => text("pattern").map(|pattern| match text("path") {
+            Some(path) => format!("\"{pattern}\" in {path}"),
+            None => format!("\"{pattern}\""),
+        }),
+        "apply_patch" => text("patch").and_then(|patch| patch_targets(&patch)),
+        "ask_user" => text("question"),
+        "save_memory" => text("lesson"),
+        "skill_view" | "skill_write" | "skill_patch" => text("name"),
+        _ => None,
+    };
+    match detail {
+        Some(detail) => one_line(&detail),
+        None => one_line(&argument_list(args)),
+    }
+}
+
+/// `run  cargo clippy`: the verb a human reads, then the thing it touches.
+pub fn call_label(name: &str, detail: &str) -> String {
+    format!("{}  {detail}", verb(name)).trim_end().to_string()
+}
+
+/// One word for what the tool does. An unknown tool keeps its own name, so a
+/// new tool still reads as itself rather than as nothing.
+fn verb(name: &str) -> &str {
+    match name {
+        "run_command" => "run",
+        "read_file" => "read",
+        "write_file" => "write",
+        "edit_file" => "edit",
+        "apply_patch" => "patch",
+        "list_directory" => "list",
+        "search_files" => "search",
+        "ask_user" => "ask",
+        "save_memory" => "remember",
+        "skill_view" => "skill",
+        "skill_write" => "skill save",
+        "skill_patch" => "skill edit",
+        other => other,
+    }
+}
+
+/// One file named, a batch counted: a patch that touches twenty files would
+/// otherwise print twenty paths on one line.
+fn patch_targets(patch: &str) -> Option<String> {
+    let files = crate::agent::patch::parse(patch).ok()?;
+    match files.len() {
+        0 => None,
+        1 => Some(files[0].path.display().to_string()),
+        count => Some(format!("{count} files")),
+    }
+}
+
+/// One line, one length: a multi-line command must not wrap the transcript.
+fn one_line(text: &str) -> String {
+    let squeezed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::agent::events::bounded(&squeezed, DETAIL_LIMIT)
+}
+
+/// The fallback for a tool this list does not know: `key="value"` pairs, so an
+/// unknown call still shows what it carries.
+fn argument_list(args: &Value) -> String {
+    match args {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| {
+                let value = match value {
+                    // char-safe: byte slicing panics on multibyte args
+                    Value::String(text) if text.chars().count() > 60 => {
+                        let head: String = text.chars().take(57).collect();
+                        format!("\"{head}...\"")
+                    }
+                    Value::String(text) => format!("\"{text}\""),
+                    other => other.to_string(),
+                };
+                format!("{key}={value}")
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
     }
 }
 

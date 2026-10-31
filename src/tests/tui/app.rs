@@ -345,17 +345,20 @@ fn mode_change_is_rejected_while_busy_and_says_so() {
 }
 
 #[test]
-fn switching_modes_stays_silent() {
+fn ctrl_tab_walks_the_four_standing_modes_and_stays_silent() {
     // The header and footer already show the active mode; a switch must not add
     // a transcript row of its own.
     let mut app = test_app();
-    app.toggle_mode();
-    assert_eq!(app.mode, AgentMode::Plan);
-    assert!(transcript(&app).is_empty(), "{}", transcript(&app));
-
-    app.toggle_mode();
-    assert_eq!(app.mode, AgentMode::Build);
-    assert!(transcript(&app).is_empty(), "{}", transcript(&app));
+    for expected in [
+        AgentMode::Plan,
+        AgentMode::AcceptEdits,
+        AgentMode::Auto,
+        AgentMode::Build,
+    ] {
+        app.cycle_mode();
+        assert_eq!(app.mode, expected);
+        assert!(transcript(&app).is_empty(), "{}", transcript(&app));
+    }
 
     let mut plan = test_app();
     plan.mode = AgentMode::Plan;
@@ -1431,7 +1434,7 @@ fn a_tool_event_renders_its_outcome_and_never_completes_a_cancelled_call() {
     let tool = |status, elapsed, failure| crate::agent::events::ToolEvent {
         call_id: "call-1".to_string(),
         name: "read_file".to_string(),
-        summary: "path=\"note.txt\"".to_string(),
+        summary: "note.txt".to_string(),
         status,
         failure,
         started_at: 1,
@@ -1444,10 +1447,7 @@ fn a_tool_event_renders_its_outcome_and_never_completes_a_cancelled_call() {
         &tx,
     );
     let queued = crate::tui::compact::transcript_from_segments(&app.segments);
-    assert!(
-        queued.contains("⚡ read_file(path=\"note.txt\")"),
-        "{queued}"
-    );
+    assert!(queued.contains("⚡ read  note.txt"), "{queued}");
 
     super::actions::apply(
         &mut app,
@@ -1846,20 +1846,20 @@ fn the_test_command_is_vetted_by_the_permission_matrix() {
         ..Default::default()
     };
     assert_eq!(
-        super::actions::test_verdict(&config, ActionKind::Execute),
+        super::actions::test_verdict(&config, AgentMode::Build, ActionKind::Execute),
         Verdict::Deny,
         "tool_permissions = deny must refuse the command /test proposes"
     );
 
     config.tool_permissions = "ask".to_string();
     assert_eq!(
-        super::actions::test_verdict(&config, ActionKind::Execute),
+        super::actions::test_verdict(&config, AgentMode::Build, ActionKind::Execute),
         Verdict::Ask
     );
 
     config.permitted_actions = vec!["execute".to_string()];
     assert_eq!(
-        super::actions::test_verdict(&config, ActionKind::Execute),
+        super::actions::test_verdict(&config, AgentMode::Build, ActionKind::Execute),
         Verdict::Allow,
         "an already-permitted category is not asked again"
     );

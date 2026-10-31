@@ -80,6 +80,17 @@ per landed change; no entry describes behaviour that is not in the code.
   `.rs` file or `Cargo.toml` in a Cargo workspace, a script file or
   `package.json` in a package workspace. A README-only change proposes nothing
   instead of running the whole suite.
+- The standing mode is one of four, cycled with `Ctrl+Tab` (`Shift+Tab` where
+  the terminal does not report it): build, plan, accept-edits and auto.
+  Accept-edits lifts the question for a write inside the workspace, auto lifts
+  every ask, and the matrix keeps its two floors in both: a write outside the
+  workspace still asks, a destructive call is still refused, and a configured
+  `deny` is never lifted.
+- A tool call reads as a verb and its object (`⚡ run  cargo clippy
+  --all-targets`), not as the argument list the model wrote, on the live
+  transcript, the session line and `sessions show`. The permission prompt names
+  the category the `a` key records and states the effect in words instead of
+  repeating the arguments after "wants to runs the command".
 
 ### tests
 

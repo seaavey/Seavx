@@ -51,11 +51,16 @@ seavx exec "Inspect Cargo.toml and list dependencies"
 
 ## 🧭 Modes
 
-- **Build** (default): all tools, including file writes and command execution.
-- **Plan**: read-only exploration; write and command tools are disabled.
+Four standing modes, cycled with `Ctrl+Tab` (`Shift+Tab` on terminals that do not report Ctrl+Tab):
 
-Use `/plan` to enter Plan Mode, `/plan off` to return to Build,
-or toggle with `Ctrl+Tab` (`Shift+Tab` on terminals that do not report Ctrl+Tab).
+- **Build** (default): all tools. A write inside the workspace and a command ask first, as `tool_permissions` says.
+- **Plan**: read-only exploration; write and command tools are disabled.
+- **Accept-edits**: a write inside the workspace runs without asking; a command and the network still ask.
+- **Auto**: a command and the network run without asking too.
+
+The matrix keeps its two floors in every mode: a write outside the workspace (memory files, skills) still asks, a destructive call is still refused, and a configured `tool_permissions = "deny"` is never lifted.
+
+`/plan` and `/plan off` jump straight between Plan and Build.
 
 ---
 
@@ -263,7 +268,7 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/config get <key>`                           | Show one effective value with its source.                                                                                                                                                                                 |
 | `/config set [--global] <key> <value>`        | Validate and persist one key.                                                                                                                                                                                             |
 | `/config unset [--global] <key>`              | Remove one key.                                                                                                                                                                                                           |
-| `/plan [on\|off]`                             | Enter or leave Plan Mode.                                                                                                                                                                                                 |
+| `/plan [on\|off]`                             | Enter or leave Plan Mode. The standing mode is one of four, cycled with `Ctrl+Tab` (`Shift+Tab` as the fallback).                                                                                                         |
 | `/ask <question>`                             | Answer a question about the code in one read-only turn. Unavailable tools stay unavailable: no writes, no commands, no checkpoints, and the Plan/Build selection is untouched. Citations must point at a line this turn actually read; anything else is marked unverified.                                        |
 | `/review [working-tree\|staged\|commit <ref>\|base <ref>]` | Review a Git target without touching the index, worktree or refs. The diff is resolved on the host, bounded to 1 MiB with a 30-second Git timeout, and protected or symlinked paths are withheld (count only). Findings carry severity, evidence, path/line and confirmed-or-hypothesis; no test is claimed.     |
 | `/preset [name \| add <file.md>]`                  | Pick a prompt preset from a searchable list with a preview of its text, or load one by name into the next prompt. `/preset add <file.md>` copies that Markdown file into `.seavx/prompts/<stem>.md` (the `@` picker's `[file:…]` tag is accepted as the path), refusing a name that is already taken instead of overwriting it. A preset is static text from `.seavx/prompts/<name>.md` (project) or `~/.seavx/prompts/<name>.md` (user), project shadowing user. Names are restricted to letters, digits, `-` and `_`; symlinks, non-regular files and anything over 64 KiB are refused with the path and the reason. A preset can never change the mode, the permission policy or the security rules, and it never reaches the system prompt. |

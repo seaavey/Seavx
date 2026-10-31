@@ -300,7 +300,7 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
     }
 
     if is_mode_shortcut(&key) {
-        app.toggle_mode();
+        app.cycle_mode();
         return;
     }
 

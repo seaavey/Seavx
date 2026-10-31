@@ -89,6 +89,16 @@ fn header_and_footer_show_build_mode() {
 }
 
 #[test]
+fn header_shows_the_mode_the_shortcut_cycled_to() {
+    let mut app = test_app();
+    app.cycle_mode();
+    app.cycle_mode();
+    let screen = screen_of(&app);
+    assert!(screen.contains("[accept-edits]"), "{screen}");
+    assert!(!screen.contains("[plan]"), "{screen}");
+}
+
+#[test]
 fn header_and_footer_show_plan_mode() {
     let mut app = test_app();
     app.mode = AgentMode::Plan;
@@ -323,6 +333,31 @@ fn reasoning_uses_the_whole_width_of_a_wide_terminal() {
 }
 
 #[test]
+fn a_tool_call_draws_its_verb_and_its_object_above_the_outcome() {
+    let mut app = test_app();
+    app.push_text("\n⚡ run  cargo clippy --all-targets\n\n");
+    app.push_text("  └ completed 11.7s\n");
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String { (0..90).map(|x| buffer[(x, y)].symbol()).collect() };
+
+    let call_y = (0..24)
+        .find(|y| row(*y).contains("cargo clippy"))
+        .expect("the call line");
+    assert!(
+        row(call_y).starts_with('⚡') && row(call_y).contains("run  cargo clippy --all-targets"),
+        "the verb and the command, not the argument list: {:?}",
+        row(call_y)
+    );
+    let outcome_y = (call_y + 1..call_y + 3)
+        .find(|y| row(*y).contains("completed 11.7s"))
+        .unwrap_or_else(|| panic!("the outcome sits under the call: {:?}", row(call_y + 1)));
+    assert!(outcome_y > call_y, "below the call, never above it");
+}
+
+#[test]
 fn a_pending_permission_renders_a_box_above_the_composer() {
     let mut app = test_app();
     let (reply, _answer) = tokio::sync::oneshot::channel();
@@ -349,8 +384,18 @@ fn a_pending_permission_renders_a_box_above_the_composer() {
         row(title_y)
     );
     assert!(
-        row(title_y + 1).contains("write_file") && row(title_y + 1).contains("notes.txt"),
-        "the tool and its effect share the first row: {:?}",
+        row(title_y).contains("permission · write"),
+        "the box names the category `a` would record: {:?}",
+        row(title_y)
+    );
+    assert!(
+        row(title_y + 1).contains("write notes.txt inside the workspace"),
+        "the effect is spelled out in words: {:?}",
+        row(title_y + 1)
+    );
+    assert!(
+        !row(title_y + 1).contains("write_file"),
+        "the tool name is not what a person needs to read: {:?}",
         row(title_y + 1)
     );
     for key in ["y", "a", "u", "n"] {

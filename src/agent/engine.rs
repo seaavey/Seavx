@@ -6,7 +6,7 @@ use crate::agent::events::{
 use crate::agent::permissions::{self, ActionKind, Confirmer, PermissionMode, Verdict};
 use crate::agent::prompt::{ASK_POLICY, PLAN_POLICY, REVIEW_POLICY, load_system_prompt};
 use crate::agent::security::{self, WorkspaceSecurity};
-use crate::agent::tools::ToolRegistry;
+use crate::agent::tools::{self, ToolRegistry};
 use crate::session::MessageStatus;
 use genai::Client;
 use genai::adapter::AdapterKind;
@@ -34,6 +34,12 @@ pub enum AgentMode {
     Ask,
     /// One-shot code review of a resolved Git target. Ephemeral too.
     Review,
+    /// Build, without the question for a write inside the workspace.
+    AcceptEdits,
+    /// Build, without the question for a workspace write, a command or the
+    /// network. The matrix keeps its own two floors: a write outside the
+    /// workspace still asks, and a destructive call is still refused.
+    Auto,
 }
 
 impl AgentMode {
@@ -43,19 +49,55 @@ impl AgentMode {
             Self::Plan => "plan",
             Self::Ask => "ask",
             Self::Review => "review",
+            Self::AcceptEdits => "accept-edits",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// The four modes `ctrl+tab` cycles, in order. Ask and Review last one turn
+    /// and are never part of the ring.
+    pub fn next_standing(self) -> Self {
+        match self {
+            Self::Build => Self::Plan,
+            Self::Plan => Self::AcceptEdits,
+            Self::AcceptEdits => Self::Auto,
+            Self::Auto | Self::Ask | Self::Review => Self::Build,
         }
     }
 }
 
-/// A completed task is only a skill candidate in Build Mode.
+/// The matrix a mode runs: AcceptEdits lifts the workspace write, Auto lifts
+/// every ask, and a configured `deny` is never lifted by either.
+pub(crate) fn mode_permissions(
+    mode: AgentMode,
+    configured: PermissionMode,
+    permitted: Vec<ActionKind>,
+) -> (PermissionMode, Vec<ActionKind>) {
+    let mut kinds = permitted;
+    if matches!(mode, AgentMode::AcceptEdits | AgentMode::Auto)
+        && !kinds.contains(&ActionKind::Write)
+    {
+        kinds.push(ActionKind::Write);
+    }
+    let configured = match mode {
+        AgentMode::Auto if configured != PermissionMode::Deny => PermissionMode::Allow,
+        _ => configured,
+    };
+    (configured, kinds)
+}
+
+/// A completed task is only a skill candidate in a build turn.
 pub(crate) fn should_auto_distill(mode: AgentMode, step_count: usize) -> bool {
-    mode == AgentMode::Build && step_count >= 2
+    matches!(
+        mode,
+        AgentMode::Build | AgentMode::AcceptEdits | AgentMode::Auto
+    ) && step_count >= 2
 }
 
 /// Append the read-only planning policy after the base prompt has been resolved.
 pub(crate) fn with_mode_policy(mut prompt: String, mode: AgentMode) -> String {
     let policy = match mode {
-        AgentMode::Build => None,
+        AgentMode::Build | AgentMode::AcceptEdits | AgentMode::Auto => None,
         AgentMode::Plan => Some(PLAN_POLICY),
         AgentMode::Ask => Some(ASK_POLICY),
         AgentMode::Review => Some(REVIEW_POLICY),
@@ -1185,30 +1227,9 @@ impl AgentRuntime {
                 }
                 last_action = Some(signature);
 
-                let args_summary = match &call.fn_arguments {
-                    serde_json::Value::Object(map) => {
-                        let parts: Vec<String> = map
-                            .iter()
-                            .map(|(k, v)| {
-                                let val_str = match v {
-                                    serde_json::Value::String(s) => {
-                                        // char-safe: byte slicing panics on multibyte args
-                                        if s.chars().count() > 60 {
-                                            let head: String = s.chars().take(57).collect();
-                                            format!("\"{head}...\"")
-                                        } else {
-                                            format!("\"{s}\"")
-                                        }
-                                    }
-                                    other => other.to_string(),
-                                };
-                                format!("{k}={val_str}")
-                            })
-                            .collect();
-                        parts.join(", ")
-                    }
-                    other => other.to_string(),
-                };
+                // The human words for this call, never the arguments the model
+                // wrote: a command, a path, a question.
+                let args_summary = tools::describe_call(tool_name, &call.fn_arguments);
 
                 let args_summary = security::redact(&args_summary);
                 let call_id = call.call_id.clone();
@@ -1269,7 +1290,7 @@ impl AgentRuntime {
                             let detail = destination
                                 .map(|path| path.display().to_string())
                                 .unwrap_or_else(|| args_summary.clone());
-                            match self.gate(confirm, kind, tool_name, &detail).await {
+                            match self.gate(mode, confirm, kind, tool_name, &detail).await {
                                 Ok(()) => match tool.execute(args, &self.security, cancel).await {
                                     // A tool that returns after the cancel landed did
                                     // not complete: it was cut short, whatever the
@@ -1521,13 +1542,15 @@ impl AgentRuntime {
     /// answer's persistence. A denial is a tool result, never a turn failure.
     pub(crate) async fn gate(
         &self,
+        mode: AgentMode,
         confirm: &dyn Confirmer,
         kind: ActionKind,
         tool: &str,
         detail: &str,
     ) -> Result<(), String> {
         let denied = || format!("Permission denied: {}", kind.effect(detail));
-        match permissions::decide(self.permission_mode(), &self.permitted_kinds(), kind) {
+        let (permission_mode, permitted) = self.permissions(mode);
+        match permissions::decide(permission_mode, &permitted, kind) {
             Verdict::Allow => return Ok(()),
             Verdict::Deny => return Err(denied()),
             Verdict::Ask => {}
@@ -1539,15 +1562,15 @@ impl AgentRuntime {
 
     /// An invalid mode asks rather than allowing: a broken config must not widen
     /// permissions.
-    fn permission_mode(&self) -> PermissionMode {
-        permissions::parse_mode(&self.config.tool_permissions).unwrap_or_else(|error| {
-            tracing::warn!(%error, "tool_permissions is invalid; asking");
-            PermissionMode::Ask
-        })
-    }
-
-    fn permitted_kinds(&self) -> Vec<ActionKind> {
-        permissions::parse_permitted(&self.config.permitted_actions).unwrap_or_default()
+    fn permissions(&self, mode: AgentMode) -> (PermissionMode, Vec<ActionKind>) {
+        let configured =
+            permissions::parse_mode(&self.config.tool_permissions).unwrap_or_else(|error| {
+                tracing::warn!(%error, "tool_permissions is invalid; asking");
+                PermissionMode::Ask
+            });
+        let permitted =
+            permissions::parse_permitted(&self.config.permitted_actions).unwrap_or_default();
+        mode_permissions(mode, configured, permitted)
     }
 
     /// The only place tool activity is logged, so redaction cannot be forgotten
