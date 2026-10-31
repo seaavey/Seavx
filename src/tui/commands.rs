@@ -20,6 +20,16 @@ pub enum GoalAction {
     Edit(Option<String>),
     CriteriaAdd(String),
     CriteriaRemove(usize),
+    /// Satisfy a criterion with the evidence that proves it.
+    CriteriaSatisfy {
+        index: usize,
+        evidence: String,
+    },
+    /// Waive a criterion, which needs the user's reason.
+    CriteriaWaive {
+        index: usize,
+        reason: String,
+    },
     TaskAdd(String),
     TaskRemove(usize),
     Approve,
@@ -199,7 +209,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/goal",
-        usage: "/goal <objective> | edit [text] | criteria add|remove <n|text> | task add|remove <n|text> | approve | show | pause | resume | cancel [id]",
+        usage: "/goal <objective> | edit [text] | criteria add|remove|satisfy|waive <n|text> | task add|remove <n|text> | approve | show | pause | resume | cancel [id]",
         summary: "Draft, approve and track a durable goal",
         id: CommandId::Goal,
     },
@@ -445,6 +455,30 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
                 },
                 _ => SlashCommand::Unknown(trimmed.to_string()),
             },
+            // A missing number, a zero index or a missing reason is a typo, not
+            // a new objective: these forms never fall through to `New`.
+            ["criteria", "satisfy", number, text @ ..] => {
+                match (number.parse::<usize>(), text.is_empty()) {
+                    (Ok(index), false) if index > 0 => SlashCommand::Goal {
+                        action: GoalAction::CriteriaSatisfy {
+                            index: index - 1,
+                            evidence: text.join(" "),
+                        },
+                    },
+                    _ => SlashCommand::Unknown(trimmed.to_string()),
+                }
+            }
+            ["criteria", "waive", number, text @ ..] => {
+                match (number.parse::<usize>(), text.is_empty()) {
+                    (Ok(index), false) if index > 0 => SlashCommand::Goal {
+                        action: GoalAction::CriteriaWaive {
+                            index: index - 1,
+                            reason: text.join(" "),
+                        },
+                    },
+                    _ => SlashCommand::Unknown(trimmed.to_string()),
+                }
+            }
             ["approve"] => SlashCommand::Goal {
                 action: GoalAction::Approve,
             },

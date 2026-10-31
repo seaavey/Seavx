@@ -26,14 +26,15 @@ pub(super) fn spawn_session_resume(app: &mut App, tx: &mpsc::UnboundedSender<Act
 }
 
 /// Apply one `/goal` operation. Every refusal names what to do next; nothing
-/// here switches a goal behind the user's back.
-fn run_goal(
+/// here switches a goal behind the user's back. The store is passed in so the
+/// verbs are testable against a temporary database.
+pub(super) fn run_goal(
+    store: &crate::session::SessionStore,
     workspace: &str,
     action: crate::tui::commands::GoalAction,
     start: &mut Option<String>,
 ) -> Result<String, String> {
     use crate::tui::commands::GoalAction;
-    let store = crate::session::SessionStore::open().map_err(|error| error.to_string())?;
 
     // `id` defaults to the one goal that holds the turn, then to the newest.
     let resolve = |id: Option<i64>| -> Result<i64, String> {
@@ -94,6 +95,48 @@ fn run_goal(
                 .set_goal_plan(workspace, id, &criteria, &tasks)
                 .map_err(|error| error.to_string())?;
             Ok(format!("Goal {id}: {} criteria.", criteria.len()))
+        }
+        GoalAction::CriteriaWaive { index, reason } => {
+            let id = resolve(None)?;
+            // The index is checked here, like the sibling add/remove verbs, so a
+            // typo names the criterion instead of surfacing a store error.
+            let goal = store
+                .goal(workspace, id)
+                .map_err(|error| error.to_string())?;
+            if index >= goal.criteria.len() {
+                return Err(format!("there is no criterion {}", index + 1));
+            }
+            store
+                .set_criterion_state(
+                    workspace,
+                    id,
+                    index as i64,
+                    crate::session::CriterionState::Waived,
+                    "",
+                    Some(&reason),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id}: criterion {} waived.", index + 1))
+        }
+        GoalAction::CriteriaSatisfy { index, evidence } => {
+            let id = resolve(None)?;
+            let goal = store
+                .goal(workspace, id)
+                .map_err(|error| error.to_string())?;
+            if index >= goal.criteria.len() {
+                return Err(format!("there is no criterion {}", index + 1));
+            }
+            store
+                .set_criterion_state(
+                    workspace,
+                    id,
+                    index as i64,
+                    crate::session::CriterionState::Satisfied,
+                    &evidence,
+                    None,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id}: criterion {} satisfied.", index + 1))
         }
         GoalAction::TaskAdd(text) => {
             let id = resolve(None)?;
@@ -363,7 +406,9 @@ pub(super) fn apply_command_effect(
             let workspace = crate::session::workspace_key();
             tokio::task::spawn_blocking(move || {
                 let mut start = None;
-                let result = run_goal(&workspace, action, &mut start);
+                let result = crate::session::SessionStore::open()
+                    .map_err(|error| error.to_string())
+                    .and_then(|store| run_goal(&store, &workspace, action, &mut start));
                 let goal = live_goal_line(&workspace);
                 let _ = tx.send(Action::GoalDone {
                     result,

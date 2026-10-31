@@ -1078,6 +1078,20 @@ fn goal_editing_parses_and_stays_draft_only() {
         ),
         ("/goal criteria remove 2", GoalAction::CriteriaRemove(1)),
         (
+            "/goal criteria satisfy 1 cargo test passes",
+            GoalAction::CriteriaSatisfy {
+                index: 0,
+                evidence: "cargo test passes".to_string(),
+            },
+        ),
+        (
+            "/goal criteria waive 2 no CI in this repo",
+            GoalAction::CriteriaWaive {
+                index: 1,
+                reason: "no CI in this repo".to_string(),
+            },
+        ),
+        (
             "/goal task add write code",
             GoalAction::TaskAdd("write code".to_string()),
         ),
@@ -1085,7 +1099,14 @@ fn goal_editing_parses_and_stays_draft_only() {
     ] {
         assert_eq!(parse(input), Some(SlashCommand::Goal { action }), "{input}");
     }
-    for bad in ["/goal criteria remove zero", "/goal task remove 0"] {
+    for bad in [
+        "/goal criteria remove zero",
+        "/goal task remove 0",
+        "/goal criteria satisfy 1",
+        "/goal criteria satisfy 0 done",
+        "/goal criteria waive 2",
+        "/goal criteria waive zero why",
+    ] {
         assert!(
             matches!(parse(bad), Some(SlashCommand::Unknown(_))),
             "{bad}"

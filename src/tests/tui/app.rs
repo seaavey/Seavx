@@ -1741,3 +1741,83 @@ fn a_queued_prompt_is_dropped_when_the_turn_does_not_succeed() {
     let text = transcript(&app);
     assert!(text.contains("Queued prompt dropped"), "{text}");
 }
+
+#[test]
+fn criteria_can_be_satisfied_or_waived_so_a_goal_reaches_completed() {
+    use crate::session::{CriterionState, GoalState};
+    use crate::tui::app::effects::run_goal;
+    use crate::tui::commands::GoalAction;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let workspace = "ws";
+    let id = store.create_goal(workspace, None, "ship 0.1.3").unwrap();
+    store
+        .set_goal_plan(
+            workspace,
+            id,
+            &["tests pass".to_string(), "docs updated".to_string()],
+            &["write the code".to_string()],
+        )
+        .unwrap();
+    store
+        .set_goal_state(workspace, id, GoalState::Active)
+        .unwrap();
+    let mut start = None;
+
+    let report = run_goal(
+        &store,
+        workspace,
+        GoalAction::CriteriaSatisfy {
+            index: 0,
+            evidence: "cargo test: 535 passed".to_string(),
+        },
+        &mut start,
+    )
+    .expect("a criterion can be satisfied");
+    assert!(report.contains("criterion 1"), "{report}");
+
+    // One criterion is still pending, so completion is still refused.
+    assert!(
+        store
+            .set_goal_state(workspace, id, GoalState::Completed)
+            .is_err(),
+        "a pending criterion must still block completion"
+    );
+
+    let report = run_goal(
+        &store,
+        workspace,
+        GoalAction::CriteriaWaive {
+            index: 1,
+            reason: "docs land with 0.1.4".to_string(),
+        },
+        &mut start,
+    )
+    .expect("a criterion can be waived with a reason");
+    assert!(report.contains("criterion 2"), "{report}");
+
+    // A refusal names the index that does not exist instead of doing nothing.
+    let refused = run_goal(
+        &store,
+        workspace,
+        GoalAction::CriteriaWaive {
+            index: 7,
+            reason: "nope".to_string(),
+        },
+        &mut start,
+    )
+    .expect_err("there is no criterion 8");
+    assert!(refused.contains('8'), "{refused}");
+
+    store
+        .set_goal_state(workspace, id, GoalState::Completed)
+        .expect("every criterion is satisfied or waived");
+    let goal = store.goal(workspace, id).unwrap();
+    assert_eq!(goal.state, GoalState::Completed);
+    let states: Vec<CriterionState> = goal.criteria.iter().map(|row| row.state).collect();
+    assert_eq!(
+        states,
+        vec![CriterionState::Satisfied, CriterionState::Waived]
+    );
+}
