@@ -213,12 +213,28 @@ async fn main() -> anyhow::Result<()> {
                                 streamed = true;
                                 print!("{token}");
                             }
-                            agent::events::AgentEvent::Tool(tool) => {
-                                println!("Tool: {}({})", tool.name, tool.summary);
+                            // One line per call: the same event arrives queued,
+                            // running and finished, and only the outcome is news.
+                            agent::events::AgentEvent::Tool(tool)
+                                if matches!(
+                                    tool.status,
+                                    agent::events::ToolStatus::Completed
+                                        | agent::events::ToolStatus::Failed
+                                        | agent::events::ToolStatus::Cancelled
+                                ) =>
+                            {
+                                println!(
+                                    "Tool: {}({}) {}",
+                                    tool.name,
+                                    tool.summary,
+                                    tool.status.as_str()
+                                );
                             }
                             agent::events::AgentEvent::Notice(note) => println!("{note}"),
                             agent::events::AgentEvent::Thinking(_)
                             | agent::events::AgentEvent::Usage { .. }
+                            // A call that has not finished has nothing to report yet.
+                            | agent::events::AgentEvent::Tool(_)
                             // Nothing steers a headless run: no human is attached.
                             | agent::events::AgentEvent::Steer(_)
                             | agent::events::AgentEvent::Turn { .. } => {}
