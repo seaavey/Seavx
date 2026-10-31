@@ -609,7 +609,9 @@ mod engine_seam {
     }
 
     pub(super) fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path) -> AgentRuntime {
-        let mut config = AgentConfig::load(workspace);
+        // No home and no environment: a test must not read the developer's own
+        // ~/.seavx/config.toml.
+        let mut config = AgentConfig::load_with_report_home(workspace, None, |_| None).0;
         config.model = Some("fake-model".to_string());
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
@@ -852,6 +854,80 @@ mod engine_seam {
             "a denial never reads as success: {tool:?}"
         );
         assert!(!temp.path().join("made.txt").exists());
+    }
+
+    /// A stream that dies on its first chunk after sending only whitespace, and
+    /// can still answer the unstreamed retry.
+    #[derive(Clone, Default)]
+    struct BlankStreamBackend {
+        streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        sends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatBackend for BlankStreamBackend {
+        async fn send(
+            &self,
+            _model: &str,
+            _request: ChatRequest,
+            _options: Option<&ChatOptions>,
+        ) -> Result<ChatResponse, crate::agent::backend::BackendError> {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(response(MessageContent::from_text("answered unstreamed")))
+        }
+
+        async fn stream(
+            &self,
+            _model: &str,
+            _request: ChatRequest,
+            _options: Option<&ChatOptions>,
+            on_delta: &mut (dyn FnMut(crate::agent::backend::StreamDelta) + Send),
+        ) -> Result<ChatResponse, crate::agent::backend::BackendError> {
+            self.streams
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            on_delta(crate::agent::backend::StreamDelta::Token(
+                "\n\n\n\n".to_string(),
+            ));
+            Err(std::io::Error::other(
+                "JSON value extension error: PropertyNotFound(\"/delta/text\")",
+            )
+            .into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_sent_only_whitespace_still_gets_the_turn_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = BlankStreamBackend::default();
+        let mut config = AgentConfig::load_with_report_home(temp.path(), None, |_| None).0;
+        config.model = Some("fake-model".to_string());
+        config.max_turns = 4;
+        config.base_url = Some("https://gateway.test/v1/".to_string());
+        config.stream = true;
+        let security = WorkspaceSecurity::new(temp.path());
+        let runtime = AgentRuntime::with_backend(config, security, Box::new(backend.clone()));
+
+        let mut events = Vec::new();
+        let outcome = runtime
+            .execute_task(
+                ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await;
+
+        let answer = outcome.result.unwrap();
+        assert!(answer.contains("answered unstreamed"), "{answer}");
+        assert_eq!(backend.streams.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "whitespace alone must not spend the turn's retry"
+        );
     }
 
     #[tokio::test]
@@ -1942,6 +2018,24 @@ mod retry_budget {
             2,
             "the replay rejection spent the only retry"
         );
+    }
+
+    #[test]
+    fn only_a_call_that_never_completed_is_retried() {
+        use crate::agent::engine::evaluator_retryable;
+
+        // The request reached the provider and was rejected: a second call buys
+        // the same answer.
+        assert!(!evaluator_retryable(&genai::Error::Internal(
+            "400 bad request".to_string()
+        )));
+        // The call broke before an answer existed: worth one more try.
+        let broken = genai::Error::WebStream {
+            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
+            cause: "connection reset".to_string(),
+            error: "connection reset".into(),
+        };
+        assert!(evaluator_retryable(&broken));
     }
 
     #[tokio::test]

@@ -520,10 +520,13 @@ impl AgentConfig {
         )
     }
 
-    /// Persist under the workspace's `.seavx/config.toml`. Call-sites that
-    /// cannot report an error ignore it.
-    pub fn save(&self, workspace_root: &Path) -> std::io::Result<()> {
-        self.write_to(&workspace_root.join(".seavx/config.toml"))
+    /// Persist under the config the loader reads: the workspace file when one
+    /// exists, the global one otherwise. Creating a workspace file here would
+    /// shadow the global config and drop its `api_key`. Call-sites that cannot
+    /// report an error ignore it.
+    pub fn save(&self, workspace_root: &Path) -> std::io::Result<PathBuf> {
+        let path = crate::cli::config::active_config_path(workspace_root);
+        self.write_to(&path).map(|()| path)
     }
 
     /// Write through the one validated config writer in `config.rs`.
@@ -572,6 +575,18 @@ pub enum RetryTrigger {
     StreamUnavailable,
 }
 
+/// A provider call that never completed — transport, DNS, timeout — is worth one
+/// more try; a request the adapter rejected is not. Keeps the background skill
+/// evaluator from spending a second call on an answer it will get again.
+pub fn evaluator_retryable(error: &genai::Error) -> bool {
+    matches!(
+        error,
+        genai::Error::WebModelCall { .. }
+            | genai::Error::WebAdapterCall { .. }
+            | genai::Error::WebStream { .. }
+    )
+}
+
 /// One budget per user turn, never per tool call.
 #[derive(Debug, Default)]
 pub struct RetryBudget {
@@ -584,6 +599,13 @@ impl RetryBudget {
     /// resent. Phase 5's streaming path is the caller that sets this.
     pub fn note_output(&mut self) {
         self.output_seen = true;
+    }
+
+    /// Whether the user already saw part of the answer. Whitespace never calls
+    /// [`Self::note_output`], so a stream that died before its first word still
+    /// owns the turn's one retry.
+    pub fn output_seen(&self) -> bool {
+        self.output_seen
     }
 
     /// `true` when this trigger may be retried; a second call is always refused,
@@ -1119,16 +1141,18 @@ impl AgentRuntime {
 
             // First attempt: a stream when the config allows it, one plain
             // request otherwise. Both share the turn's single retry.
-            let mut got_delta = false;
             let mut streamed_thinking = false;
             let mut received = String::new();
             let attempt = async {
                 if self.config.stream {
                     let mut on_delta = |delta: StreamDelta| {
-                        got_delta = true;
-                        retry.note_output();
                         match delta {
                             StreamDelta::Token(token) => {
+                                // Whitespace is not an answer: an adapter that
+                                // dies on the first chunk must not burn the retry.
+                                if !token.trim().is_empty() {
+                                    retry.note_output();
+                                }
                                 received.push_str(&token);
                                 // Ask answers are shown once, after their
                                 // citations are validated; a delta would show
@@ -1174,7 +1198,7 @@ impl AgentRuntime {
 
             let response = match first {
                 Ok(response) => response,
-                Err(error) if got_delta => {
+                Err(error) if retry.output_seen() => {
                     // Output already left the sink: persisted, never resent.
                     if !received.trim().is_empty() {
                         on_message(&ChatMessage::assistant(&received), MessageStatus::Partial);
@@ -1670,7 +1694,7 @@ impl AgentRuntime {
             Verdict::Ask => {}
         }
 
-        let path = crate::cli::config::workspace_config_path(self.security.root());
+        let path = crate::cli::config::active_config_path(self.security.root());
         permissions::approve(confirm, kind, tool, detail, &path).await
     }
 
@@ -1806,20 +1830,30 @@ impl AgentRuntime {
         // — which an anthropic-shaped proxy can answer without the block
         // signature genai requires, failing the request outright.
         let options = ChatOptions::default();
-        let res = match client
-            .exec_chat(self.config.model_name(), req, Some(&options))
-            .await
-        {
-            Ok(res) => res,
-            Err(err) => {
-                tracing::warn!(error = %err, "Skill synthesis skipped: evaluator request failed");
-                // One line: the error carries the whole request body, and that
-                // belongs in the log, not in the transcript.
-                event_sink(AgentEvent::Notice(format!(
-                    "skill evaluator skipped: {}",
-                    one_line(&err.to_string())
-                )));
-                return;
+        // One more try on a call that never completed: the evaluator runs after
+        // the turn, so a second attempt costs the user nothing.
+        let mut attempt = 0u32;
+        let res = loop {
+            attempt += 1;
+            match client
+                .exec_chat(self.config.model_name(), req.clone(), Some(&options))
+                .await
+            {
+                Ok(res) => break res,
+                Err(err) if attempt == 1 && evaluator_retryable(&err) => {
+                    tracing::info!(error = %err, "evaluator request failed; retrying once");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "Skill synthesis skipped: evaluator request failed");
+                    // One line: the error carries the whole request body, and that
+                    // belongs in the log, not in the transcript.
+                    event_sink(AgentEvent::Notice(format!(
+                        "skill evaluator skipped after {attempt} attempt{}: {}. The turn is unaffected; the provider error is in the log.",
+                        if attempt == 1 { "" } else { "s" },
+                        one_line(&err.to_string())
+                    )));
+                    return;
+                }
             }
         };
 

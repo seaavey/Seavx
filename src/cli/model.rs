@@ -58,7 +58,9 @@ pub fn apply_flags(
 }
 
 pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Result<()> {
-    let config_path = PathBuf::from(".seavx/config.toml");
+    // The active config, never a fresh workspace file: one would shadow the
+    // global config and drop its api_key. `seavx setup` writes the same file.
+    let config_path = crate::cli::config::active_config_path(Path::new("."));
     let mut config = AgentConfig::load(Path::new("."));
     let base_url = match require_endpoint(&config) {
         Ok(base_url) => base_url,
@@ -102,7 +104,7 @@ pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Resul
                 preserved.display()
             );
         }
-        println!("Updated .seavx/config.toml: model = {chosen_model}");
+        println!("Updated {}: model = {chosen_model}", config_path.display());
         return Ok(());
     }
 
@@ -198,7 +200,7 @@ pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Resul
     }
 
     crate::cli::config::write_agent_config(&config_path, &config).map_err(anyhow::Error::msg)?;
-    println!("\nSuccessfully saved to .seavx/config.toml!");
+    println!("\nSuccessfully saved to {}!", config_path.display());
     println!("  Model : {}", crate::cli::config::model_label(&config));
     println!(
         "  Effort: {}",

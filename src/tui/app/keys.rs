@@ -175,7 +175,7 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                     let saved = app.config.save(std::path::Path::new("."));
 
                     let saved_line = match &saved {
-                        Ok(()) => "Saved to .seavx/config.toml".to_string(),
+                        Ok(path) => format!("Saved to {}", path.display()),
                         Err(error) => format!("Failed to save config: {error}"),
                     };
                     app.set_text(format!(

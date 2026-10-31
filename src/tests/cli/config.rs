@@ -855,3 +855,59 @@ fn unset_model_returns_to_unset() {
     assert!(!text.contains("model"), "{text}");
     assert_eq!(AgentConfig::load(temp.path()).model, None);
 }
+
+/// The workspace file shadows the global one entirely, so a write the user did
+/// not scope to a file must land in the one the loader reads — never in a new
+/// workspace file that would drop the global `api_key`.
+#[test]
+fn a_write_targets_the_config_the_loader_reads() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("repo");
+    fs::create_dir_all(&workspace).unwrap();
+
+    // No workspace file yet: the global config is the active one.
+    assert_eq!(
+        active_config_path_in(&workspace, Some(&home)),
+        home.join(".seavx/config.toml")
+    );
+
+    // Once a workspace file exists it is the active one.
+    let workspace_config = workspace.join(".seavx/config.toml");
+    fs::create_dir_all(workspace_config.parent().unwrap()).unwrap();
+    fs::write(&workspace_config, "model = \"m\"\n").unwrap();
+    assert_eq!(
+        active_config_path_in(&workspace, Some(&home)),
+        workspace_config
+    );
+
+    // No home to fall back on: the workspace is the only place left.
+    assert_eq!(active_config_path_in(&workspace, None), workspace_config);
+}
+
+#[test]
+fn a_model_switch_keeps_the_key_of_the_active_config() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("repo");
+    fs::create_dir_all(&workspace).unwrap();
+    let global = home.join(".seavx/config.toml");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::write(&global, "api_key = \"sk-test\"\nmodel = \"old\"\n").unwrap();
+
+    let mut config = AgentConfig::load_with_report_home(&workspace, Some(&home), |_| None).0;
+    config.model = Some("new-model".to_string());
+    write_agent_config(&active_config_path_in(&workspace, Some(&home)), &config).unwrap();
+
+    assert!(
+        !workspace.join(".seavx/config.toml").exists(),
+        "a model switch must not create a workspace config"
+    );
+    let text = fs::read_to_string(&global).unwrap();
+    assert!(text.contains("api_key = \"sk-test\""), "{text}");
+    assert!(text.contains("model = \"new-model\""), "{text}");
+
+    let reloaded = AgentConfig::load_with_report_home(&workspace, Some(&home), |_| None).0;
+    assert_eq!(reloaded.model.as_deref(), Some("new-model"));
+    assert!(reloaded.api_key.is_some(), "the key is still reachable");
+}

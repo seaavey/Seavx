@@ -25,6 +25,28 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- A model or effort change writes the config the loader actually reads: the
+  workspace file when one exists, the global `~/.seavx/config.toml` otherwise.
+  Before, `/model`, the model picker, `seavx model` and a permission approval all
+  created a workspace `.seavx/config.toml`, which shadows the global config
+  entirely — the `api_key` stayed behind and the next turn failed with
+  `Resolver error … ApiKeyEnvNotFound { env_name: "ANTHROPIC_API_KEY" }`.
+  `/config set` and `/config unset` without `--global` follow the same rule, and
+  the saved-file notice names the path it wrote.
+- `seavx setup --workspace` writes this repo's `.seavx/config.toml` instead of
+  the global one; without it the wizard keeps writing `~/.seavx/config.toml`,
+  and a workspace target is pre-filled from the config in effect so the key is
+  offered again rather than asked for from scratch.
+- A stream that dies on a chunk the adapter cannot parse keeps the turn's one
+  retry when all it had sent was whitespace: only non-whitespace text counts as
+  output. The failure now reads as
+  `the provider sent a stream chunk this client cannot parse (cause logged).
+  Retry the turn; if it repeats, switch model or turn streaming off.` — the raw
+  JSON pointer stays in the log instead of the transcript.
+- The background skill evaluator retries once when its model call never
+  completed (transport, DNS, timeout) instead of skipping at the first failure,
+  and its notice says how many attempts it made, that the turn is unaffected,
+  and that the provider error is in the log.
 - Background requests no longer inherit the turn's reasoning budget: a session
   title, a compaction summary and the skill evaluator are short transforms, and
   a proxy adapter answers extended thinking without the block `signature` genai

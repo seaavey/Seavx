@@ -49,6 +49,11 @@ seavx doctor --offline | rg session     # .seavx/sessions.db, not /home/…/.sea
 
 ## Traps
 
+- **Whitespace is not output.** The turn's single retry is gated on
+  `RetryBudget::note_output`, and only non-whitespace text may call it: a stream
+  that dies right after `"\n\n"` must still get its unstreamed retry. Log the
+  adapter's parse cause; never let a JSON pointer reach the transcript.
+
 - **Never develop against `~/.seavx`.** A bug that only reproduces in one of the
   two stores hides for as long as you run only that one.
 - **Do not edit `.env` through agent tools.** It is protected; the read or write

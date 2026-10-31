@@ -38,17 +38,37 @@ pub fn persist(
     Ok(preserved)
 }
 
-pub async fn providers() -> anyhow::Result<()> {
+/// The file the wizard writes: this workspace's config when asked, the global
+/// one otherwise.
+pub fn target_path(
+    workspace: bool,
+    workspace_root: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    if workspace {
+        return Ok(crate::cli::config::workspace_config_path(workspace_root));
+    }
+    home.map(|home| home.join(".seavx/config.toml"))
+        .ok_or_else(|| "home directory is not set, cannot locate config".to_string())
+}
+
+pub async fn providers(workspace: bool) -> anyhow::Result<()> {
     use std::io::{self, IsTerminal, Write};
 
-    let config_path = crate::util::global_config_path()
-        .ok_or_else(|| anyhow::anyhow!("home directory is not set, cannot locate config"))?;
+    let config_path = target_path(
+        workspace,
+        std::path::Path::new("."),
+        crate::home::dir().as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
 
-    // A malformed file is replaced, matching AgentConfig::load's fallback to defaults.
+    // A malformed or missing file is replaced, matching AgentConfig::load's
+    // fallback — seeded from the config in effect, so answers already given
+    // (the key above all) are offered again instead of starting blank.
     let mut config: crate::agent::engine::AgentConfig = std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|content| toml::from_str(&content).ok())
-        .unwrap_or_default();
+        .unwrap_or_else(|| crate::agent::engine::AgentConfig::load(std::path::Path::new(".")));
 
     let mask = |key: &str| {
         if key.is_empty() {
@@ -226,9 +246,13 @@ pub async fn providers() -> anyhow::Result<()> {
             ),
         ],
     );
-    if std::path::PathBuf::from(".seavx/config.toml").exists() {
+    if !workspace && std::path::PathBuf::from(".seavx/config.toml").exists() {
         println!("note: ./.seavx/config.toml overrides this file in the current workspace.");
     }
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/cli/setup.rs"]
+mod tests;

@@ -205,3 +205,64 @@ async fn a_streamed_response_carries_usage_and_tool_calls() {
     assert_eq!(calls[0].fn_arguments["path"], "a.rs");
     assert_eq!(response.usage.total_tokens, Some(7));
 }
+
+/// The reported gateway bug, replayed against the real Anthropic adapter: a
+/// `input_json_delta` for a stopped `tool_use` block arrives while a text block
+/// is open, and the whitespace before it is the only output.
+#[tokio::test]
+async fn a_bad_anthropic_chunk_arrives_as_a_readable_error_after_its_prefix() {
+    let payload = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n\\n\\n\\n\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n\n",
+    )
+    .to_string();
+    let (backend, server) = serve(payload, 7).await;
+
+    let mut deltas = Vec::new();
+    let error = backend
+        .stream("claude-sonnet-4-6", request(), None, &mut |delta| {
+            deltas.push(delta)
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    server.await.unwrap();
+
+    assert_eq!(deltas, vec![StreamDelta::Token("\n\n\n\n".to_string())]);
+    assert!(error.contains("cannot parse"), "{error}");
+    assert!(
+        !error.contains("JSON value extension error"),
+        "the JSON pointer stays out of the transcript: {error}"
+    );
+}
+
+/// The raw error is a JSON pointer: it names nothing the user can act on, so
+/// the adapter's parse failure is rewritten and the cause stays in the log.
+#[test]
+fn an_unparseable_stream_chunk_reads_as_a_message_not_a_json_pointer() {
+    let serde_error = serde_json::from_str::<serde_json::Value>("nope").unwrap_err();
+    let error: super::BackendError = genai::Error::StreamParse {
+        model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
+        serde_error,
+    }
+    .into();
+
+    let mapped = super::readable_stream_error(error).to_string();
+    assert!(mapped.contains("cannot parse"), "{mapped}");
+    assert!(mapped.contains("Retry the turn"), "{mapped}");
+    assert!(
+        !mapped.contains("Failed to parse stream data"),
+        "the JSON pointer stays out of the transcript: {mapped}"
+    );
+}
+
+#[test]
+fn an_ordinary_stream_error_is_passed_through() {
+    let error: super::BackendError = std::io::Error::other("connection reset").into();
+    assert_eq!(
+        super::readable_stream_error(error).to_string(),
+        "connection reset"
+    );
+}

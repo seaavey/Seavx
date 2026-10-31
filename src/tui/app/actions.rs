@@ -353,7 +353,7 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                     }
                     Verdict::Allow => {}
                     Verdict::Ask => {
-                        let path = crate::cli::config::workspace_config_path(security.root());
+                        let path = crate::cli::config::active_config_path(security.root());
                         let confirm = crate::tui::app::TuiConfirmer::new(tx.clone());
                         if let Err(denied) = crate::agent::permissions::approve(
                             &confirm,

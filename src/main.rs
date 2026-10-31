@@ -45,6 +45,9 @@ enum Commands {
     Setup {
         #[command(subcommand)]
         section: Option<SetupSection>,
+        /// Write this workspace's .seavx/config.toml instead of the global one
+        #[arg(long)]
+        workspace: bool,
     },
 
     /// Check the installation
@@ -264,8 +267,8 @@ async fn main() -> anyhow::Result<()> {
         }
         // `seavx setup` is the providers wizard: the only section, so naming it
         // is optional rather than a usage error.
-        Some(Commands::Setup { section }) => match section {
-            None | Some(SetupSection::Providers) => cli::setup::providers().await?,
+        Some(Commands::Setup { section, workspace }) => match section {
+            None | Some(SetupSection::Providers) => cli::setup::providers(workspace).await?,
         },
         Some(Commands::Doctor { offline }) => {
             let report = cli::doctor::run(cli::doctor::DoctorOptions {

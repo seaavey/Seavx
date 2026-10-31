@@ -1174,7 +1174,9 @@ fn target_config_path(global: bool) -> Result<std::path::PathBuf, String> {
         config::global_config_path()
             .ok_or_else(|| "Could not resolve the home directory for --global.".to_string())
     } else {
-        Ok(config::workspace_config_path(std::path::Path::new(".")))
+        // The active file, so a default write never creates a workspace config
+        // that shadows the global one and drops its api_key.
+        Ok(config::active_config_path(std::path::Path::new(".")))
     }
 }
 

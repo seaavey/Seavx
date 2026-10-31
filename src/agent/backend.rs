@@ -119,7 +119,7 @@ impl ChatBackend for GenaiBackend {
                 Ok(event) => event,
                 // The transport broke mid-answer: keep what the sink already
                 // got, hand the prefix back so the caller can persist it.
-                Err(error) => return Err(prefix_error(error, &text)),
+                Err(error) => return Err(prefix_error(readable_stream_error(error.into()), &text)),
             };
             match event {
                 ChatStreamEvent::Chunk(chunk) if !chunk.content.is_empty() => {
@@ -181,6 +181,25 @@ impl ChatBackend for GenaiBackend {
 
 /// A failed stream still delivered text: name that prefix in the error, which
 /// is the only place the caller can learn how much of the answer it holds.
+/// A chunk the adapter cannot parse is a provider/client format mismatch, and
+/// its Display is a JSON pointer the user cannot act on. Say what happened;
+/// the raw cause and the rejected path stay in the log.
+fn readable_stream_error(error: BackendError) -> BackendError {
+    let unparseable = matches!(
+        error.downcast_ref::<genai::Error>(),
+        Some(genai::Error::JsonValueExt(_) | genai::Error::StreamParse { .. })
+    );
+    if !unparseable {
+        return error;
+    }
+    tracing::warn!(%error, "stream chunk rejected by the adapter");
+    std::io::Error::other(
+        "the provider sent a stream chunk this client cannot parse (cause logged). \
+         Retry the turn; if it repeats, switch model or turn streaming off.",
+    )
+    .into()
+}
+
 fn prefix_error(error: impl Into<BackendError>, text: &str) -> BackendError {
     let error = error.into();
     if text.is_empty() {
