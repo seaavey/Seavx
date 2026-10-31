@@ -747,25 +747,41 @@ pub fn status_text(app: &App) -> String {
 ///
 /// A guess is not a proposal: the command is only offered when a manifest in
 /// the changed set (or at the root) actually declares tests.
-pub(crate) fn propose_test(changed: &[String], root_has_cargo: bool) -> Option<(String, String)> {
-    let cargo = root_has_cargo
-        || changed
+pub(crate) fn propose_test(
+    changed: &[String],
+    root_has_cargo: bool,
+    root_has_package: bool,
+) -> Option<(String, String)> {
+    // The command runs at the workspace root, so that manifest has to be there,
+    // and something it covers has to have changed. A README or a stylesheet does
+    // not justify running a suite.
+    let count = |suffix: &str| changed.iter().filter(|path| path.ends_with(suffix)).count();
+    let manifest = |name: &str| {
+        changed
             .iter()
-            .any(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
-    if cargo {
-        return Some((
-            "cargo test".to_string(),
-            "Cargo.toml declares the Rust test targets".to_string(),
-        ));
+            .any(|path| path == name || path.ends_with(&format!("/{name}")))
+    };
+
+    if root_has_cargo && (manifest("Cargo.toml") || count(".rs") > 0) {
+        let evidence = if manifest("Cargo.toml") {
+            "Cargo.toml changed".to_string()
+        } else {
+            format!("{} changed Rust file(s)", count(".rs"))
+        };
+        return Some(("cargo test".to_string(), evidence));
     }
-    let package = changed
+
+    let scripts = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]
         .iter()
-        .any(|path| path == "package.json" || path.ends_with("/package.json"));
-    if package {
-        return Some((
-            "npm test --silent".to_string(),
-            "package.json declares the test script".to_string(),
-        ));
+        .map(|suffix| count(suffix))
+        .sum::<usize>();
+    if root_has_package && (manifest("package.json") || scripts > 0) {
+        let evidence = if manifest("package.json") {
+            "package.json changed".to_string()
+        } else {
+            format!("{scripts} changed script file(s)")
+        };
+        return Some(("npm test --silent".to_string(), evidence));
     }
     None
 }

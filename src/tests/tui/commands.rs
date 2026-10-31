@@ -1216,20 +1216,38 @@ fn steering_and_queuing_parse_their_text_and_refuse_while_idle() {
 }
 
 #[test]
-fn a_test_is_only_proposed_when_a_manifest_declares_one() {
-    // No manifest: no command, no guess.
-    assert_eq!(propose_test(&["src/main.rs".to_string()], false), None);
+fn a_test_is_only_proposed_for_a_change_its_manifest_covers() {
+    let paths = |list: &[&str]| list.iter().map(|path| path.to_string()).collect::<Vec<_>>();
+
+    // No root manifest: no command, no guess, whatever changed.
+    assert_eq!(propose_test(&paths(&["src/main.rs"]), false, false), None);
+
+    // A Rust change in a Cargo workspace runs the suite; a README does not.
     assert_eq!(
-        propose_test(&["package.json".to_string()], false),
-        Some((
-            "npm test --silent".to_string(),
-            "package.json declares the test script".to_string()
-        ))
-    );
-    // A root manifest is enough, and Cargo wins when both are around.
-    assert_eq!(
-        propose_test(&["src/lib.rs".to_string()], true).map(|(command, _)| command),
+        propose_test(&paths(&["src/lib.rs"]), true, false).map(|(command, _)| command),
         Some("cargo test".to_string())
+    );
+    assert_eq!(
+        propose_test(&paths(&["README.md", "assets/logo.png"]), true, false),
+        None,
+        "docs and images do not justify running the suite"
+    );
+    assert_eq!(
+        propose_test(&paths(&["Cargo.toml"]), true, false).map(|(command, _)| command),
+        Some("cargo test".to_string())
+    );
+
+    // The same rule for a package workspace, and the two never swap.
+    assert_eq!(
+        propose_test(&paths(&["web/app.tsx"]), false, true).map(|(command, _)| command),
+        Some("npm test --silent".to_string())
+    );
+    assert_eq!(propose_test(&paths(&["notes.md"]), false, true), None);
+    assert_eq!(
+        propose_test(&paths(&["web/app.tsx", "src/lib.rs"]), true, true)
+            .map(|(command, _)| command),
+        Some("cargo test".to_string()),
+        "Cargo wins when both manifests are in the workspace"
     );
 }
 

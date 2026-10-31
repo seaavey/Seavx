@@ -73,6 +73,10 @@ per landed change; no entry describes behaviour that is not in the code.
 - `/preset` opens a searchable picker: typing filters the names, the selected
   preset's first lines are previewed, and Enter puts it in the next prompt.
   `/preset <name>` still applies one directly.
+- `/test` proposes a suite only when the change is one that suite covers: a
+  `.rs` file or `Cargo.toml` in a Cargo workspace, a script file or
+  `package.json` in a package workspace. A README-only change proposes nothing
+  instead of running the whole suite.
 
 ### tests
 

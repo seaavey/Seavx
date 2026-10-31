@@ -453,8 +453,9 @@ pub(super) fn apply_command_effect(
                     }
                 };
                 let root_has_cargo = security.root().join("Cargo.toml").is_file();
+                let root_has_package = security.root().join("package.json").is_file();
                 let Some((command, evidence)) =
-                    crate::tui::commands::propose_test(&changed, root_has_cargo)
+                    crate::tui::commands::propose_test(&changed, root_has_cargo, root_has_package)
                 else {
                     let _ = tx.send(Action::TestDone(format!(
                         "No manifest in the {} changed file(s) declares tests, so no command is proposed. Run one explicitly with the agent.",
