@@ -1062,6 +1062,8 @@ fn goal_parses_every_documented_form() {
         ("/goal approve", GoalAction::Approve),
         ("/goal pause", GoalAction::Pause(None)),
         ("/goal resume 2", GoalAction::Resume(Some(2))),
+        ("/goal complete", GoalAction::Complete(None)),
+        ("/goal complete 4", GoalAction::Complete(Some(4))),
         ("/goal cancel", GoalAction::Cancel(None)),
     ] {
         assert_eq!(parse(input), Some(SlashCommand::Goal { action }), "{input}");

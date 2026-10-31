@@ -36,6 +36,8 @@ pub enum GoalAction {
     Show(Option<i64>),
     Pause(Option<i64>),
     Resume(Option<i64>),
+    /// Mark a goal done; the store refuses until every criterion is settled.
+    Complete(Option<i64>),
     Cancel(Option<i64>),
 }
 
@@ -209,7 +211,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/goal",
-        usage: "/goal <objective> | edit [text] | criteria add|remove|satisfy|waive <n|text> | task add|remove <n|text> | approve | show | pause | resume | cancel [id]",
+        usage: "/goal <objective> | edit [text] | criteria add|remove|satisfy|waive <n|text> | task add|remove <n|text> | approve | show | pause | resume | complete | cancel [id]",
         summary: "Draft, approve and track a durable goal",
         id: CommandId::Goal,
     },
@@ -482,7 +484,10 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             ["approve"] => SlashCommand::Goal {
                 action: GoalAction::Approve,
             },
-            [verb @ ("show" | "pause" | "resume" | "cancel"), rest @ ..] => {
+            [
+                verb @ ("show" | "pause" | "resume" | "cancel" | "complete"),
+                rest @ ..,
+            ] => {
                 let id = match rest {
                     [] => None,
                     [number] => match number.parse::<i64>() {
@@ -495,6 +500,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
                     "show" => GoalAction::Show(id),
                     "pause" => GoalAction::Pause(id),
                     "resume" => GoalAction::Resume(id),
+                    "complete" => GoalAction::Complete(id),
                     _ => GoalAction::Cancel(id),
                 };
                 SlashCommand::Goal { action }

@@ -1811,9 +1811,11 @@ fn criteria_can_be_satisfied_or_waived_so_a_goal_reaches_completed() {
     .expect_err("there is no criterion 8");
     assert!(refused.contains('8'), "{refused}");
 
-    store
-        .set_goal_state(workspace, id, GoalState::Completed)
+    // Completion goes through the command the user has, and the store still
+    // enforces the criteria gate underneath it.
+    let report = run_goal(&store, workspace, GoalAction::Complete(None), &mut start)
         .expect("every criterion is satisfied or waived");
+    assert!(report.contains("completed"), "{report}");
     let goal = store.goal(workspace, id).unwrap();
     assert_eq!(goal.state, GoalState::Completed);
     let states: Vec<CriterionState> = goal.criteria.iter().map(|row| row.state).collect();

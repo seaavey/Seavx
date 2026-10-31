@@ -227,6 +227,15 @@ pub(super) fn run_goal(
                 .map_err(|error| error.to_string())?;
             Ok(format!("Goal {id} paused."))
         }
+        GoalAction::Complete(id) => {
+            let id = resolve(id)?;
+            // The store is the gate: it refuses while a criterion is pending or
+            // missing its evidence, so this cannot be a model-asserted claim.
+            store
+                .set_goal_state(workspace, id, crate::session::GoalState::Completed)
+                .map_err(|error| error.to_string())?;
+            Ok(format!("Goal {id} completed."))
+        }
         GoalAction::Resume(id) => {
             let id = resolve(id)?;
             store
