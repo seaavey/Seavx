@@ -301,3 +301,32 @@ fn the_task_text_names_the_target_and_withholds_no_content() {
     assert!(text.contains("no changes"), "{text}");
     assert!(!text.contains("+one"), "{text}");
 }
+
+/// A stream that fails mid-read, the way a broken pipe or a killed Git does.
+struct FailingReader;
+
+impl std::io::Read for FailingReader {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("pipe broke"))
+    }
+}
+
+#[test]
+fn a_read_error_is_not_reported_as_a_complete_stream() {
+    let overflow = std::sync::atomic::AtomicBool::new(false);
+    let (buffer, stop) = super::read_capped(FailingReader, &overflow);
+    assert!(buffer.is_empty(), "nothing was read");
+    assert!(
+        stop.is_some_and(|reason| reason.contains("could not be read")),
+        "an interrupted read must never read as a clean end of output: {stop:?}"
+    );
+    assert!(!overflow.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn a_stream_that_ends_normally_reports_no_stop() {
+    let overflow = std::sync::atomic::AtomicBool::new(false);
+    let (buffer, stop) = super::read_capped(&b"+one\n"[..], &overflow);
+    assert_eq!(buffer, b"+one\n");
+    assert!(stop.is_none(), "{stop:?}");
+}

@@ -385,10 +385,13 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         }
     };
 
-    let (out, out_overflow) = out.join().unwrap_or((Vec::new(), false));
-    let (err, err_overflow) = err.join().unwrap_or((Vec::new(), false));
-    if out_overflow || err_overflow {
-        return Err(cap_error(args));
+    let (out, out_stop) = out.join().unwrap_or((Vec::new(), None));
+    let (err, err_stop) = err.join().unwrap_or((Vec::new(), None));
+    if let Some(reason) = out_stop.or(err_stop) {
+        return Err(format!(
+            "git {}: {reason}; the review is incomplete",
+            args.first().unwrap_or(&"")
+        ));
     }
     if !status.success() {
         let message = String::from_utf8_lossy(&err).trim().to_string();
@@ -404,7 +407,7 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 fn drain(
     stream: impl Read + Send + 'static,
     overflow: Arc<AtomicBool>,
-) -> JoinHandle<(Vec<u8>, bool)> {
+) -> JoinHandle<(Vec<u8>, Option<&'static str>)> {
     std::thread::spawn(move || read_capped(stream, &overflow))
 }
 
@@ -415,19 +418,22 @@ fn cap_error(args: &[&str]) -> String {
     )
 }
 
-/// Read at most `DIFF_LIMIT` bytes, and say whether more arrived.
-fn read_capped(mut stream: impl Read, overflow: &AtomicBool) -> (Vec<u8>, bool) {
+/// Read at most `DIFF_LIMIT` bytes. `Some(reason)` means the bytes are only a
+/// prefix: either the cap was hit or the stream failed. A read error is not an
+/// end of file — reporting one as clean would review a truncated diff.
+fn read_capped(mut stream: impl Read, overflow: &AtomicBool) -> (Vec<u8>, Option<&'static str>) {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return (buffer, false),
+            Ok(0) => return (buffer, None),
+            Err(_) => return (buffer, Some("the output could not be read to the end")),
             Ok(read) => {
                 let room = DIFF_LIMIT.saturating_sub(buffer.len());
                 if read > room {
                     buffer.extend_from_slice(&chunk[..room]);
                     overflow.store(true, Ordering::Relaxed);
-                    return (buffer, true);
+                    return (buffer, Some("the output exceeded the cap"));
                 }
                 buffer.extend_from_slice(&chunk[..read]);
             }
