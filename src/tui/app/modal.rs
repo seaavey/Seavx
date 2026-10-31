@@ -274,7 +274,9 @@ impl App<'_> {
             return;
         }
 
-        let config_path = crate::cli::config::workspace_config_path(std::path::Path::new("."));
+        // The active config, not a fresh workspace file: one would shadow the
+        // global config and drop its api_key.
+        let config_path = crate::cli::config::active_config_path(std::path::Path::new("."));
         // One write: the model and the effort change together or not at all.
         let mut errors = Vec::new();
         if let Err(error) =
@@ -286,9 +288,10 @@ impl App<'_> {
         self.config = crate::agent::engine::AgentConfig::load(std::path::Path::new("."));
 
         let mut message = format!(
-            "Switched model to: {}\nEffort: {}\nSaved to .seavx/config.toml",
+            "Switched model to: {}\nEffort: {}\nSaved to {}",
             self.config.model.as_deref().unwrap_or("not set"),
-            self.config.reasoning_effort.as_deref().unwrap_or("none")
+            self.config.reasoning_effort.as_deref().unwrap_or("none"),
+            config_path.display()
         );
         for error in errors {
             message.push_str(&format!("\n{error}"));

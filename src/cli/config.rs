@@ -122,6 +122,24 @@ pub fn global_config_path() -> Option<PathBuf> {
     crate::home::dir().map(|home| home.join(".seavx/config.toml"))
 }
 
+/// Where a write belongs when the user named no file: the config the loader
+/// reads right now. The workspace file shadows the global one entirely, so
+/// creating one here would silently drop the global `api_key`.
+pub fn active_config_path(workspace_root: &Path) -> PathBuf {
+    active_config_path_in(workspace_root, crate::home::dir().as_deref())
+}
+
+/// [`active_config_path`] with the home directory injected, so a test never
+/// reads the real one.
+pub(crate) fn active_config_path_in(workspace_root: &Path, home: Option<&Path>) -> PathBuf {
+    let workspace = workspace_config_path(workspace_root);
+    if workspace.exists() {
+        return workspace;
+    }
+    home.map(|home| home.join(".seavx/config.toml"))
+        .unwrap_or(workspace)
+}
+
 /// `set (...abcd)` / `set (****)` / `unset`, never the full key.
 pub fn mask_key(value: &str) -> String {
     if value.is_empty() {

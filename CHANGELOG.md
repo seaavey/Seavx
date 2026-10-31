@@ -25,6 +25,18 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- A model or effort change writes the config the loader actually reads: the
+  workspace file when one exists, the global `~/.seavx/config.toml` otherwise.
+  Before, `/model`, the model picker, `seavx model` and a permission approval all
+  created a workspace `.seavx/config.toml`, which shadows the global config
+  entirely — the `api_key` stayed behind and the next turn failed with
+  `Resolver error … ApiKeyEnvNotFound { env_name: "ANTHROPIC_API_KEY" }`.
+  `/config set` and `/config unset` without `--global` follow the same rule, and
+  the saved-file notice names the path it wrote.
+- `seavx setup --workspace` writes this repo's `.seavx/config.toml` instead of
+  the global one; without it the wizard keeps writing `~/.seavx/config.toml`,
+  and a workspace target is pre-filled from the config in effect so the key is
+  offered again rather than asked for from scratch.
 - Background requests no longer inherit the turn's reasoning budget: a session
   title, a compaction summary and the skill evaluator are short transforms, and
   a proxy adapter answers extended thinking without the block `signature` genai

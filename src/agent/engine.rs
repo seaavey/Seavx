@@ -520,10 +520,13 @@ impl AgentConfig {
         )
     }
 
-    /// Persist under the workspace's `.seavx/config.toml`. Call-sites that
-    /// cannot report an error ignore it.
-    pub fn save(&self, workspace_root: &Path) -> std::io::Result<()> {
-        self.write_to(&workspace_root.join(".seavx/config.toml"))
+    /// Persist under the config the loader reads: the workspace file when one
+    /// exists, the global one otherwise. Creating a workspace file here would
+    /// shadow the global config and drop its `api_key`. Call-sites that cannot
+    /// report an error ignore it.
+    pub fn save(&self, workspace_root: &Path) -> std::io::Result<PathBuf> {
+        let path = crate::cli::config::active_config_path(workspace_root);
+        self.write_to(&path).map(|()| path)
     }
 
     /// Write through the one validated config writer in `config.rs`.
@@ -1670,7 +1673,7 @@ impl AgentRuntime {
             Verdict::Ask => {}
         }
 
-        let path = crate::cli::config::workspace_config_path(self.security.root());
+        let path = crate::cli::config::active_config_path(self.security.root());
         permissions::approve(confirm, kind, tool, detail, &path).await
     }
 

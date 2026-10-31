@@ -609,7 +609,9 @@ mod engine_seam {
     }
 
     pub(super) fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path) -> AgentRuntime {
-        let mut config = AgentConfig::load(workspace);
+        // No home and no environment: a test must not read the developer's own
+        // ~/.seavx/config.toml.
+        let mut config = AgentConfig::load_with_report_home(workspace, None, |_| None).0;
         config.model = Some("fake-model".to_string());
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());

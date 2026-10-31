@@ -26,7 +26,7 @@ layer (`genai`), SQLite sessions, and a checkpoint store `/undo` restores from.
 | `seavx sessions list\|show <id>\|export <id>\|resume <id>` | the session store from the shell |
 | `seavx model [model] [-e effort]` | set model and effort; this refreshes the model cache |
 | `seavx doctor [--offline]` | environment and health report |
-| `seavx init`, `seavx setup providers` | write `.seavx/config.toml`; ask for base URL, key, model, effort |
+| `seavx init`, `seavx setup providers` | write a config file (`seavx init` → workspace, `seavx setup [--workspace]` → global by default); ask for base URL, key, model, effort |
 | `seavx memory`, `seavx skills …` | inspect `MEMORY.md`/`USER.md`; list, install, remove skills |
 | `seavx update [--force]`, `seavx uninstall` | self-update, removal |
 
@@ -88,6 +88,14 @@ permitted_actions = ["write", "execute", "network"]
 override the file. `permitted_actions` lifts kinds from `ask` to `allow`; it
 cannot lift global writes or destructive actions, which always ask. `/config` and
 `seavx model` write atomically, owner-only (`0600`), and never print the key back.
+
+A write that names no file — `/model`, the model picker, `seavx model`, a
+permission approval, `/config set` — lands in the config the loader reads: the
+workspace file when one exists, the global one otherwise. The workspace file
+shadows the global config *entirely*, and these writers never persist `api_key`,
+so one created where none existed leaves the key behind and the next turn dies
+with `ApiKeyEnvNotFound`. `seavx setup` is the deliberate exception: it writes
+the global file by default and this workspace's with `--workspace`.
 
 ## Permissions and safety
 

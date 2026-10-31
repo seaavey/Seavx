@@ -82,11 +82,6 @@ pub fn epoch_millis() -> u128 {
         .as_millis()
 }
 
-/// Global (per-user) config.toml path; `None` when the home directory is unset.
-pub fn global_config_path() -> Option<PathBuf> {
-    crate::home::dir().map(|home| home.join(".seavx/config.toml"))
-}
-
 /// Entries skipped by every workspace walk: hidden dirs, build artifacts, deps.
 pub fn is_skipped(name: &str) -> bool {
     name.starts_with('.') || name == "target" || name == "node_modules"

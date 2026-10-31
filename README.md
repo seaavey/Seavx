@@ -226,7 +226,7 @@ Configure a provider once per machine (base URL, API key, model, reasoning effor
 seavx setup providers
 ```
 
-`seavx setup` on its own runs the same wizard — providers is the only section, so the name is optional. This writes `~/.seavx/config.toml` with owner-only permissions. Before saving it calls the endpoint's `/models` and reports reachability, so a wrong URL or rejected key shows up immediately. A workspace `.seavx/config.toml` still takes precedence.
+`seavx setup` on its own runs the same wizard — providers is the only section, so the name is optional. By default it writes the global `~/.seavx/config.toml`; `seavx setup --workspace` writes this repo's `.seavx/config.toml` instead, pre-filled from the config in effect. Either file is written owner-only. Before saving it calls the endpoint's `/models` and reports reachability, so a wrong URL or rejected key shows up immediately. A workspace `.seavx/config.toml` still takes precedence over the global one.
 
 Initialize project-local settings:
 
@@ -256,6 +256,8 @@ seavx model
 seavx model <provider>/<model> --effort highx
 ```
 
+`seavx model`, `/model` and the model picker all edit the config the loader reads: the workspace `.seavx/config.toml` when one exists, the global `~/.seavx/config.toml` otherwise — the file `seavx setup` writes unless it is given `--workspace`. A workspace file shadows the global one entirely, so none of them creates one.
+
 ### TUI Slash Commands
 
 Type `/` in the interactive prompt to list and run these commands:
@@ -267,8 +269,8 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/config`                                     | Show the effective configuration and where each value comes from.                                                                                                                                                         |
 | `/config path`                                | Show workspace and global config paths and which one is active.                                                                                                                                                           |
 | `/config get <key>`                           | Show one effective value with its source.                                                                                                                                                                                 |
-| `/config set [--global] <key> <value>`        | Validate and persist one key.                                                                                                                                                                                             |
-| `/config unset [--global] <key>`              | Remove one key.                                                                                                                                                                                                           |
+| `/config set [--global] <key> <value>`        | Validate and persist one key: the active config by default, the global file with `--global`.                                                                                                                              |
+| `/config unset [--global] <key>`              | Remove one key from the active config, or from the global file with `--global`.                                                                                                                                            |
 | `/plan [on\|off]`                             | Enter or leave Plan Mode. The standing mode is one of four, cycled with `Ctrl+Tab` (`Shift+Tab` as the fallback).                                                                                                         |
 | `/ask <question>`                             | Answer a question about the code in one read-only turn. Unavailable tools stay unavailable: no writes, no commands, no checkpoints, and the Plan/Build selection is untouched. Citations must point at a line this turn actually read; anything else is marked unverified.                                        |
 | `/review [working-tree\|staged\|commit <ref>\|base <ref>]` | Review a Git target without touching the index, worktree or refs. The diff is resolved on the host, bounded to 1 MiB with a 30-second Git timeout, and protected or symlinked paths are withheld (count only). Findings carry severity, evidence, path/line and confirmed-or-hypothesis; no test is claimed.     |
