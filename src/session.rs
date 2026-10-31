@@ -1305,36 +1305,55 @@ impl SessionStore {
                     return Err(SessionError::Unknown(source));
                 }
 
-                let newest: Option<i64> = connection
+                let boundary = match boundary {
+                    Some(seq) => seq,
+                    // Default: the newest finished turn. A session whose last
+                    // row is an unanswered prompt still has one to fork.
+                    None => connection
+                        .query_row(
+                            "SELECT MAX(seq) FROM messages
+                             WHERE session_id = ?1 AND role = 'assistant' AND status = 'complete'",
+                            [source],
+                            |row| row.get::<_, Option<i64>>(0),
+                        )
+                        .optional()?
+                        .flatten()
+                        .ok_or_else(|| {
+                            SessionError::Refused(format!(
+                                "session {source} has no finished turn to fork"
+                            ))
+                        })?,
+                };
+                let (role, status): (String, String) = connection
                     .query_row(
-                        "SELECT MAX(seq) FROM messages WHERE session_id = ?1",
-                        [source],
-                        |row| row.get(0),
+                        "SELECT role, status FROM messages WHERE session_id = ?1 AND seq = ?2",
+                        params![source, boundary],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?
-                    .flatten();
-                let boundary = boundary.or(newest).ok_or_else(|| {
-                    SessionError::Refused(format!("session {source} has nothing to fork"))
-                })?;
-                let status: Option<String> = connection
+                    .ok_or_else(|| {
+                        SessionError::Refused(format!(
+                            "session {source} has no message {boundary}"
+                        ))
+                    })?;
+                if role != "assistant" || status != "complete" {
+                    return Err(SessionError::Refused(format!(
+                        "message {boundary} is not a finished turn; fork only at the end of a completed turn"
+                    )));
+                }
+                // The row after the boundary may only be the next turn's prompt.
+                // Anything else means the fork would end inside a turn.
+                let next_role: Option<String> = connection
                     .query_row(
-                        "SELECT status FROM messages WHERE session_id = ?1 AND seq = ?2",
-                        params![source, boundary],
+                        "SELECT role FROM messages WHERE session_id = ?1 AND seq = ?2",
+                        params![source, boundary + 1],
                         |row| row.get(0),
                     )
                     .optional()?;
-                match status.as_deref() {
-                    None => {
-                        return Err(SessionError::Refused(format!(
-                            "session {source} has no message {boundary}"
-                        )));
-                    }
-                    Some("complete") => {}
-                    Some(_) => {
-                        return Err(SessionError::Refused(format!(
-                            "message {boundary} is not a completed turn; fork only at a finished boundary"
-                        )));
-                    }
+                if next_role.as_deref().is_some_and(|role| role != "user") {
+                    return Err(SessionError::Refused(format!(
+                        "message {boundary} is inside a turn; fork only at the end of a completed turn"
+                    )));
                 }
 
                 let mut slug = new_slug();

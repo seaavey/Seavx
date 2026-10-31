@@ -979,13 +979,14 @@ fn the_session_verbs_run_off_thread_against_the_store() {
     let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
     let workspace = "ws";
     let source = store.create(workspace, None, Some("parser work")).unwrap();
-    for text in ["first", "second", "third"] {
+    for message in [
+        genai::chat::ChatMessage::user("first"),
+        genai::chat::ChatMessage::assistant(genai::chat::MessageContent::from_text("one")),
+        genai::chat::ChatMessage::user("second"),
+        genai::chat::ChatMessage::assistant(genai::chat::MessageContent::from_text("two")),
+    ] {
         store
-            .record_message(
-                source,
-                &genai::chat::ChatMessage::user(text),
-                crate::session::MessageStatus::Complete,
-            )
+            .record_message(source, &message, crate::session::MessageStatus::Complete)
             .unwrap();
     }
     let other = store.create(workspace, None, Some("unrelated")).unwrap();
@@ -1020,7 +1021,7 @@ fn the_session_verbs_run_off_thread_against_the_store() {
         workspace,
         SessionsOp::Fork {
             id: source.to_string(),
-            at: Some(2),
+            at: Some(4),
         },
     )
     .expect("forks");
@@ -1033,12 +1034,12 @@ fn the_session_verbs_run_off_thread_against_the_store() {
         .expect("the fork is a new session of this workspace");
     assert_eq!(
         store.load(forked.id).unwrap().messages.len(),
-        2,
+        4,
         "the prefix"
     );
     assert_eq!(
         store.load(source).unwrap().messages.len(),
-        3,
+        4,
         "the source keeps every message"
     );
 

@@ -2114,18 +2114,23 @@ fn a_session_forks_its_prefix_and_leaves_the_source_alone() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
     let source = store.create("ws", None, Some("original")).unwrap();
-    for (index, text) in ["first", "second", "third"].iter().enumerate() {
-        let message = ChatMessage::user(*text);
+    // Two finished turns: a fork boundary is the end of a turn, never a prompt
+    // and never the middle of an answer.
+    for message in [
+        ChatMessage::user("first"),
+        ChatMessage::assistant(MessageContent::from_text("answer one")),
+        ChatMessage::user("second"),
+        ChatMessage::assistant(MessageContent::from_text("answer two")),
+    ] {
         store
             .record_message(source, &message, MessageStatus::Complete)
             .unwrap();
-        assert_eq!(index + 1, store.load(source).unwrap().messages.len());
     }
 
-    // Default boundary: the newest complete message.
+    // Default boundary: the newest finished turn, not the newest row.
     let fork = store.fork("ws", source, None).unwrap();
     let forked = store.load(fork).unwrap();
-    assert_eq!(forked.messages.len(), 3);
+    assert_eq!(forked.messages.len(), 4);
     assert_ne!(
         forked.slug,
         store.load(source).unwrap().slug,
@@ -2139,14 +2144,22 @@ fn a_session_forks_its_prefix_and_leaves_the_source_alone() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!((parent, seq), (Some(source), Some(3)));
+    assert_eq!((parent, seq), (Some(source), Some(4)));
 
     // An explicit boundary copies exactly that prefix.
     let half = store.fork("ws", source, Some(2)).unwrap();
     assert_eq!(store.load(half).unwrap().messages.len(), 2);
 
+    // A prompt is not a boundary: forking there ends the copy on an unanswered
+    // user row, which replays as a draft instead of a finished turn.
+    assert!(
+        store.fork("ws", source, Some(1)).is_err(),
+        "a user row is not a finished turn"
+    );
+    assert!(store.fork("ws", source, Some(3)).is_err());
+
     // The source is untouched.
-    assert_eq!(store.load(source).unwrap().messages.len(), 3);
+    assert_eq!(store.load(source).unwrap().messages.len(), 4);
     let (parent, seq): (Option<i64>, Option<i64>) = store
         .connection
         .query_row(
@@ -2169,9 +2182,14 @@ fn archive_hides_a_session_without_deleting_anything() {
     let kept = store.create("ws", None, Some("kept")).unwrap();
     let hidden = store.create("ws", None, Some("hidden")).unwrap();
     for id in [kept, hidden] {
-        store
-            .record_message(id, &ChatMessage::user("hello"), MessageStatus::Complete)
-            .unwrap();
+        for message in [
+            ChatMessage::user("hello"),
+            ChatMessage::assistant(MessageContent::from_text("hi")),
+        ] {
+            store
+                .record_message(id, &message, MessageStatus::Complete)
+                .unwrap();
+        }
     }
 
     store.archive("ws", hidden, true).unwrap();
@@ -2186,7 +2204,7 @@ fn archive_hides_a_session_without_deleting_anything() {
     assert_eq!(all.len(), 2);
 
     // Archived is hidden, not gone: it still loads, and answering it works.
-    assert_eq!(store.load(hidden).unwrap().messages.len(), 1);
+    assert_eq!(store.load(hidden).unwrap().messages.len(), 2);
     assert!(store.fork("ws", hidden, None).is_ok());
 
     store.archive("ws", hidden, false).unwrap();
@@ -2543,4 +2561,48 @@ fn a_real_v0_1_2_database_migrates_to_v6_and_accepts_new_rows() {
     // Writable after the upgrade: the point of a migration.
     store.record_user(1, "after the upgrade").unwrap();
     assert_eq!(store.load(1).unwrap().messages.len(), 3);
+}
+
+#[test]
+fn a_fork_never_ends_inside_a_tool_call_pair() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let source = store.create("ws", None, Some("tool turn")).unwrap();
+    let rows = [
+        ChatMessage::user("read the file"),
+        ChatMessage::assistant(MessageContent::from_tool_calls(vec![tool_call(
+            "call-1",
+            "read_file",
+        )])),
+        ChatMessage::from(ToolResponse::new("call-1", "body")),
+        ChatMessage::assistant(MessageContent::from_text("the file says body")),
+    ];
+    for message in &rows {
+        store
+            .record_message(source, message, MessageStatus::Complete)
+            .unwrap();
+    }
+
+    // The assistant tool-call row and its result are both complete, and both
+    // sit inside the turn: forking there copies a call with no result.
+    for (boundary, expected) in [
+        (1, "not a finished turn"),
+        (2, "inside a turn"),
+        (3, "not a finished turn"),
+    ] {
+        let error = store
+            .fork("ws", source, Some(boundary))
+            .expect_err("only the end of the turn is a boundary")
+            .to_string();
+        assert!(error.contains(expected), "{boundary}: {error}");
+    }
+
+    // The final answer of the turn is a boundary, and the copy replays clean.
+    let fork = store.fork("ws", source, Some(4)).unwrap();
+    let forked = store.load(fork).unwrap();
+    assert_eq!(forked.messages.len(), 4);
+    assert!(
+        replay(&forked).synthetic.is_empty(),
+        "a fork at a finished turn needs no repaired tool call"
+    );
 }
