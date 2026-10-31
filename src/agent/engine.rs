@@ -575,6 +575,18 @@ pub enum RetryTrigger {
     StreamUnavailable,
 }
 
+/// A provider call that never completed — transport, DNS, timeout — is worth one
+/// more try; a request the adapter rejected is not. Keeps the background skill
+/// evaluator from spending a second call on an answer it will get again.
+pub fn evaluator_retryable(error: &genai::Error) -> bool {
+    matches!(
+        error,
+        genai::Error::WebModelCall { .. }
+            | genai::Error::WebAdapterCall { .. }
+            | genai::Error::WebStream { .. }
+    )
+}
+
 /// One budget per user turn, never per tool call.
 #[derive(Debug, Default)]
 pub struct RetryBudget {
@@ -1818,20 +1830,30 @@ impl AgentRuntime {
         // — which an anthropic-shaped proxy can answer without the block
         // signature genai requires, failing the request outright.
         let options = ChatOptions::default();
-        let res = match client
-            .exec_chat(self.config.model_name(), req, Some(&options))
-            .await
-        {
-            Ok(res) => res,
-            Err(err) => {
-                tracing::warn!(error = %err, "Skill synthesis skipped: evaluator request failed");
-                // One line: the error carries the whole request body, and that
-                // belongs in the log, not in the transcript.
-                event_sink(AgentEvent::Notice(format!(
-                    "skill evaluator skipped: {}",
-                    one_line(&err.to_string())
-                )));
-                return;
+        // One more try on a call that never completed: the evaluator runs after
+        // the turn, so a second attempt costs the user nothing.
+        let mut attempt = 0u32;
+        let res = loop {
+            attempt += 1;
+            match client
+                .exec_chat(self.config.model_name(), req.clone(), Some(&options))
+                .await
+            {
+                Ok(res) => break res,
+                Err(err) if attempt == 1 && evaluator_retryable(&err) => {
+                    tracing::info!(error = %err, "evaluator request failed; retrying once");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "Skill synthesis skipped: evaluator request failed");
+                    // One line: the error carries the whole request body, and that
+                    // belongs in the log, not in the transcript.
+                    event_sink(AgentEvent::Notice(format!(
+                        "skill evaluator skipped after {attempt} attempt{}: {}. The turn is unaffected; the provider error is in the log.",
+                        if attempt == 1 { "" } else { "s" },
+                        one_line(&err.to_string())
+                    )));
+                    return;
+                }
             }
         };
 

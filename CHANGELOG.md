@@ -43,6 +43,10 @@ per landed change; no entry describes behaviour that is not in the code.
   `the provider sent a stream chunk this client cannot parse (cause logged).
   Retry the turn; if it repeats, switch model or turn streaming off.` — the raw
   JSON pointer stays in the log instead of the transcript.
+- The background skill evaluator retries once when its model call never
+  completed (transport, DNS, timeout) instead of skipping at the first failure,
+  and its notice says how many attempts it made, that the turn is unaffected,
+  and that the provider error is in the log.
 - Background requests no longer inherit the turn's reasoning budget: a session
   title, a compaction summary and the skill evaluator are short transforms, and
   a proxy adapter answers extended thinking without the block `signature` genai

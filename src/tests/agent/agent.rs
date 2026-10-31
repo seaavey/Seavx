@@ -2020,6 +2020,24 @@ mod retry_budget {
         );
     }
 
+    #[test]
+    fn only_a_call_that_never_completed_is_retried() {
+        use crate::agent::engine::evaluator_retryable;
+
+        // The request reached the provider and was rejected: a second call buys
+        // the same answer.
+        assert!(!evaluator_retryable(&genai::Error::Internal(
+            "400 bad request".to_string()
+        )));
+        // The call broke before an answer existed: worth one more try.
+        let broken = genai::Error::WebStream {
+            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
+            cause: "connection reset".to_string(),
+            error: "connection reset".into(),
+        };
+        assert!(evaluator_retryable(&broken));
+    }
+
     #[tokio::test]
     async fn a_turn_with_partial_output_is_retried_zero_times() {
         // Phase 5's streaming path calls `note_output`; the invariant is here.
