@@ -41,6 +41,79 @@ impl App<'_> {
 
     /// Move the open model picker's cursor by one row, wrapping. Arrows and the
     /// wheel both land here, so the cursor never leaves the filtered rows.
+    /// List every preset with its first lines, so the picker can preview one
+    /// before it is applied. Reading happens once, here.
+    pub fn open_preset_picker(&mut self) -> bool {
+        let found = crate::agent::presets::list(&self.root);
+        if found.is_empty() {
+            self.push_notice(
+                "No presets yet. Add .seavx/prompts/<name>.md (project) or ~/.seavx/prompts/<name>.md (everywhere)."
+                    .to_string(),
+            );
+            return false;
+        }
+        let mut names = Vec::with_capacity(found.len());
+        let mut previews = Vec::with_capacity(found.len());
+        for (name, _path) in found {
+            let preview = match crate::agent::presets::load(&self.root, &name) {
+                Ok(text) => preset_preview(&text),
+                // A preset that cannot be read is still listed: the reason is
+                // what the user needs to fix, and hiding the row loses it.
+                Err(error) => error,
+            };
+            names.push(name);
+            previews.push(preview);
+        }
+        self.modal = Some(ModalSelection::Preset {
+            names,
+            previews,
+            query: String::new(),
+            selected: 0,
+        });
+        true
+    }
+
+    /// Put one preset in the next prompt. Shared by `/preset <name>` and the
+    /// picker, so both say the same thing and neither touches the policy.
+    pub fn apply_preset(&mut self, name: &str) {
+        match crate::agent::presets::load(&self.root, name) {
+            Ok(text) => {
+                let preview: Vec<&str> = text.lines().take(3).collect();
+                self.set_input(&text);
+                self.push_notice(format!(
+                    "Preset '{name}' loaded into the prompt:\n{}",
+                    preview.join("\n")
+                ));
+            }
+            Err(error) => self.push_notice(error),
+        }
+    }
+
+    /// Move inside the preset picker, wrapping over the visible rows.
+    pub fn step_preset_picker(&mut self, down: bool) {
+        let Some(ModalSelection::Preset {
+            names,
+            previews,
+            query,
+            selected,
+        }) = self.modal.take()
+        else {
+            return;
+        };
+        let len = visible_presets(&names, &query).len();
+        let selected = if down {
+            next_index(selected, len)
+        } else {
+            prev_index(selected, len)
+        };
+        self.modal = Some(ModalSelection::Preset {
+            names,
+            previews,
+            query,
+            selected,
+        });
+    }
+
     pub fn step_model_picker(&mut self, down: bool) {
         let Some(ModalSelection::Model {
             models,
@@ -164,6 +237,32 @@ pub fn visible_models<'a>(models: &'a [String], query: &str) -> Vec<&'a String> 
         .iter()
         .filter(|model| model_matches(model, query))
         .collect()
+}
+
+/// Preset rows a query keeps, in list order. The search box filters the names
+/// the same way every site that draws or selects reads them.
+pub fn visible_presets(names: &[String], query: &str) -> Vec<usize> {
+    let wanted = query.trim().to_ascii_lowercase();
+    names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| wanted.is_empty() || name.to_ascii_lowercase().contains(&wanted))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The lines a picker shows for one preset: enough to recognise it, never the
+/// whole file, and one line per row.
+fn preset_preview(text: &str) -> String {
+    const LINES: usize = 12;
+    let mut preview: Vec<&str> = text.lines().take(LINES).collect();
+    let more = text.lines().count() > LINES;
+    let mut out = preview.join("\n");
+    preview.clear();
+    if more {
+        out.push_str("\n...");
+    }
+    out
 }
 
 /// The picker's search box: a printable key appends, Backspace deletes one

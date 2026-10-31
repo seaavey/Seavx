@@ -125,6 +125,37 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                     _ => {}
                 }
             }
+            ModalSelection::Preset {
+                names,
+                previews,
+                query,
+                selected,
+            } => {
+                if let Some(query) = edit_query(&query, &key) {
+                    app.modal = Some(ModalSelection::Preset {
+                        names,
+                        previews,
+                        query,
+                        selected: 0,
+                    });
+                    return;
+                }
+                match key.code {
+                    KeyCode::Esc => app.modal = None,
+                    KeyCode::Up => app.step_preset_picker(false),
+                    KeyCode::Down => app.step_preset_picker(true),
+                    KeyCode::Enter => {
+                        let chosen = crate::tui::app::modal::visible_presets(&names, &query)
+                            .get(selected)
+                            .map(|index| names[*index].clone());
+                        app.modal = None;
+                        if let Some(name) = chosen {
+                            app.apply_preset(&name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             ModalSelection::Effort {
                 model,
                 options,

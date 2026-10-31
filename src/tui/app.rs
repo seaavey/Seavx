@@ -38,7 +38,7 @@ pub(in crate::tui::app) use references::scan_workspace_entries_at;
 pub(in crate::tui::app) use modal::edit_query;
 #[cfg(test)]
 pub(in crate::tui::app) use modal::resolve_model_target;
-pub use modal::visible_models;
+pub use modal::{visible_models, visible_presets};
 // The worker stays reachable as `crate::tui::app::run_agent_worker` for both
 // submit paths and for callers outside the module.
 #[cfg(test)]
@@ -66,6 +66,14 @@ pub enum ModalSelection {
     Effort {
         model: String,
         options: Vec<&'static str>,
+        selected: usize,
+    },
+    /// Prompt presets: the name list, the preview of each one, and the search box.
+    /// The preview is read when the picker opens, never on the render path.
+    Preset {
+        names: Vec<String>,
+        previews: Vec<String>,
+        query: String,
         selected: usize,
     },
     /// One row per stored session, newest first: the order `/sessions <n>` reads.

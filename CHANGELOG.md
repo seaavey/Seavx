@@ -70,6 +70,9 @@ per landed change; no entry describes behaviour that is not in the code.
   reviewing a truncated diff, and kills the Git process group on timeout.
 - Ask only annotates `path:line` tokens that name a file, so a clock time or a
   URL port is left alone.
+- `/preset` opens a searchable picker: typing filters the names, the selected
+  preset's first lines are previewed, and Enter puts it in the next prompt.
+  `/preset <name>` still applies one directly.
 
 ### tests
 

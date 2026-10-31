@@ -972,38 +972,13 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         // still say so.
         SlashCommand::Steer { .. } | SlashCommand::Queue { .. } => CommandEffect::Handled,
         SlashCommand::Preset { name } => {
-            // The workspace the session belongs to, not the process cwd.
-            let root = app.root.clone();
-            let root = root.as_path();
             match name {
+                // No name means choose: the picker filters as the user types and
+                // shows the text before it is applied.
                 None => {
-                    let found = crate::agent::presets::list(root);
-                    if found.is_empty() {
-                        app.push_notice(
-                            "No presets yet. Add .seavx/prompts/<name>.md (project) or ~/.seavx/prompts/<name>.md (everywhere)."
-                                .to_string(),
-                        );
-                    } else {
-                        let names: Vec<String> = found
-                            .into_iter()
-                            .map(|(name, path)| format!("{name}  ({})", path.display()))
-                            .collect();
-                        app.push_notice(format!("Presets:\n{}", names.join("\n")));
-                    }
+                    app.open_preset_picker();
                 }
-                Some(name) => match crate::agent::presets::load(root, &name) {
-                    Ok(text) => {
-                        let preview: Vec<&str> = text.lines().take(3).collect();
-                        // The preset becomes the next prompt; it never reaches
-                        // the system prompt or the permission policy.
-                        app.set_input(&text);
-                        app.push_notice(format!(
-                            "Preset '{name}' loaded into the prompt:\n{}",
-                            preview.join("\n")
-                        ));
-                    }
-                    Err(error) => app.push_notice(error),
-                },
+                Some(name) => app.apply_preset(&name),
             }
             CommandEffect::Handled
         }

@@ -1310,3 +1310,58 @@ fn a_preset_lands_in_the_next_prompt_and_never_in_the_policy() {
         "the system prompt is untouched"
     );
 }
+
+#[test]
+fn the_preset_picker_searches_and_previews_before_applying() {
+    use crate::agent::presets;
+
+    let root = tempfile::TempDir::new().unwrap();
+    let dir = presets::project_dir(root.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("triage.md"),
+        "Triage the failing tests first.\nThen fix them.",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("release.md"),
+        "Write the changelog entry.\nBump the version.",
+    )
+    .unwrap();
+
+    let mut app = crate::tui::app::test_app();
+    app.root = root.path().to_path_buf();
+    execute(&mut app, SlashCommand::Preset { name: None });
+
+    let Some(crate::tui::app::ModalSelection::Preset {
+        names,
+        previews,
+        query,
+        selected,
+    }) = app.modal.clone()
+    else {
+        panic!("the picker opened: {:?}", app.modal.is_some());
+    };
+    assert_eq!(names, vec!["release".to_string(), "triage".to_string()]);
+    assert!(
+        previews[1].contains("Triage the failing tests first."),
+        "each row carries its own preview: {previews:?}"
+    );
+    assert!(query.is_empty() && selected == 0);
+
+    // Typing filters the search; the preview follows the selected row.
+    let filtered = crate::tui::app::visible_presets(&names, "tri");
+    assert_eq!(filtered, vec![1], "only the matching preset survives");
+    assert!(crate::tui::app::visible_presets(&names, "zzz").is_empty());
+
+    // An empty directory answers with the hint instead of an empty box.
+    let empty = tempfile::TempDir::new().unwrap();
+    let mut other = crate::tui::app::test_app();
+    other.root = empty.path().to_path_buf();
+    execute(&mut other, SlashCommand::Preset { name: None });
+    assert!(other.modal.is_none(), "no picker without presets");
+    assert!(
+        format!("{:?}", other.segments.last()).contains("No presets yet"),
+        "the hint names where to put one"
+    );
+}

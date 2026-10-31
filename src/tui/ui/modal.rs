@@ -9,6 +9,7 @@ use crate::tui::app::{App, ModalSelection};
 
 mod effort;
 mod model;
+mod preset;
 mod session;
 mod skills;
 
@@ -39,6 +40,12 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame, millis: u128) {
             options,
             selected,
         } => effort::render(area, frame, model, options, *selected, millis),
+        ModalSelection::Preset {
+            names,
+            previews,
+            query,
+            selected,
+        } => preset::render(area, frame, names, previews, query, *selected),
         ModalSelection::Session { rows, selected } => session::render(area, frame, rows, *selected),
         ModalSelection::Skills {
             names,

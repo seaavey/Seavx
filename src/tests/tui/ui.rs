@@ -701,3 +701,57 @@ fn the_session_line_shows_title_and_state() {
         "the working orb sits beside the state: {line:?}"
     );
 }
+
+#[test]
+fn the_preset_picker_draws_the_names_and_the_selected_preview() {
+    use crate::agent::presets;
+
+    let root = tempfile::TempDir::new().unwrap();
+    let dir = presets::project_dir(root.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("triage.md"), "Triage the failing tests first.").unwrap();
+    std::fs::write(dir.join("release.md"), "Write the changelog entry.").unwrap();
+
+    let mut app = test_app();
+    app.root = root.path().to_path_buf();
+    assert!(app.open_preset_picker(), "the picker opens with presets");
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String { (0..90).map(|x| buffer[(x, y)].symbol()).collect() };
+    let rows: Vec<String> = (0..30).map(row).collect();
+
+    assert!(
+        rows.iter().any(|line| line.contains("Presets")),
+        "the box names itself and its keys: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|line| line.contains("release")),
+        "every preset is a row: {rows:?}"
+    );
+    // Row 0 is selected, so its preview is the one on screen.
+    assert!(
+        rows.iter()
+            .any(|line| line.contains("Write the changelog entry.")),
+        "the selected preset is previewed: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|line| line.contains("Triage the failing tests first.")),
+        "the row under the cursor is not previewed: {rows:?}"
+    );
+
+    let y = rows
+        .iter()
+        .position(|line| line.contains("release"))
+        .expect("the first row is drawn");
+    let start = rows[y][..rows[y].find("release").unwrap()].chars().count() as u16;
+    assert_eq!(
+        buffer[(start, y as u16)].style().bg,
+        Some(Color::Yellow),
+        "the selected row has a background: {:?}",
+        rows[y]
+    );
+}
