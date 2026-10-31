@@ -36,6 +36,10 @@ pub enum AgentEvent {
     Thinking(String),
     /// Engine news for the user, without the old `System: ` prefix.
     Notice(String),
+    /// Text the user sent into a running turn, delivered at its next boundary.
+    /// Its own variant because it is transcript content, not model output: the
+    /// worker stores it as a user row and the turn must not be replayed without it.
+    Steer(String),
     Usage {
         total_tokens: i32,
         prompt_tokens: i32,

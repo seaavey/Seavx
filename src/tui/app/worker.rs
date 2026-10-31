@@ -255,6 +255,8 @@ pub async fn run_agent_worker(
         }
 
         let tx_clone = tx.clone();
+        let steer_store = store.clone();
+        let steer_tx = tx.clone();
         let row_store = store.clone();
         let row_tx = tx.clone();
         let event_store = store.clone();
@@ -312,6 +314,18 @@ pub async fn run_agent_worker(
                         AgentEvent::Tool(tool) => Some(Action::AgentTool(tool)),
                         AgentEvent::Notice(note) => {
                             Some(Action::AgentToken(format!("\n  {note}\n")))
+                        }
+                        // The steer is part of the conversation: store it as the
+                        // user row the model was given, once, then show it.
+                        AgentEvent::Steer(text) => {
+                            if let (Some(handle), Some(id)) = (&steer_store, session_id)
+                                && let Err(error) = lock_store(handle).record_user(id, &text)
+                            {
+                                let _ = steer_tx.send(Action::SessionFailed(format!(
+                                    "Steer not recorded: {error}"
+                                )));
+                            }
+                            Some(Action::AgentToken(format!("\n\n[steer] {text}\n\n")))
                         }
                         // The turn's terminal status is sent from the outcome
                         // right after this call returns, once, with its cleanup.

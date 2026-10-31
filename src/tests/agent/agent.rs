@@ -1311,7 +1311,10 @@ mod engine_seam {
             std::sync::Arc::new(std::sync::Mutex::new(crate::tui::app::SteerSlot::default()));
         // The user types `/steer` while the first request is in flight.
         let typed = slot.clone();
-        let sink = move |_event: crate::agent::events::AgentEvent| {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = seen.clone();
+        let sink = move |event: crate::agent::events::AgentEvent| {
+            events.lock().unwrap().push(event);
             let Ok(mut slot) = typed.lock() else { return };
             if slot.waiting.is_none() && slot.applied == 0 {
                 slot.waiting = Some("focus on the tests".to_string());
@@ -1352,6 +1355,31 @@ mod engine_seam {
         let slot = slot.lock().unwrap();
         assert_eq!(slot.applied, 1, "taken exactly once");
         assert!(slot.waiting.is_none(), "and not left behind");
+        drop(slot);
+
+        // The steer is reported as its own event, because the worker stores it
+        // as a user row: a `Token` would persist it as model output or not at
+        // all, and the resumed transcript would hold an answer to nothing.
+        let events = seen.lock().unwrap();
+        let steers: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::agent::events::AgentEvent::Steer(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steers,
+            vec![&"focus on the tests".to_string()],
+            "exactly one steer event: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                crate::agent::events::AgentEvent::Token(text) if text.contains("[steer]")
+            )),
+            "the steer is never model text: {events:?}"
+        );
     }
 }
 

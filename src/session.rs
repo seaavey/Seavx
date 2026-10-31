@@ -541,6 +541,7 @@ impl<'a> NewEvent<'a> {
             AgentEvent::Token(_)
             | AgentEvent::Thinking(_)
             | AgentEvent::Notice(_)
+            | AgentEvent::Steer(_)
             | AgentEvent::Usage { .. } => None,
         }
     }

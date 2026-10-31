@@ -219,6 +219,8 @@ async fn main() -> anyhow::Result<()> {
                             agent::events::AgentEvent::Notice(note) => println!("{note}"),
                             agent::events::AgentEvent::Thinking(_)
                             | agent::events::AgentEvent::Usage { .. }
+                            // Nothing steers a headless run: no human is attached.
+                            | agent::events::AgentEvent::Steer(_)
                             | agent::events::AgentEvent::Turn { .. } => {}
                         }
                     },

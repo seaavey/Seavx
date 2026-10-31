@@ -928,7 +928,9 @@ impl AgentRuntime {
             // results included), before this request. Never mid-call.
             if let Some(steer) = self.steering.take() {
                 chat_req = chat_req.append_message(genai::chat::ChatMessage::user(steer.clone()));
-                event_sink(AgentEvent::Token(format!("\n\n[steer] {steer}\n\n")));
+                // The worker persists this as a user row: a resumed session that
+                // held the answer but not the instruction is a broken transcript.
+                event_sink(AgentEvent::Steer(steer));
             }
 
             // Log full request payload to .seavx/request.log
