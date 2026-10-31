@@ -1758,6 +1758,84 @@ fn answering_a_restored_question_appends_exactly_one_result() {
     assert_eq!(results, vec!["call_ask".to_string()], "exactly one result");
 }
 
+#[tokio::test]
+async fn a_running_test_keeps_the_turn_slot_busy_until_it_finishes() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    // `/test` marks the app busy before the command is proposed.
+    app.status = AgentState::Checking;
+    super::actions::apply(
+        &mut app,
+        Action::TestProposed {
+            command: "cargo test".to_string(),
+            evidence: "Cargo.toml".to_string(),
+            changed: 1,
+        },
+        &tx,
+    );
+    assert_eq!(
+        app.status,
+        AgentState::Checking,
+        "proposing the test must not free the turn slot"
+    );
+    assert!(
+        app.submit_turn("start another task").is_none(),
+        "a second turn must wait for the test"
+    );
+
+    super::actions::apply(&mut app, Action::TestDone("exit: 0".to_string()), &tx);
+    assert_eq!(app.status, AgentState::Idle);
+    assert!(
+        app.submit_turn("start another task").is_some(),
+        "the slot frees when the test is done"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_operation_keeps_the_slot_busy_and_its_prompt_still_starts() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    // `CommandEffect::RunGoal` marks the app busy while the store work runs.
+    app.status = AgentState::Checking;
+    assert!(
+        app.submit_turn("while the goal runs").is_none(),
+        "a prompt cannot start while a goal operation holds the slot"
+    );
+
+    super::actions::apply(
+        &mut app,
+        Action::GoalDone {
+            result: Ok("Goal 1 approved.".to_string()),
+            goal: Some("1 active".to_string()),
+            start: Some("write the parser".to_string()),
+        },
+        &tx,
+    );
+    assert_eq!(
+        app.status,
+        AgentState::Thinking,
+        "the goal prompt is submitted, not refused as busy"
+    );
+    assert!(transcript(&app).contains("User: write the parser"));
+}
+
+#[tokio::test]
+async fn a_goal_operation_without_a_prompt_returns_to_idle() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.status = AgentState::Checking;
+    super::actions::apply(
+        &mut app,
+        Action::GoalDone {
+            result: Ok("Goal 1 paused.".to_string()),
+            goal: Some("1 paused".to_string()),
+            start: None,
+        },
+        &tx,
+    );
+    assert_eq!(app.status, AgentState::Idle);
+}
+
 #[test]
 fn a_queued_prompt_is_dropped_when_the_turn_does_not_succeed() {
     use crate::agent::cancel::TurnStatus;

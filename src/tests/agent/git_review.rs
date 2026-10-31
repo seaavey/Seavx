@@ -160,6 +160,34 @@ fn an_unstaged_edit_is_in_the_diff() {
 }
 
 #[test]
+fn a_magic_looking_visible_path_cannot_select_a_protected_file() {
+    let repo = repo(&[(".env", "SECRET=old\n"), (":(top).env", "public old\n")]);
+    write(repo.path(), ".env", "SECRET=protected\n");
+    write(repo.path(), ":(top).env", "public changed\n");
+
+    let input = resolve_after(repo.path(), &ReviewTarget::WorkingTree);
+    assert!(input.diff.contains("+public changed"), "{}", input.diff);
+    assert!(!input.diff.contains("SECRET=protected"), "{}", input.diff);
+    assert_eq!(input.withheld_paths, 1);
+}
+
+#[test]
+fn a_root_commit_is_reviewed_as_a_change() {
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Test"]);
+    git(repo.path(), &["config", "user.email", "test@example.com"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    write(repo.path(), "root.txt", "root change\n");
+    git(repo.path(), &["add", "--", "root.txt"]);
+    git(repo.path(), &["commit", "-q", "-m", "root"]);
+
+    let input = resolve_after(repo.path(), &ReviewTarget::Commit("HEAD".to_string()));
+    assert!(input.diff.contains("+root change"), "{}", input.diff);
+    assert_eq!(input.changed_paths, vec!["root.txt".to_string()]);
+}
+
+#[test]
 fn a_staged_edit_survives_only_in_the_staged_target() {
     let repo = repo(&[("a.txt", "one\n")]);
     write(repo.path(), "a.txt", "one\nstaged\n");
@@ -169,7 +197,11 @@ fn a_staged_edit_survives_only_in_the_staged_target() {
     assert!(staged.diff.contains("+staged"), "{}", staged.diff);
 
     let commit = resolve_after(repo.path(), &ReviewTarget::Commit("HEAD".to_string()));
-    assert!(commit.is_empty, "HEAD alone changes nothing");
+    assert!(
+        !commit.diff.contains("+staged"),
+        "the staged edit belongs to the staged target only: {}",
+        commit.diff
+    );
 }
 
 #[test]
@@ -279,6 +311,19 @@ fn output_over_the_cap_fails_the_review_instead_of_truncating() {
 }
 
 #[test]
+fn an_empty_review_with_withheld_paths_reports_the_count() {
+    let repo = repo(&[("a.txt", "one\n")]);
+    write(repo.path(), ".env", "SECRET=protected\n");
+
+    let input = resolve_after(repo.path(), &ReviewTarget::WorkingTree);
+    assert!(input.is_empty);
+    assert_eq!(input.withheld_paths, 1);
+    let text = crate::agent::git_review::task_text(&input);
+    assert!(text.contains("1 path(s) were withheld"), "{text}");
+    assert!(text.contains("no reviewable changes"), "{text}");
+}
+
+#[test]
 fn the_task_text_names_the_target_and_withholds_no_content() {
     let input = crate::agent::git_review::ReviewInput {
         target: "staged".to_string(),
@@ -298,7 +343,8 @@ fn the_task_text_names_the_target_and_withholds_no_content() {
         ..input
     };
     let text = crate::agent::git_review::task_text(&empty);
-    assert!(text.contains("no changes"), "{text}");
+    assert!(text.contains("no reviewable changes"), "{text}");
+    assert!(text.contains("2 path(s) were withheld"), "{text}");
     assert!(!text.contains("+one"), "{text}");
 }
 

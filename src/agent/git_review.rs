@@ -115,6 +115,7 @@ pub fn resolve(
                     &[
                         "diff-tree",
                         "--no-commit-id",
+                        "--root",
                         "--name-only",
                         "-r",
                         "-z",
@@ -124,6 +125,7 @@ pub fn resolve(
                 vec![
                     "diff-tree".to_string(),
                     "--no-commit-id".to_string(),
+                    "--root".to_string(),
                     "-p".to_string(),
                     "--no-ext-diff".to_string(),
                     "--no-textconv".to_string(),
@@ -169,7 +171,8 @@ pub fn resolve(
 
     let mut diff = String::new();
     if !visible.is_empty() {
-        let mut command = patch_args;
+        let mut command = vec!["--literal-pathspecs".to_string()];
+        command.extend(patch_args);
         command.push("--".to_string());
         command.extend(visible.iter().cloned());
         let args: Vec<&str> = command.iter().map(String::as_str).collect();
@@ -209,8 +212,16 @@ pub fn resolve(
 /// Only what the resolver already filtered can reach it.
 pub fn task_text(input: &ReviewInput) -> String {
     if input.is_empty {
+        let summary = if input.withheld_paths > 0 {
+            format!(
+                "There are no reviewable changes in this target. {} path(s) were withheld for security; their contents are not available to you.",
+                input.withheld_paths
+            )
+        } else {
+            "There are no changes in this target, so there is nothing to review.".to_string()
+        };
         return format!(
-            "Review the {} changes.\n\nThere are no changes in this target, so there is nothing to review. Report that plainly, name the target, and state the review's limits.",
+            "Review the {} changes.\n\n{summary} Report that plainly, name the target, and state the review's limits.",
             input.target
         );
     }

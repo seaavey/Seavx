@@ -421,6 +421,9 @@ pub(super) fn apply_command_effect(
             });
         }
         CommandEffect::RunGoal { action } => {
+            // The store work runs off the loop; the slot is held until
+            // `GoalDone` arrives, so no other turn can start beside it.
+            app.status = AgentState::Checking;
             let tx = tx.clone();
             let workspace = crate::session::workspace_key();
             tokio::task::spawn_blocking(move || {

@@ -1,5 +1,6 @@
 //! Session lifecycle, stored messages, turns and the one write path.
 use super::*;
+use crate::agent::questions::QuestionAnswer;
 use genai::chat::{ChatMessage, ToolResponse};
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
@@ -121,7 +122,12 @@ impl SessionStore {
         let needs_rebuild = !ledger_names.iter().any(|name| name == "goal_id")
             || !ledger_ddl.contains("'question'");
         if needs_rebuild {
-            transaction.execute_batch(
+            let goal_id = if ledger_names.iter().any(|name| name == "goal_id") {
+                "goal_id"
+            } else {
+                "NULL"
+            };
+            transaction.execute_batch(&format!(
                 "ALTER TABLE agent_events RENAME TO agent_events_v3;
                  CREATE TABLE agent_events(
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +147,7 @@ impl SessionStore {
                  );
                  INSERT INTO agent_events(id, session_id, goal_id, seq, turn_id, kind,
                                           status, failure, tool_call_id, summary, pid, created_at)
-                     SELECT id, session_id, NULL, seq, turn_id, kind, status, failure,
+                     SELECT id, session_id, {goal_id}, seq, turn_id, kind, status, failure,
                             tool_call_id, summary, pid, created_at
                      FROM agent_events_v3;
                  DROP TABLE agent_events_v3;
@@ -149,7 +155,7 @@ impl SessionStore {
                      ON agent_events(session_id, seq);
                  CREATE UNIQUE INDEX IF NOT EXISTS agent_events_goal_seq
                      ON agent_events(goal_id, seq) WHERE goal_id IS NOT NULL;",
-            )?;
+            ))?;
         }
         // After the rebuild, never in `SCHEMA`: on a v3 file the column does not
         // exist yet, and the whole batch would fail on the index alone.
@@ -267,6 +273,33 @@ impl SessionStore {
                 if role != "assistant" || status != "complete" {
                     return Err(SessionError::Refused(format!(
                         "message {boundary} is not a finished turn; fork only at the end of a completed turn"
+                    )));
+                }
+                // Every call in the prefix must have its result inside it: a
+                // fork that copies a dangling call cannot be replayed.
+                let mut statement = connection.prepare(
+                    "SELECT role, payload FROM messages
+                     WHERE session_id = ?1 AND seq <= ?2 ORDER BY seq",
+                )?;
+                let prefix: Vec<(String, String)> = statement
+                    .query_map(params![source, boundary], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(statement);
+                let mut open: Vec<String> = Vec::new();
+                for (role, payload) in prefix {
+                    if role == "assistant" {
+                        open.extend(call_ids(&payload));
+                    } else if role == "tool"
+                        && let Some(call_id) = response_call_id(&payload)
+                    {
+                        open.retain(|open| open != &call_id);
+                    }
+                }
+                if !open.is_empty() {
+                    return Err(SessionError::Refused(format!(
+                        "message {boundary} is inside a turn; fork only at the end of a completed turn"
                     )));
                 }
                 // The row after the boundary may only be the next turn's prompt.
@@ -599,8 +632,9 @@ impl SessionStore {
         })
     }
 
-    /// Write the synthetic interrupted result for every tool call of the last
-    /// assistant row that never got a result. Idempotent, never rewrites a row.
+    /// Write the one result every tool call of the last assistant row is
+    /// missing: the durable outcome of a question that was already resolved, or
+    /// the synthetic interruption. Idempotent, never rewrites a row.
     pub fn record_recovery(&self, session: i64) -> Result<usize, SessionError> {
         let loaded = self.load(session)?;
         if let Some(reason) = loaded.read_only {
@@ -618,20 +652,54 @@ impl SessionStore {
             .filter(|row| row.role == "tool")
             .filter_map(|row| response_call_id(&row.payload))
             .collect();
+        let resolved = self.resolved_question_results(session)?;
 
         let mut written = 0;
         for call_id in call_ids(&loaded.messages[last].payload) {
-            if answered.contains(&call_id) {
+            if answered.contains(&call_id) || loaded.pending_calls.contains(&call_id) {
                 continue;
             }
+            // The answer was stored before the crash: rebuild the result the
+            // model would have seen, not a generic interruption.
+            let (result, status) = match resolved.get(&call_id) {
+                Some(result) => (result.clone(), MessageStatus::Complete),
+                None => (INTERRUPTED_RESULT.to_string(), MessageStatus::Interrupted),
+            };
             self.record_message(
                 session,
-                &ChatMessage::from(ToolResponse::new(call_id, INTERRUPTED_RESULT)),
-                MessageStatus::Interrupted,
+                &ChatMessage::from(ToolResponse::new(call_id, result)),
+                status,
             )?;
             written += 1;
         }
         Ok(written)
+    }
+
+    /// The tool result each resolved question's call is owed, keyed by call id.
+    fn resolved_question_results(
+        &self,
+        session: i64,
+    ) -> Result<std::collections::HashMap<String, String>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT tool_call_id, state, answer FROM pending_questions
+             WHERE session_id = ?1 AND state <> 'pending'",
+        )?;
+        let questions: Vec<(String, String, String)> = statement
+            .query_map([session], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+
+        let mut results = std::collections::HashMap::new();
+        for (call_id, state, answer) in questions {
+            let answer = match state.as_str() {
+                "answered" => QuestionAnswer::Answered(answer),
+                "skipped" => QuestionAnswer::Skipped,
+                "cancelled" => QuestionAnswer::Cancelled,
+                _ => continue,
+            };
+            results.insert(call_id, answer.tool_result());
+        }
+        Ok(results)
     }
 
     fn rows(&self, session: i64) -> Result<Vec<StoredMessage>, SessionError> {

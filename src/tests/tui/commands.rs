@@ -26,6 +26,16 @@ fn parses_existing_commands_and_arguments() {
 }
 
 #[test]
+fn test_takes_no_arguments() {
+    assert_eq!(parse("/test"), Some(SlashCommand::Test));
+    assert_eq!(
+        parse("/test extra"),
+        Some(SlashCommand::Unknown("/test extra".into())),
+        "an argument is a usage error, not a run of the default command"
+    );
+}
+
+#[test]
 fn busy_app_rejects_clear_but_allows_help_and_exit() {
     let mut app = crate::tui::app::test_app();
     app.status = AgentState::Streaming;

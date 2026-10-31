@@ -1360,6 +1360,16 @@ impl AgentRuntime {
                     match crate::agent::questions::parse_request(&call_id, &call.fn_arguments) {
                         Ok(request) => {
                             let answer = self.questioner.ask(request).await;
+                            // Esc on a question cancels the turn: the sibling
+                            // calls in this response must not run after it.
+                            if answer == crate::agent::questions::QuestionAnswer::Cancelled {
+                                let result = security::redact(&answer.tool_result());
+                                lifecycle(ToolStatus::Cancelled, None, Some(started.elapsed()));
+                                let response =
+                                    ChatMessage::from(ToolResponse::new(call_id.clone(), result));
+                                on_message(&response, crate::session::MessageStatus::Complete);
+                                return Err(cancelled(turn_state));
+                            }
                             (answer.tool_result(), ToolEnd::Done)
                         }
                         Err(error) => (
@@ -1439,6 +1449,18 @@ impl AgentRuntime {
 
                 if is_err {
                     if last_failure.as_deref() == Some(result_str.as_str()) {
+                        // This call ends the loop, so it still owes its
+                        // terminal event and its result row before the return.
+                        let failure = match end {
+                            ToolEnd::Failed(failure) => Some(failure),
+                            _ => None,
+                        };
+                        lifecycle(ToolStatus::Failed, failure, Some(started.elapsed()));
+                        let tool_message = ChatMessage::from(ToolResponse::new(
+                            call.call_id.clone(),
+                            result_str.clone(),
+                        ));
+                        on_message(&tool_message, crate::session::MessageStatus::Complete);
                         return Ok(report_stopped(
                             &mut on_message,
                             format!("stopped: the same error repeated twice: {result_str}"),

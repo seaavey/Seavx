@@ -529,7 +529,7 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
             },
             _ => SlashCommand::Unknown(trimmed.to_string()),
         },
-        CommandId::Test => SlashCommand::Test,
+        CommandId::Test => no_args(&args, trimmed, SlashCommand::Test),
         CommandId::Steer => SlashCommand::Steer {
             text: args.join(" "),
         },

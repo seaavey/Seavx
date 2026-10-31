@@ -608,7 +608,7 @@ mod engine_seam {
         }
     }
 
-    fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path) -> AgentRuntime {
+    pub(super) fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path) -> AgentRuntime {
         let mut config = AgentConfig::load(workspace);
         config.model = Some("fake-model".to_string());
         config.max_turns = 4;
@@ -1267,6 +1267,15 @@ mod engine_seam {
         .unwrap()
     }
 
+    fn write_call(call_id: &str, path: &str, content: &str) -> genai::chat::ToolCall {
+        serde_json::from_value(serde_json::json!({
+            "call_id": call_id,
+            "fn_name": "write_file",
+            "fn_arguments": { "path": path, "content": content },
+        }))
+        .unwrap()
+    }
+
     fn tool_responses(messages: &[ChatMessage]) -> Vec<String> {
         messages
             .iter()
@@ -1360,6 +1369,69 @@ mod engine_seam {
             unavailable.contains("No human is available"),
             "{unavailable}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_question_stops_the_sibling_calls_and_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            ask_call("call_ask", "Write it?"),
+            write_call("call_write", "created.txt", "must not land"),
+        ])));
+        let questioner = std::sync::Arc::new(RecordingQuestioner {
+            answer: Some(crate::agent::questions::QuestionAnswer::Cancelled),
+            ..Default::default()
+        });
+        let runtime = runtime_with(&fake, temp.path()).with_questioner(questioner);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut rows: Vec<ChatMessage> = Vec::new();
+        let outcome = runtime
+            .execute_task(
+                ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |message, _| rows.push(message.clone()),
+            )
+            .await;
+
+        assert_eq!(outcome.status, TurnStatus::Cancelled);
+        assert!(
+            !temp.path().join("created.txt").exists(),
+            "a sibling write must not run after the question is cancelled"
+        );
+        assert_eq!(
+            fake.requests().len(),
+            1,
+            "no request is sent after the cancelled turn"
+        );
+        assert_eq!(
+            tool_responses(&rows),
+            vec!["call_ask".to_string()],
+            "only the question is answered"
+        );
+        let terminal = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Tool(tool) if tool.call_id == "call_ask" && tool.elapsed.is_some() => {
+                    Some(tool)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("the cancelled call has a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Cancelled);
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Turn {
+                status: TurnStatus::Cancelled,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1978,6 +2050,75 @@ mod repeated_actions {
             fake.requests().len(),
             2,
             "the loop stops instead of asking a third time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_error_records_the_terminal_result_of_the_stopped_call() {
+        use crate::agent::events::{AgentEvent, ToolStatus};
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        // Different arguments, so the repeated-action guard does not fire
+        // first; the OS reports the same missing-file error for both.
+        for (call_id, path) in [("call_one", "missing-a.txt"), ("call_two", "missing-b.txt")] {
+            fake.push(response(MessageContent::from_tool_calls(vec![tool_call(
+                call_id,
+                "read_file",
+                path,
+            )])));
+        }
+
+        let runtime = super::engine_seam::runtime_with(&fake, temp.path());
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut rows: Vec<(String, crate::session::MessageStatus)> = Vec::new();
+        let result = runtime
+            .execute_task(
+                ChatMessage::user("read the file"),
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |message, status| {
+                    for response in message.content.tool_responses() {
+                        rows.push((response.call_id.clone(), status));
+                    }
+                },
+            )
+            .await
+            .result
+            .unwrap();
+
+        assert!(
+            result.contains("the same error repeated twice"),
+            "the summary still stops the loop: {result}"
+        );
+        let terminal = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Tool(tool) if tool.call_id == "call_two" && tool.elapsed.is_some() => {
+                    Some(tool)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("the stopped call has a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Failed);
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "call_one".to_string(),
+                    crate::session::MessageStatus::Complete
+                ),
+                (
+                    "call_two".to_string(),
+                    crate::session::MessageStatus::Complete
+                ),
+            ],
+            "every call the loop ran gets its result, including the one it stopped on"
         );
     }
 

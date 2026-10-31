@@ -1,8 +1,9 @@
 use crate::cli::sessions::{
-    export_text, list_text, parse_resume_number, relative_age, resume_target, session_rows,
-    show_text,
+    export_text, list_text, parse_resume_number, relative_age, resume_by_number, resume_target,
+    session_rows, show_text,
 };
-use crate::session::{MessageStatus, SessionStore};
+use crate::session::{MessageStatus, QuestionKind, QuestionState, SessionStore};
+use genai::chat::{ChatMessage, MessageContent};
 
 /// Two workspaces, one answered session each, same-second timestamps.
 fn fixture() -> (tempfile::TempDir, SessionStore) {
@@ -127,6 +128,62 @@ fn the_resume_prompt_accepts_only_a_number_it_printed() {
         parse_resume_number("1", 0).unwrap_err(),
         "no sessions to resume"
     );
+}
+
+#[test]
+fn resume_by_number_restores_a_resolved_question_before_showing_it() {
+    let (_dir, store) = fixture();
+    let id = store.list("/x").unwrap()[0].id;
+    // The crash happened after the answer was stored, before the result row.
+    let call = ChatMessage::assistant(MessageContent::from_tool_calls(vec![
+        serde_json::from_value(serde_json::json!({
+            "call_id": "call_ask",
+            "fn_name": "ask_user",
+            "fn_arguments": { "question": "Which file?" },
+        }))
+        .unwrap(),
+    ]));
+    store
+        .record_message(id, &call, MessageStatus::Complete)
+        .unwrap();
+    let question = store
+        .ask_question(
+            "/x",
+            Some(id),
+            2,
+            "call_ask",
+            "Which file?",
+            QuestionKind::Text,
+            &[],
+        )
+        .unwrap();
+    store
+        .resolve_question("/x", question, QuestionState::Answered, "blue")
+        .unwrap();
+
+    let loaded = resume_by_number(&store, "/x", 1).expect("the session resumes");
+    let results: Vec<(String, String)> = loaded
+        .messages
+        .iter()
+        .filter_map(|row| serde_json::from_str::<ChatMessage>(&row.payload).ok())
+        .flat_map(|message| {
+            message
+                .content
+                .tool_responses()
+                .iter()
+                .map(|response| (response.call_id.clone(), response.content.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        results,
+        vec![(
+            "call_ask".to_string(),
+            "The user answered: blue".to_string()
+        )],
+        "the durable answer comes back as the tool result, not an interruption"
+    );
+    assert!(loaded.pending_calls.is_empty());
 }
 
 #[test]

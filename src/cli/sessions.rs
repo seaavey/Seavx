@@ -332,7 +332,11 @@ pub fn resume_by_number(
             session.id
         ));
     }
-    Ok(session)
+    // The picker must recover a crash the same way `seavx resume` does.
+    store
+        .record_recovery(summary.id)
+        .map_err(|error| error.to_string())?;
+    store.load(summary.id).map_err(|error| error.to_string())
 }
 
 /// Full transcript with the header the spec asks for: id, title, model,

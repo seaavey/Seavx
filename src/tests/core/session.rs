@@ -702,6 +702,102 @@ fn recovery_writes_exactly_one_interrupted_row_per_missing_call() {
 }
 
 #[test]
+fn recovery_restores_resolved_question_results_instead_of_interrupting_them() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let session = store.create("ws", None, None).unwrap();
+    let calls = ChatMessage::assistant(MessageContent::from_tool_calls(vec![
+        tool_call("call-answer", "ask_user"),
+        tool_call("call-skip", "ask_user"),
+        tool_call("call-cancel", "ask_user"),
+    ]));
+    store
+        .record_message(session, &calls, MessageStatus::Complete)
+        .unwrap();
+    for (call, state, answer) in [
+        ("call-answer", QuestionState::Answered, "blue"),
+        ("call-skip", QuestionState::Skipped, ""),
+        ("call-cancel", QuestionState::Cancelled, ""),
+    ] {
+        let id = store
+            .ask_question(
+                "ws",
+                Some(session),
+                1,
+                call,
+                "Which?",
+                QuestionKind::Text,
+                &[],
+            )
+            .unwrap();
+        store.resolve_question("ws", id, state, answer).unwrap();
+    }
+
+    assert_eq!(store.record_recovery(session).unwrap(), 3);
+    assert_eq!(store.record_recovery(session).unwrap(), 0);
+    let loaded = store.load(session).unwrap();
+    let results: Vec<(String, String, MessageStatus)> = loaded.messages[1..]
+        .iter()
+        .map(|row| {
+            let message: ChatMessage = serde_json::from_str(&row.payload).unwrap();
+            let response = message.content.tool_responses()[0];
+            (
+                response.call_id.clone(),
+                response.content.clone(),
+                row.status,
+            )
+        })
+        .collect();
+    for (call, expected) in [
+        ("call-answer", "The user answered: blue"),
+        ("call-skip", "The user skipped the question."),
+        ("call-cancel", "The user cancelled the question."),
+    ] {
+        let (_, result, status) = results.iter().find(|row| row.0 == call).unwrap();
+        assert_eq!(status, &MessageStatus::Complete);
+        assert!(result.contains(expected), "{result}");
+    }
+}
+
+#[test]
+fn recovery_leaves_a_pending_question_for_the_human() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let session = store.create("ws", None, None).unwrap();
+    let calls = ChatMessage::assistant(MessageContent::from_tool_calls(vec![
+        tool_call("call-asked", "ask_user"),
+        tool_call("call-other", "read_file"),
+    ]));
+    store
+        .record_message(session, &calls, MessageStatus::Complete)
+        .unwrap();
+    store
+        .ask_question(
+            "ws",
+            Some(session),
+            1,
+            "call-asked",
+            "Which?",
+            QuestionKind::Text,
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(store.record_recovery(session).unwrap(), 1);
+    let loaded = store.load(session).unwrap();
+    let answered: Vec<String> = loaded.messages[1..]
+        .iter()
+        .filter_map(|row| super::response_call_id(&row.payload))
+        .collect();
+    assert_eq!(
+        answered,
+        vec!["call-other".to_string()],
+        "a question still waiting on the user is not a result"
+    );
+    assert_eq!(loaded.pending_calls, vec!["call-asked".to_string()]);
+}
+
+#[test]
 fn export_stays_valid_json_with_an_unparseable_payload() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("sessions.db");
@@ -2110,6 +2206,56 @@ fn a_pending_question_is_not_repaired_as_interrupted() {
 }
 
 #[test]
+fn a_fork_refuses_a_last_row_tool_call_without_a_result() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let source = store.create("ws", None, None).unwrap();
+    store.record_user(source, "finish a turn").unwrap();
+    store
+        .record_message(source, &assistant_text("finished"), MessageStatus::Complete)
+        .unwrap();
+    store.record_user(source, "start another turn").unwrap();
+    store
+        .record_message(
+            source,
+            &call_message(vec![tool_call("call-crash", "read_file")]),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+
+    let error = store.fork("ws", source, Some(4)).unwrap_err().to_string();
+    assert!(error.contains("inside a turn"), "{error}");
+}
+
+#[test]
+fn a_fork_refuses_a_call_left_dangling_in_the_prefix() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let source = store.create("ws", None, None).unwrap();
+    // The crashed turn's call has no result; the next turn finished cleanly.
+    store.record_user(source, "start a turn").unwrap();
+    store
+        .record_message(
+            source,
+            &call_message(vec![tool_call("call-crash", "read_file")]),
+            MessageStatus::Complete,
+        )
+        .unwrap();
+    store.record_user(source, "start another turn").unwrap();
+    store
+        .record_message(source, &assistant_text("finished"), MessageStatus::Complete)
+        .unwrap();
+
+    for boundary in [2, 4] {
+        let error = store
+            .fork("ws", source, Some(boundary))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inside a turn"), "{boundary}: {error}");
+    }
+}
+
+#[test]
 fn a_session_forks_its_prefix_and_leaves_the_source_alone() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
@@ -2459,6 +2605,15 @@ fn a_v4_database_fixture_migrates_to_v6_and_keeps_goals_tasks_and_events() {
 
     let events = store.events(1).unwrap();
     assert_eq!(events.len(), 1, "the session ledger keeps one row");
+    let goal_events: Vec<(Option<i64>, String)> = store
+        .connection()
+        .prepare("SELECT goal_id, status FROM agent_events WHERE session_id IS NULL")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(goal_events, vec![(Some(1), "active".to_string())]);
 
     // The rebuilt ledger admits the new `question` kind, so v5 can write it.
     store

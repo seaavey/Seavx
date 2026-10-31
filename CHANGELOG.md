@@ -150,6 +150,25 @@ test` for a Cargo manifest, `npm test --silent` for a package manifest), shows
   `seaavey/thinking-orbs-rs` and one state word (`working`, `thinking`,
   `streaming`), never the command being run: the transcript shows the call and
   `/status` names it. The orb is still while idle.
+- `/review` reads the paths Git reported literally, so a file named `:(top).env`
+  cannot pull a withheld `.env` into the diff; a target whose changes are all
+  withheld says so and counts them, and reviewing a root commit includes the
+  changes that commit made.
+- Resume — `seavx resume`, `seavx sessions resume` and the TUI picker — rebuilds
+  a clarification's result from the stored answer instead of interrupting it,
+  and leaves a question that is still pending alone.
+- `fork` refuses a prefix in which an assistant row has a tool call without its
+  result, not only a boundary row.
+- Esc on `ask_user` cancels the turn: the remaining calls in the same response
+  never run.
+- A turn stopped by the same error twice records that call's failed event and
+  its result before returning the summary.
+- `/test` and every `/goal` operation hold the TUI busy until they finish, so a
+  second prompt cannot run beside them; the goal prompt starts once the slot is
+  free.
+- `/test <extra>` is a usage error instead of running the proposed suite.
+- Rebuilding the `agent_events` table keeps each event's `goal_id` instead of
+  nulling it.
 
 ### tests
 

@@ -102,6 +102,11 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             goal,
             start,
         } => {
+            // Free the slot the goal operation held before a prompt is
+            // submitted, or the busy check would refuse the goal's own turn.
+            if app.status == AgentState::Checking {
+                app.status = AgentState::Idle;
+            }
             app.goal = goal;
             match result {
                 Ok(text) => app.push_notice(text),
@@ -321,7 +326,8 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             evidence,
             changed,
         } => {
-            app.status = AgentState::Idle;
+            // The app stays busy: the command still has to run, and a second
+            // turn must not start beside it. `TestDone` frees the slot.
             app.push_notice(format!(
                 "Proposed: {command}\n{evidence} ({changed} changed file(s))."
             ));
