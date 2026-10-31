@@ -835,7 +835,7 @@ fn resending_a_pending_prompt_creates_one_row_and_one_request() {
 }
 
 #[test]
-fn esc_cancels_while_busy_and_quits_only_when_idle() {
+fn esc_cancels_while_busy_and_never_quits() {
     let mut busy = test_app();
     busy.status = AgentState::Streaming;
     busy.escape();
@@ -847,9 +847,10 @@ fn esc_cancels_while_busy_and_quits_only_when_idle() {
         "the worker owns the status"
     );
 
+    // Idle, Esc is not a way out any more.
     let mut idle = test_app();
     idle.escape();
-    assert!(idle.should_quit, "Esc quits when nothing is running");
+    assert!(!idle.should_quit, "Ctrl+C is the only exit");
 
     // With a popup on screen, Esc closes it and touches neither.
     let mut popup = test_app();
@@ -1164,16 +1165,16 @@ fn quitting_is_never_blocked_by_a_pending_permission() {
 
     let ctrl = |code: KeyCode| KeyEvent::new(code, KeyModifiers::CONTROL);
     assert!(
-        quit_shortcut(&mut app, &ctrl(KeyCode::Char('d'))),
-        "Ctrl+D quits while a question is on screen"
+        !quit_shortcut(&mut app, &ctrl(KeyCode::Char('d'))),
+        "Ctrl+D is not an exit"
     );
-    assert!(app.should_quit);
+    assert!(!app.should_quit);
     // The question was not answered: the dropped reply is the denial.
     assert!(app.pending_permission.is_some());
 
     let mut app = test_app();
-    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('q'))));
-    assert!(app.should_quit);
+    assert!(!quit_shortcut(&mut app, &ctrl(KeyCode::Char('q'))));
+    assert!(!app.should_quit, "Ctrl+Q is not an exit either");
 }
 
 #[test]
@@ -1324,9 +1325,42 @@ async fn escape_closes_the_ghost_then_the_popup_then_cancels_the_turn() {
     let mut idle = test_app();
     super::keys::handle(&mut idle, esc(), &tx).await;
     assert!(
-        idle.should_quit,
-        "Esc with nothing open and nothing running quits"
+        !idle.should_quit,
+        "Esc with nothing open and nothing running does not quit"
     );
+}
+
+#[tokio::test]
+async fn a_second_esc_clears_the_line() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let mut app = test_app();
+    app.set_input("half typed");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert_eq!(app.input_text(), "half typed", "one press only arms");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert_eq!(app.input_text(), "", "the second press clears");
+}
+
+#[tokio::test]
+async fn typing_between_two_esc_presses_keeps_the_line() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let mut app = test_app();
+    app.set_input("first");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    super::keys::handle(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        &tx,
+    )
+    .await;
+    super::keys::handle(&mut app, esc(), &tx).await;
+
+    assert_eq!(app.input_text(), "firstx", "a key between them disarms");
 }
 
 #[tokio::test]
@@ -2157,4 +2191,88 @@ async fn typing_with_the_picker_open_stays_in_the_filter() {
         Some(ModalSelection::Model { query, .. }) => assert_eq!(query, "/exit"),
         _ => panic!("the picker stays open while its filter is edited"),
     }
+}
+
+fn sample_image() -> crate::session::Attachment {
+    let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 9, 9, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encode");
+    crate::session::Attachment::new(
+        "image-001.png".to_string(),
+        "image/png".to_string(),
+        2,
+        2,
+        bytes.into_inner(),
+        crate::session::PasteSource::Clipboard,
+    )
+}
+
+#[test]
+fn an_image_alone_is_a_turn() {
+    let mut app = test_app();
+    app.pending_attachments.push(sample_image());
+
+    assert!(
+        matches!(app.enter_action(""), EnterAction::Turn(_)),
+        "an empty line with an image is still a turn"
+    );
+    let request = app.submit_turn("").expect("an image alone is a turn");
+
+    assert_eq!(request.prompt, "");
+    assert_eq!(request.attachments.len(), 1);
+    assert!(
+        app.pending_attachments.is_empty(),
+        "the accepted turn took the image"
+    );
+    let text = transcript(&app);
+    assert!(
+        text.contains("[image #1 2\u{00d7}2 png"),
+        "the transcript labels the image: {text}"
+    );
+}
+
+#[test]
+fn a_typed_prompt_and_an_image_are_one_turn() {
+    let mut app = test_app();
+    app.pending_attachments.push(sample_image());
+
+    let request = app.submit_turn("what is this").expect("one turn");
+
+    assert_eq!(request.prompt, "what is this");
+    assert_eq!(
+        request.attachments.len(),
+        1,
+        "the image rides the same turn"
+    );
+}
+
+#[test]
+fn a_refused_turn_keeps_its_attachments() {
+    let mut app = test_app();
+    app.pending_attachments.push(sample_image());
+    app.status = AgentState::Thinking;
+
+    assert!(app.submit_turn("hello").is_none(), "a busy turn refuses");
+
+    assert_eq!(
+        app.pending_attachments.len(),
+        1,
+        "a refusal must not eat the image"
+    );
+}
+
+#[test]
+fn the_same_bytes_attach_once() {
+    let mut app = test_app();
+
+    paste::attach(&mut app, sample_image());
+    paste::attach(&mut app, sample_image());
+
+    assert_eq!(app.pending_attachments.len(), 1, "one chip per image");
+    assert!(
+        transcript(&app).contains("already attached as #1"),
+        "the second paste says where it went"
+    );
 }

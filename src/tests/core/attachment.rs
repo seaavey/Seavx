@@ -81,3 +81,43 @@ fn a_user_message_carries_the_text_and_one_part_per_image() {
         2
     );
 }
+
+#[test]
+fn a_resumed_transcript_shows_the_image_line() {
+    let message = user_message("look", &[attachment(png(4, 3))]);
+    let rendered = crate::session::render_messages(&[message]);
+
+    assert!(rendered.starts_with("User: look"), "{rendered}");
+    assert!(
+        rendered.contains("[image #1 4\u{00d7}3 png"),
+        "a resumed row must read like the live one: {rendered}"
+    );
+}
+
+#[test]
+fn the_stored_row_round_trips_the_image() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let attached = attachment(png(2, 2));
+
+    let (id, history) = crate::session::prepare_turn(
+        &store,
+        "ws",
+        "m",
+        None,
+        "look",
+        std::slice::from_ref(&attached),
+    )
+    .unwrap();
+
+    assert!(history.is_empty(), "the unanswered row is the draft");
+    let loaded = store.load(id).unwrap();
+    let row = loaded.messages.last().expect("the user row");
+    let payload: genai::chat::ChatMessage = serde_json::from_str(&row.payload).unwrap();
+    let parts = payload.content.parts();
+    assert_eq!(parts.len(), 2, "text then binary");
+    assert!(
+        matches!(parts[1], genai::chat::ContentPart::Binary(_)),
+        "the row carries the image, not a summary of it"
+    );
+}

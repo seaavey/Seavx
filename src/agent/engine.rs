@@ -766,6 +766,19 @@ fn redacted_value(value: &serde_json::Value) -> serde_json::Value {
 /// A loop that stops early still ends with one assistant row, so a resumed
 /// session can see why the turn ended instead of a completed turn with no
 /// answer. The reason is already redacted by the caller.
+/// One line, bounded. An error that carries a whole request body is logged as it
+/// is and shown as its first line, because a transcript is not a log file.
+pub(super) fn one_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    let mut chars = line.chars();
+    let short: String = chars.by_ref().take(160).collect();
+    if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
 fn report_stopped(
     on_message: &mut impl FnMut(&ChatMessage, MessageStatus),
     text: String,
@@ -1766,7 +1779,11 @@ impl AgentRuntime {
             return;
         };
         let req = ChatRequest::from_user(prompt);
-        let options = self.chat_options();
+        // Deliberately not `chat_options`: the evaluator asks for one short
+        // classification, and a reasoning budget turns it into extended thinking
+        // — which an anthropic-shaped proxy can answer without the block
+        // signature genai requires, failing the request outright.
+        let options = ChatOptions::default();
         let res = match client
             .exec_chat(self.config.model_name(), req, Some(&options))
             .await
@@ -1774,8 +1791,11 @@ impl AgentRuntime {
             Ok(res) => res,
             Err(err) => {
                 tracing::warn!(error = %err, "Skill synthesis skipped: evaluator request failed");
+                // One line: the error carries the whole request body, and that
+                // belongs in the log, not in the transcript.
                 event_sink(AgentEvent::Notice(format!(
-                    "skill evaluator request failed: {err}"
+                    "skill evaluator skipped: {}",
+                    one_line(&err.to_string())
                 )));
                 return;
             }

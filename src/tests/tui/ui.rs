@@ -343,6 +343,38 @@ fn the_footer_keeps_the_model_token_and_effort_columns_in_a_wide_frame() {
 }
 
 #[test]
+fn the_footer_drops_hints_before_it_clips_the_token_count() {
+    let mut app = test_app();
+    app.config.model = Some("rv/deepseek-ai/DeepSeek-V4.1-Flash-1017".to_string());
+    app.total_tokens = 1234;
+    app.prompt_tokens = 1234;
+
+    let footer = |width: u16| -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width).map(|x| buffer[(x, 23)].symbol()).collect()
+    };
+
+    // The pane this app opens in: the long model name alone must not eat the
+    // counter; the shortest hint tier gives way instead.
+    let narrow = footer(100);
+    assert!(narrow.contains("/128k"), "{narrow}");
+    assert!(narrow.contains("ctrl+c"), "{narrow}");
+
+    // Too narrow for any hint: they go, the data stays.
+    let tight = footer(60);
+    assert!(tight.contains("/128k"), "{tight}");
+    assert!(tight.contains("effort"), "{tight}");
+    assert!(!tight.contains("tab complete"), "{tight}");
+
+    // Narrower than the line itself: the model is the column that folds.
+    let tiny = footer(44);
+    assert!(tiny.contains('…'), "{tiny}");
+    assert!(tiny.contains("/128k"), "{tiny}");
+}
+
+#[test]
 fn streamed_reasoning_deltas_stay_in_one_paragraph() {
     let mut app = test_app();
     // The engine emits one delta per token, none of them ending in a newline.
@@ -884,4 +916,37 @@ fn scroll_counts_wrapped_rows_not_source_lines() {
     assert_eq!(app.scroll, bottom);
     let back = transcript_screen(&app, 40, 10);
     assert!(back.contains("THE-END"), "last row is off screen: {back}");
+}
+
+#[test]
+fn a_pending_image_is_drawn_above_the_prompt_not_in_the_transcript() {
+    let mut app = test_app();
+    let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    app.pending_attachments
+        .push(crate::session::Attachment::new(
+            "image-001.png".to_string(),
+            "image/png".to_string(),
+            2,
+            2,
+            bytes.into_inner(),
+            crate::session::PasteSource::Clipboard,
+        ));
+
+    let drawn = transcript_screen(&app, 90, 24);
+
+    assert!(drawn.contains("[image #1 2×2 png"), "{drawn}");
+    assert!(
+        !app.segments.iter().any(|segment| match segment {
+            crate::tui::app::Segment::Text(text) | crate::tui::app::Segment::Notice(text) =>
+                text.contains("image #1"),
+            crate::tui::app::Segment::Thinking(text) => text.contains("image #1"),
+        }),
+        "the strip is composer state, not transcript output"
+    );
+
+    // A short terminal keeps room for the prompt: the strip clips, not the box.
+    let short = transcript_screen(&app, 40, 12);
+    assert!(short.contains("Ask anything"), "the prompt box still draws");
 }

@@ -4,7 +4,7 @@ use std::time::Duration;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event as CEvent, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        Event as CEvent, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     execute,
@@ -46,7 +46,9 @@ pub(super) fn redraw_interval(app: &App) -> Duration {
 /// is what stopped a pasted newline from submitting a turn.
 pub(super) fn translate(event: CEvent) -> Option<Action> {
     match event {
-        CEvent::Key(key) => Some(Action::Key(key)),
+        // With keyboard enhancement on, one press arrives three times. Acting on
+        // the release would run the key twice: paste twice, toggle twice.
+        CEvent::Key(key) if key.kind != KeyEventKind::Release => Some(Action::Key(key)),
         CEvent::Mouse(mouse) => Some(Action::Mouse(mouse)),
         CEvent::Paste(text) => Some(Action::Paste(text)),
         _ => None,

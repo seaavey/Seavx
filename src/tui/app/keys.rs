@@ -438,6 +438,8 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
             }
         }
         _ => {
+            // Any other key disarms the second-Esc clear.
+            app.last_esc = None;
             app.reset_history_nav();
             // Cursor moves dismiss the ghost; edits regrow it.
             app.clear_ghost();
@@ -452,25 +454,27 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
 /// `Ctrl+V`/`Alt+V`: the read is bounded (see `clipboard::read`), and a clipboard
 /// that is empty or failed says so instead of doing nothing.
 async fn paste_from_clipboard(app: &mut App<'_>) {
-    match clipboard::read(&app.clipboard).await {
-        Ok(text) if text.is_empty() => app.push_notice("clipboard is empty"),
-        Ok(text) => paste::handle(app, &text),
+    let text = clipboard::read(&app.clipboard, |clipboard| clipboard.text()).await;
+    if let Ok(text) = &text
+        && !text.is_empty()
+    {
+        return paste::handle(app, text);
+    }
+    // No text on the clipboard: it may be holding an image.
+    match clipboard::read(&app.clipboard, |clipboard| clipboard.image()).await {
+        Ok(image) => paste::handle_image(app, image),
         Err(reason) => app.push_notice(format!("clipboard {reason}")),
     }
 }
 
-/// The three ways out of the TUI, checked before anything that could swallow a
-/// key: `Ctrl+D`/`Ctrl+Q` quit at once, `Ctrl+C` needs a second press within
-/// 1.5 s. Returns `true` when the key was consumed.
+/// The one way out of the TUI, checked before anything that could swallow a key:
+/// `Ctrl+C`, twice within 1.5 s. `Esc` never quits — it clears the line instead.
+/// Returns `true` when the key was consumed.
 pub(super) fn quit_shortcut(app: &mut App, key: &KeyEvent) -> bool {
     if !key.modifiers.contains(KeyModifiers::CONTROL) {
         return false;
     }
     match key.code {
-        KeyCode::Char('d') | KeyCode::Char('q') => {
-            app.should_quit = true;
-            true
-        }
         KeyCode::Char('c') => {
             if let Some(prev) = app.last_ctrl_c
                 && prev.elapsed() < std::time::Duration::from_millis(1500)

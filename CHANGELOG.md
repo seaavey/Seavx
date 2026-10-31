@@ -5,8 +5,33 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ## Unreleased
 
+### feat
+
+- An image on the clipboard is a turn attachment: `Ctrl+V` reads it on a worker
+  thread, encodes the pixels to PNG once, refuses anything over 24 MP or 4 MiB,
+  dedupes by SHA-256, labels it in the transcript as
+  `[image #1 1280×720 png 214 KiB]`, and sends it as a `Binary` part of the same
+  user message the session stores. The model sees the image; a resumed session
+  replays the same line. What waits on the next Enter is drawn on its own strip
+  above the prompt (newest three, clipped before the prompt box), never in the
+  transcript.
+
+### breaking
+
+- `Esc` no longer exits and `Ctrl+D`/`Ctrl+Q` are not shortcuts any more:
+  `Ctrl+C` twice within 1.5 s is the only way out of the TUI. `Esc` still closes
+  the ghost, an open menu and the running turn, and twice on an idle prompt it
+  clears the line.
+
 ### fix
 
+- Background requests no longer inherit the turn's reasoning budget: a session
+  title, a compaction summary and the skill evaluator are short transforms, and
+  a proxy adapter answers extended thinking without the block `signature` genai
+  requires, which failed the whole request. The evaluator's failure notice is
+  also one bounded line now, not the serialized request.
+- One key press runs once: `KeyEventKind::Release` is no longer translated into
+  an action, so `Ctrl+V` stopped pasting twice and toggling twice.
 - `Ctrl+V` and `Alt+V` paste text off the clipboard on every platform, read
   on a worker thread with a 2 s deadline so an unresponsive owner app cannot
   freeze the frame; an empty or failing clipboard says so instead of doing

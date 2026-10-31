@@ -236,7 +236,10 @@ pub async fn run_agent_worker(
             let title_session = session_id;
             let title_prompt = prompt.clone();
             let model_name = config.model.clone().unwrap_or_default();
-            let title_options = runtime.chat_options();
+            // Not `chat_options`: a title is one short line, and extended
+            // thinking on a proxy adapter can come back without the block
+            // signature genai requires.
+            let title_options = genai::chat::ChatOptions::default();
             tokio::spawn(async move {
                 let req = genai::chat::ChatRequest::from_user(format!(
                     "Generate a very short 3-5 word concise title for this task without punctuation or quotes:\n{}",

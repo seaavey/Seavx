@@ -3,6 +3,9 @@ use tui_textarea::TextArea;
 
 use clipboard::{Clipboard, SystemClipboard};
 
+/// How long a second `Esc` still counts as a double press.
+const ESC_CLEARS_IN: std::time::Duration = std::time::Duration::from_millis(1500);
+
 use crate::agent::engine::AgentMode;
 use crate::tui::event::{Action, AgentState};
 
@@ -158,6 +161,8 @@ pub struct App<'a> {
     dismissed_popup: Option<String>,
     pub toast: Option<(String, std::time::Instant)>,
     pub last_ctrl_c: Option<std::time::Instant>,
+    /// When `Esc` was last pressed, for the clear-the-line double press.
+    pub last_esc: Option<std::time::Instant>,
     /// The question the worker is blocked on, until the user answers it.
     pub pending_permission: Option<PendingPermission>,
     /// A clarification on screen; it owns the next key like a permission does.
@@ -479,6 +484,7 @@ impl<'a> App<'a> {
             dismissed_popup: None,
             toast: None,
             last_ctrl_c: None,
+            last_esc: None,
             pending_permission: None,
             pending_question: None,
             steer: std::sync::Arc::new(std::sync::Mutex::new(SteerSlot::default())),
@@ -540,15 +546,28 @@ impl<'a> App<'a> {
 
     /// Esc, in order: close the ghost, close a popup, cancel the running turn,
     /// and only quit when nothing else on screen claims the key.
+    /// `Esc` closes what is open, then cancels what runs; it never quits. Twice
+    /// while idle clears the line, the way a shell clears a half-typed command.
     pub fn escape(&mut self) {
         if self.ghost_active() {
             self.clear_ghost();
-        } else if self.popup_open() {
+            return;
+        }
+        if self.popup_open() {
             self.dismiss_popups();
-        } else if self.status != AgentState::Idle {
+            return;
+        }
+        if self.status != AgentState::Idle {
             self.cancel.cancel();
-        } else {
-            self.should_quit = true;
+            return;
+        }
+        let twice = self
+            .last_esc
+            .is_some_and(|previous| previous.elapsed() < ESC_CLEARS_IN);
+        self.last_esc = Some(std::time::Instant::now());
+        if twice && !self.input_text().is_empty() {
+            self.input = new_input();
+            self.reset_history_nav();
         }
     }
 }

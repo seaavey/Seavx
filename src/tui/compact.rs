@@ -54,7 +54,10 @@ impl ModelSummarizer {
         Self {
             client: runtime.client().cloned(),
             model: config.model_name().to_string(),
-            options: runtime.chat_options(),
+            // A summary is a long text transform, not a reasoning task, and a
+            // reasoning budget can come back without the block signature genai
+            // requires when the adapter is a proxy.
+            options: genai::chat::ChatOptions::default(),
         }
     }
 }

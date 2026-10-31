@@ -2276,3 +2276,20 @@ mod backend_seam {
         );
     }
 }
+
+#[test]
+fn a_failure_is_shown_as_one_bounded_line() {
+    let dump =
+        "Error while generating a ChatResponse\nRequest: {\"messages\":[...]}\nCause: signature";
+    let shown = crate::agent::engine::one_line(dump);
+
+    assert_eq!(
+        shown, "Error while generating a ChatResponse",
+        "first line only"
+    );
+
+    let long = format!("{}\nmore", "x".repeat(400));
+    let bounded = crate::agent::engine::one_line(&long);
+    assert_eq!(bounded.chars().count(), 161, "160 chars and the ellipsis");
+    assert!(bounded.ends_with('…'));
+}

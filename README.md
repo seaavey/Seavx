@@ -75,8 +75,8 @@ While you type, the prompt box completes from what you already wrote:
 - The newest match also grows back as a dimmed tail. `Tab`, `→` or `Enter`
   accepts it, and typing replaces it.
 - `Esc` closes the ghost suggestion, then an open menu, then cancels the
-  running turn; with nothing open or running it exits. `Ctrl+C` twice also
-  exits.
+  running turn; it never exits. Pressed twice on an idle prompt it clears the
+  line. `Ctrl+C` twice is the only way out.
 
 Prompts are kept per workspace in `.seavx/svx_history` (gitignored, newest 500),
 so recall survives restarts and picks up prompts written by another session.
@@ -202,8 +202,8 @@ produces them, rather than after the whole response arrives.
   prefix stays on screen and is stored with `partial` status, so a resumed
   session shows it and continues from there.
 - `Esc` cancels: it closes the ghost suggestion first, then an open menu, then
-  cancels the running turn, and only exits when nothing is open or running.
-  `Ctrl+C` twice still quits immediately.
+  cancels the running turn. It never quits; twice on an idle prompt clears the
+  input. `Ctrl+C` twice is the only way out.
 - A cancelled turn never looks complete. It ends with `System: cancelled`, the
   text received so far is kept as `partial` (or the row is `cancelled` when
   nothing arrived), and no further request is sent for it.

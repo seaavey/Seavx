@@ -30,6 +30,26 @@ fn a_paste_event_is_not_dropped() {
 }
 
 #[test]
+fn a_key_release_is_not_a_second_press() {
+    let press = CEvent::Key(crossterm::event::KeyEvent::new_with_kind(
+        crossterm::event::KeyCode::Char('v'),
+        crossterm::event::KeyModifiers::CONTROL,
+        crossterm::event::KeyEventKind::Press,
+    ));
+    let release = CEvent::Key(crossterm::event::KeyEvent::new_with_kind(
+        crossterm::event::KeyCode::Char('v'),
+        crossterm::event::KeyModifiers::CONTROL,
+        crossterm::event::KeyEventKind::Release,
+    ));
+
+    assert!(matches!(translate(press), Some(Action::Key(_))));
+    assert!(
+        translate(release).is_none(),
+        "a release would paste a second time"
+    );
+}
+
+#[test]
 fn a_paste_of_crlf_becomes_lf() {
     let (text, truncated) = sanitize("a\r\nb\rc").expect("not empty");
     assert_eq!(text, "a\nb\nc");
