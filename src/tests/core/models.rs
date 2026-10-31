@@ -55,6 +55,27 @@ fn fresh_cache_answers_both_readers() {
 }
 
 #[test]
+fn a_refused_credential_is_told_apart_from_a_bad_endpoint() {
+    let refused = status_error(reqwest::StatusCode::UNAUTHORIZED);
+    assert!(key_rejected(&refused), "{refused}");
+    assert!(
+        refused.contains("401"),
+        "the status stays in the message the user reads: {refused}"
+    );
+    assert!(key_rejected(&status_error(reqwest::StatusCode::FORBIDDEN)));
+    assert!(
+        !key_rejected(&status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR)),
+        "a 5xx may still be the URL, so the wizard must keep offering to save it"
+    );
+    assert!(
+        !key_rejected(
+            "HTTP request failed: error sending request for url (http://127.0.0.1:4010/v1/models)"
+        ),
+        "a port that happens to read 401 is not a refusal"
+    );
+}
+
+#[test]
 fn missing_or_unparsable_cache_answers_neither_reader() {
     let temp = tempfile::tempdir().unwrap();
     let manager = ModelManager::new(temp.path());

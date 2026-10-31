@@ -25,6 +25,12 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- `seavx setup` re-asks the API key when `/models` answers `401` or `403`: the
+  endpoint refused that credential, so the wizard says so and loops back to the
+  key prompt instead of offering `Save this endpoint anyway?`. Saving an endpoint
+  the check just rejected is what let a keyless provider be written, and the
+  model step then arrived with no key and an empty model list. `Save anyway?`
+  stays for every other failure, where a key cannot be the fix.
 - A model or effort change writes the config the loader actually reads: the
   workspace file when one exists, the global `~/.seavx/config.toml` otherwise.
   Before, `/model`, the model picker, `seavx model` and a permission approval all

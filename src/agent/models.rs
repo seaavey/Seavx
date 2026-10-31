@@ -26,6 +26,25 @@ pub fn check_model(list: &[String], name: &str) -> ModelCheck {
     }
 }
 
+/// The message a refused credential carries, so a caller can re-ask the key
+/// instead of offering to save an endpoint that cannot work.
+const KEY_REJECTED: &str = "the gateway rejected the key";
+
+/// True when `/models` refused the credential rather than the endpoint.
+pub fn key_rejected(error: &str) -> bool {
+    error.starts_with(KEY_REJECTED)
+}
+
+/// A non-success status as the error the wizard prints: 401/403 name the key,
+/// every other status may still be the URL.
+fn status_error(status: reqwest::StatusCode) -> String {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        format!("{KEY_REJECTED}: {status}")
+    } else {
+        format!("Gateway returned error status: {status}")
+    }
+}
+
 pub struct ModelManager {
     cache_dir: PathBuf,
     ttl: Duration,
@@ -148,7 +167,7 @@ impl ModelManager {
             .await
             .map_err(|e| format!("HTTP request failed: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("Gateway returned error status: {}", resp.status()));
+            return Err(status_error(resp.status()));
         }
 
         let json_val: serde_json::Value = resp

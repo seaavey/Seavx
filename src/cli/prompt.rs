@@ -38,7 +38,11 @@ pub fn secret(label: &str, current: &str) -> anyhow::Result<String> {
         read_masked_line()?
     } else {
         let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
+        // EOF is not a blank answer: the key prompt is re-asked until the
+        // gateway accepts it, and an unread line would loop there forever.
+        if io::stdin().read_line(&mut line)? == 0 {
+            anyhow::bail!("no more input on stdin while asking for {label}");
+        }
         println!();
         line.trim_end().to_string()
     };
