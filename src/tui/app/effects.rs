@@ -48,7 +48,10 @@ pub(super) fn run_goal(
             .iter()
             .find(|goal| matches!(goal.state.as_str(), "active" | "blocked" | "paused"));
         let draft = || goals.iter().find(|goal| goal.state.as_str() == "draft");
+        // The newest row last: `/goal show` must still open a finished goal, and
+        // the store refuses the verbs that do not apply to its state.
         live.or_else(draft)
+            .or_else(|| goals.first())
             .map(|goal| goal.id)
             .ok_or_else(|| "no goal yet; start one with /goal <objective>".to_string())
     };

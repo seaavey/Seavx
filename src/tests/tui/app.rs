@@ -1818,6 +1818,17 @@ fn criteria_can_be_satisfied_or_waived_so_a_goal_reaches_completed() {
     assert!(report.contains("completed"), "{report}");
     let goal = store.goal(workspace, id).unwrap();
     assert_eq!(goal.state, GoalState::Completed);
+
+    // A finished goal is neither live nor draft, and must still be readable.
+    let shown = run_goal(&store, workspace, GoalAction::Show(None), &mut start)
+        .expect("a completed goal is still inspectable");
+    assert!(shown.contains("completed"), "{shown}");
+    assert!(shown.contains("satisfied"), "{shown}");
+    // And the completion cannot be claimed a second time.
+    assert!(
+        run_goal(&store, workspace, GoalAction::Complete(None), &mut start).is_err(),
+        "a completed goal never completes again"
+    );
     let states: Vec<CriterionState> = goal.criteria.iter().map(|row| row.state).collect();
     assert_eq!(
         states,
