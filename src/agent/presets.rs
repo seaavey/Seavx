@@ -67,10 +67,6 @@ pub fn list_in(root: &Path, user: Option<&Path>) -> Vec<(String, PathBuf)> {
 
 /// Read one preset. Every refusal names the file and the reason; nothing is
 /// guessed and nothing partial is returned.
-#[cfg(test)]
-#[path = "../tests/agent/presets.rs"]
-mod tests;
-
 pub fn load(root: &Path, name: &str) -> Result<String, String> {
     load_in(root, user_dir().as_deref(), name)
 }
@@ -120,3 +116,7 @@ pub fn load_in(root: &Path, user: Option<&Path>, name: &str) -> Result<String, S
         "no preset named '{name}'; try /preset to list what is there"
     ))
 }
+
+#[cfg(test)]
+#[path = "../tests/agent/presets.rs"]
+mod tests;

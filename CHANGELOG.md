@@ -10,7 +10,7 @@ per landed change; no entry describes behaviour that is not in the code.
 - Every tool call has a typed lifecycle event (`queued`, `running`, `completed`,
   `failed`, `cancelled`) correlated by session, turn and provider call id, and
   stored in one append-only `agent_events` table (schema v3). Summaries are
-  redacted and capped at 512 bytes; a permission denial is never recorded as a
+  redacted and capped at 512 characters; a permission denial is never recorded as a
   completed call.
 - `/status` shows the current state, running tool, pending permission or
   question and the active goal. It works mid-turn and never dumps event history
@@ -34,9 +34,11 @@ per landed change; no entry describes behaviour that is not in the code.
   touching the cancellation token; `/queue <prompt>` holds one prompt until the
   turn succeeds and drops it on cancel or failure. Both refuse a second request
   while one is pending.
-- `/test` proposes the command the changed files actually justify, shows it,
-  and runs it only through the `run_command` permission prompt. Pass/fail comes
-  from the exit status; Cargo counts are parsed when present and reported as
+- `/test` proposes the command the changed files' manifest declares (`cargo
+  test` for a Cargo manifest, `npm test --silent` for a package manifest), shows
+  it, and runs it only after the permission matrix agrees: `deny` refuses, an
+  already-permitted category runs, and only `ask` prompts. Pass/fail comes from
+  the exit status; Cargo counts are parsed when present and reported as
   unavailable when the output was truncated or unrecognised.
 - `/sessions fork <id> [--at <n>]`, `archive <id>`, `unarchive <id>` and
   `find <text> [--all]` (schema v6: `parent_session_id`, `fork_seq`,
@@ -52,6 +54,22 @@ per landed change; no entry describes behaviour that is not in the code.
 
 - The `/sessions` picker reads the store on the blocking pool instead of the
   event thread, like every other store call.
+- `/goal criteria satisfy <n> <evidence>` and `/goal criteria waive <n>
+  <reason>`: a goal carrying criteria could not be completed before, because
+  nothing in the shipped commands could move a criterion out of `pending`.
+- `/test` runs through the permission matrix with the command's real kind, so
+  `tool_permissions = "deny"` refuses it instead of prompting and running.
+- A goal task is completed by a turn that succeeded, blocked by a failed turn
+  and cancelled by a cancel; `/tasks` no longer reports a failure as finished.
+- `fork` requires the end of a completed turn and defaults to the newest one, so
+  a fork never copies a tool call without its result or an unanswered prompt.
+- `/status` reports a pending clarification, not only a pending permission.
+- `/steer` is stored as the user row the model received, so a resumed session
+  never replays an answer to an instruction it does not contain.
+- `/review` fails when Git output could not be read to the end instead of
+  reviewing a truncated diff, and kills the Git process group on timeout.
+- Ask only annotates `path:line` tokens that name a file, so a clock time or a
+  URL port is left alone.
 
 ### tests
 

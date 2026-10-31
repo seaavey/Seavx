@@ -734,8 +734,6 @@ impl AgentRuntime {
         }
     }
 
-    /// Swap who answers `ask_user`. The TUI sets a human; `exec` keeps the
-    /// default, so a headless run never waits.
     /// Swap where steering comes from. Nothing is delivered mid-call: the loop
     /// reads it at a turn boundary, so a running tool is never interrupted.
     pub fn with_steering(
@@ -746,6 +744,8 @@ impl AgentRuntime {
         self
     }
 
+    /// Swap who answers `ask_user`. The TUI sets a human; `exec` keeps the
+    /// default, so a headless run never waits.
     pub fn with_questioner(
         mut self,
         questioner: std::sync::Arc<dyn crate::agent::questions::Questioner>,
