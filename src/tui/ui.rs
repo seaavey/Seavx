@@ -28,7 +28,7 @@ mod toast;
 
 // The child test module reaches these through `use super::*`.
 #[cfg(test)]
-pub(crate) use {conversation::transcript_lines, splash::SPLASH, status_line::Orb};
+pub(crate) use {conversation::transcript_lines, splash::SPLASH, status_line::orb_cells};
 
 pub fn render(app: &App, frame: &mut Frame) {
     let input_height = app.input_height();

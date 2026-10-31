@@ -2152,6 +2152,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "thinking-orbs-rs",
  "tokio",
  "toml",
  "toml_edit",
@@ -2530,6 +2531,14 @@ dependencies = [
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "thinking-orbs-rs"
+version = "0.1.0"
+source = "git+https://github.com/seaavey/thinking-orbs-rs?rev=5353e42e978d056bf1aaf0c6501341974ca41d72#5353e42e978d056bf1aaf0c6501341974ca41d72"
+dependencies = [
+ "crossterm",
 ]
 
 [[package]]

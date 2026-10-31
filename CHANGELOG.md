@@ -91,6 +91,10 @@ per landed change; no entry describes behaviour that is not in the code.
   transcript, the session line and `sessions show`. The permission prompt names
   the category the `a` key records and states the effect in words instead of
   repeating the arguments after "wants to runs the command".
+- The session line carries the session title, a five-cell orb from
+  `seaavey/thinking-orbs-rs` and one state word (`working`, `thinking`,
+  `streaming`), never the command being run: the transcript shows the call and
+  `/status` names it. The orb is still while idle.
 
 ### tests
 

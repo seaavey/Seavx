@@ -155,16 +155,39 @@ fn transcript_cache_tracks_content_and_width() {
 
 #[test]
 fn orb_animates_for_active_states_and_holds_idle() {
-    let distinct = |orb: Orb| {
+    let distinct = |state: AgentState| {
         (0..40u128)
-            .map(|i| orb.glyph(i * 45))
+            .map(|i| orb_cells(&state, i * 45))
             .collect::<std::collections::BTreeSet<_>>()
             .len()
     };
-    assert!(distinct(Orb::Breathing) > 1);
-    assert!(distinct(Orb::Composing) > 1);
-    assert!(distinct(Orb::Working) > 1);
-    assert_eq!(distinct(Orb::Idle), 1, "idle orb stays still");
+    assert!(distinct(AgentState::Thinking) > 1, "thinking moves");
+    assert!(distinct(AgentState::Streaming) > 1, "streaming moves");
+    assert!(
+        distinct(AgentState::ExecutingTool("run_command".to_string())) > 1,
+        "a running tool moves"
+    );
+    assert_eq!(distinct(AgentState::Idle), 1, "idle orb stays still");
+
+    // A blank orb reads as a broken status line: the crop must always find a
+    // glyph, in every state, at any tick.
+    for state in [
+        AgentState::Idle,
+        AgentState::Thinking,
+        AgentState::Streaming,
+        AgentState::Checking,
+        AgentState::Compacting,
+        AgentState::ExecutingTool("run_command".to_string()),
+    ] {
+        for i in 0..40u128 {
+            let cells = orb_cells(&state, i * 45);
+            assert!(
+                cells.chars().any(|cell| cell != ' '),
+                "{state:?} at {}ms drew nothing: {cells:?}",
+                i * 45
+            );
+        }
+    }
 }
 
 #[test]
@@ -723,10 +746,12 @@ fn the_at_popup_tags_folders_and_files() {
 }
 
 #[test]
-fn the_session_line_shows_title_and_state() {
+fn the_session_line_shows_the_title_and_a_short_state_only() {
     let mut app = test_app();
     app.session_title = Some("port the loader".to_string());
-    app.status = AgentState::ExecutingTool("read_file".to_string());
+    app.status = AgentState::ExecutingTool(
+        "run  cd /home/seaavey/Projects/Seavx && timeout 25 cargo clippy --all-targets".to_string(),
+    );
 
     let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
     terminal.draw(|frame| render(&app, frame)).unwrap();
@@ -739,11 +764,15 @@ fn the_session_line_shows_title_and_state() {
         .iter()
         .find(|line| line.contains("port the loader"))
         .expect("the session title keeps its row");
-    assert!(line.contains("read_file"), "the tool is named: {line:?}");
-    const ORBS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    assert!(line.contains("working"), "the state is one word: {line:?}");
     assert!(
-        ORBS.iter().any(|glyph| line.contains(glyph)),
-        "the working orb sits beside the state: {line:?}"
+        !line.contains("cargo clippy"),
+        "the running command stays out of the session line: {line:?}"
+    );
+    assert!(
+        line.chars()
+            .any(|cell| matches!(cell, '·' | '∘' | '•' | '●')),
+        "the orb sits beside the state: {line:?}"
     );
 }
 
