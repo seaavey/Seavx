@@ -700,6 +700,16 @@ pub fn status_text(app: &App) -> String {
             pending.request.tool, pending.request.effect
         ));
     }
+    if let Some(pending) = &app.pending_question {
+        // One bounded line: the question itself is on screen, and a status view
+        // that wraps into the transcript is what the reader cannot scan.
+        let first = pending.question.lines().next().unwrap_or_default();
+        lines.push(format!(
+            "waiting for an answer: {} ({})",
+            crate::agent::events::bounded(first, 80),
+            pending.kind.as_str()
+        ));
+    }
     let session = match (app.session_id, app.session_title.as_deref()) {
         (Some(id), Some(title)) => format!("{id} ({title})"),
         (Some(id), None) => id.to_string(),

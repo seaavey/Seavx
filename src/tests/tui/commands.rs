@@ -832,6 +832,52 @@ fn status_reports_a_pending_permission() {
 }
 
 #[test]
+fn status_reports_a_pending_question_on_one_bounded_line() {
+    let mut app = crate::tui::app::test_app();
+    app.pending_question = Some(crate::tui::app::PendingQuestion {
+        id: 4,
+        question: "Which file should I patch?\nand a second line".to_string(),
+        kind: crate::session::QuestionKind::Text,
+        options: Vec::new(),
+        selected: 0,
+        chosen: std::collections::BTreeSet::new(),
+        text: String::new(),
+        reply: None,
+    });
+
+    let text = status_text(&app);
+    assert!(text.contains("waiting for an answer"), "{text}");
+    assert!(text.contains("Which file should I patch?"), "{text}");
+    assert!(
+        !text.contains("second line"),
+        "a status row stays one line: {text}"
+    );
+}
+
+#[test]
+fn a_long_pending_question_is_capped_in_the_status_line() {
+    let mut app = crate::tui::app::test_app();
+    app.pending_question = Some(crate::tui::app::PendingQuestion {
+        id: 5,
+        question: "x".repeat(400),
+        kind: crate::session::QuestionKind::Single,
+        options: vec!["a".to_string()],
+        selected: 0,
+        chosen: std::collections::BTreeSet::new(),
+        text: String::new(),
+        reply: None,
+    });
+
+    let text = status_text(&app);
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("waiting for an answer"))
+        .expect("the question row is reported");
+    assert!(row.ends_with("(single)"), "{row}");
+    assert!(row.chars().count() < 120, "the row is bounded: {row}");
+}
+
+#[test]
 fn status_shows_persistence_only_when_degraded() {
     let mut app = crate::tui::app::test_app();
     app.session_id = Some(3);
