@@ -856,6 +856,80 @@ mod engine_seam {
         assert!(!temp.path().join("made.txt").exists());
     }
 
+    /// A stream that dies on its first chunk after sending only whitespace, and
+    /// can still answer the unstreamed retry.
+    #[derive(Clone, Default)]
+    struct BlankStreamBackend {
+        streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        sends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatBackend for BlankStreamBackend {
+        async fn send(
+            &self,
+            _model: &str,
+            _request: ChatRequest,
+            _options: Option<&ChatOptions>,
+        ) -> Result<ChatResponse, crate::agent::backend::BackendError> {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(response(MessageContent::from_text("answered unstreamed")))
+        }
+
+        async fn stream(
+            &self,
+            _model: &str,
+            _request: ChatRequest,
+            _options: Option<&ChatOptions>,
+            on_delta: &mut (dyn FnMut(crate::agent::backend::StreamDelta) + Send),
+        ) -> Result<ChatResponse, crate::agent::backend::BackendError> {
+            self.streams
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            on_delta(crate::agent::backend::StreamDelta::Token(
+                "\n\n\n\n".to_string(),
+            ));
+            Err(std::io::Error::other(
+                "JSON value extension error: PropertyNotFound(\"/delta/text\")",
+            )
+            .into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_sent_only_whitespace_still_gets_the_turn_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = BlankStreamBackend::default();
+        let mut config = AgentConfig::load_with_report_home(temp.path(), None, |_| None).0;
+        config.model = Some("fake-model".to_string());
+        config.max_turns = 4;
+        config.base_url = Some("https://gateway.test/v1/".to_string());
+        config.stream = true;
+        let security = WorkspaceSecurity::new(temp.path());
+        let runtime = AgentRuntime::with_backend(config, security, Box::new(backend.clone()));
+
+        let mut events = Vec::new();
+        let outcome = runtime
+            .execute_task(
+                ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await;
+
+        let answer = outcome.result.unwrap();
+        assert!(answer.contains("answered unstreamed"), "{answer}");
+        assert_eq!(backend.streams.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "whitespace alone must not spend the turn's retry"
+        );
+    }
+
     #[tokio::test]
     async fn a_tool_error_is_recorded_as_a_tool_failure() {
         let temp = tempfile::tempdir().unwrap();

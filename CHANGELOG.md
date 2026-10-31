@@ -37,6 +37,12 @@ per landed change; no entry describes behaviour that is not in the code.
   the global one; without it the wizard keeps writing `~/.seavx/config.toml`,
   and a workspace target is pre-filled from the config in effect so the key is
   offered again rather than asked for from scratch.
+- A stream that dies on a chunk the adapter cannot parse keeps the turn's one
+  retry when all it had sent was whitespace: only non-whitespace text counts as
+  output. The failure now reads as
+  `the provider sent a stream chunk this client cannot parse (cause logged).
+  Retry the turn; if it repeats, switch model or turn streaming off.` — the raw
+  JSON pointer stays in the log instead of the transcript.
 - Background requests no longer inherit the turn's reasoning budget: a session
   title, a compaction summary and the skill evaluator are short transforms, and
   a proxy adapter answers extended thinking without the block `signature` genai

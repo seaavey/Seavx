@@ -589,6 +589,13 @@ impl RetryBudget {
         self.output_seen = true;
     }
 
+    /// Whether the user already saw part of the answer. Whitespace never calls
+    /// [`Self::note_output`], so a stream that died before its first word still
+    /// owns the turn's one retry.
+    pub fn output_seen(&self) -> bool {
+        self.output_seen
+    }
+
     /// `true` when this trigger may be retried; a second call is always refused,
     /// so two triggers can never stack.
     pub fn spend(&mut self, _trigger: RetryTrigger) -> bool {
@@ -1122,16 +1129,18 @@ impl AgentRuntime {
 
             // First attempt: a stream when the config allows it, one plain
             // request otherwise. Both share the turn's single retry.
-            let mut got_delta = false;
             let mut streamed_thinking = false;
             let mut received = String::new();
             let attempt = async {
                 if self.config.stream {
                     let mut on_delta = |delta: StreamDelta| {
-                        got_delta = true;
-                        retry.note_output();
                         match delta {
                             StreamDelta::Token(token) => {
+                                // Whitespace is not an answer: an adapter that
+                                // dies on the first chunk must not burn the retry.
+                                if !token.trim().is_empty() {
+                                    retry.note_output();
+                                }
                                 received.push_str(&token);
                                 // Ask answers are shown once, after their
                                 // citations are validated; a delta would show
@@ -1177,7 +1186,7 @@ impl AgentRuntime {
 
             let response = match first {
                 Ok(response) => response,
-                Err(error) if got_delta => {
+                Err(error) if retry.output_seen() => {
                     // Output already left the sink: persisted, never resent.
                     if !received.trim().is_empty() {
                         on_message(&ChatMessage::assistant(&received), MessageStatus::Partial);
