@@ -346,6 +346,13 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Git leads its own group, so a helper it started dies with it. Without
+    // this, a timeout kills the pid and leaves the helper holding the pipe.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("git {}: {error}", args.first().unwrap_or(&"")))?;
@@ -363,8 +370,7 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + GIT_TIMEOUT;
     let status = loop {
         if overflow.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             return Err(cap_error(args));
         }
         match child.try_wait() {
@@ -373,8 +379,7 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 return Err(format!(
                     "git {} timed out after {}s",
                     args.first().unwrap_or(&""),
@@ -402,6 +407,19 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         });
     }
     Ok(out)
+}
+
+/// Kill the whole group Git leads, then reap it. A pid-only kill leaves a
+/// helper holding the pipe and the reader threads blocked on it.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn drain(

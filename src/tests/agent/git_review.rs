@@ -330,3 +330,51 @@ fn a_stream_that_ends_normally_reports_no_stop() {
     assert_eq!(buffer, b"+one\n");
     assert!(stop.is_none(), "{stop:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_killed_git_leaves_no_group_behind() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("member.pid");
+    // The same shape `run` spawns: a group leader with a child of its own.
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!("sleep 30 & echo $! > {}; wait", pid_path.display()))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command.process_group(0);
+    let mut child = command.spawn().expect("sh starts");
+
+    // Wait for the grandchild to name itself before killing anything.
+    let mut member = String::new();
+    for _ in 0..200 {
+        member = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        if !member.trim().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let member = member.trim().to_string();
+    assert!(!member.is_empty(), "the grandchild wrote its pid");
+
+    super::kill_tree(&mut child);
+
+    assert!(
+        child.try_wait().expect("waitable").is_some(),
+        "the child is reaped, not left a zombie"
+    );
+    // A killed member can sit as a zombie for a moment before init reaps it, so
+    // poll: a live `sleep 30` would still be there after the window.
+    let path = format!("/proc/{member}");
+    for _ in 0..100 {
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("a member of the group outlived the kill: pid {member}");
+}
