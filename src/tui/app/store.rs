@@ -1,4 +1,4 @@
-use super::{App, TurnRequest, new_input};
+use super::{App, PendingQuestion, TurnRequest, new_input};
 use crate::tui::event::AgentState;
 
 impl App<'_> {
@@ -61,8 +61,41 @@ impl App<'_> {
             // A draft from the session that was open would otherwise ride along.
             self.input = new_input();
         }
-        self.scroll = self.line_count();
+        self.scroll = self.max_scroll();
         self.auto_scroll = true;
+
+        // An open question comes back with the session. It is not an
+        // interruption: answering it appends the one result for its call.
+        self.pending_question = None;
+        if !session.pending_calls.is_empty()
+            && let Some(handle) = self.store.clone()
+        {
+            let workspace = crate::session::workspace_key();
+            let open = {
+                let guard = lock_store(&handle);
+                guard
+                    .open_questions(&workspace)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|question| question.session_id == Some(session.id))
+            };
+            if let Some(question) = open {
+                self.pending_question = Some(PendingQuestion {
+                    id: question.id,
+                    question: question.question.clone(),
+                    kind: question.kind,
+                    options: question.options.clone(),
+                    selected: 0,
+                    chosen: std::collections::BTreeSet::new(),
+                    text: String::new(),
+                    reply: None,
+                });
+                self.push_notice(format!(
+                    "Restored question {}: {}",
+                    question.id, question.question
+                ));
+            }
+        }
     }
 
     /// `/clear` and `/new`: a fresh session id, transcript and compaction
@@ -83,7 +116,8 @@ impl App<'_> {
     /// written by the worker, so the UI thread never waits on SQLite.
     pub fn submit_turn(&mut self, prompt: &str) -> Option<TurnRequest> {
         let prompt = prompt.trim().to_string();
-        if prompt.is_empty() {
+        // An image alone is a turn: only a turn with neither half is a no-op.
+        if prompt.is_empty() && self.pending_attachments.is_empty() {
             return None;
         }
         if let Some(reason) = self.read_only.clone() {
@@ -99,24 +133,37 @@ impl App<'_> {
             return None;
         }
 
-        self.remember_prompt(&prompt);
+        if !prompt.is_empty() {
+            self.remember_prompt(&prompt);
+        }
+        let attachments = std::mem::take(&mut self.pending_attachments);
         if !self.segments.is_empty() {
             self.push_text("\n\n");
         }
-        self.push_text(&format!("User: {prompt}\n\n"));
-        self.scroll = self.line_count();
+        let mut row = format!("User: {prompt}");
+        for (index, attachment) in attachments.iter().enumerate() {
+            row.push_str(&format!("\n[{}]", attachment.summary(index + 1)));
+        }
+        self.push_text(&format!("{row}\n\n"));
+        self.scroll = self.max_scroll();
         self.auto_scroll = true;
         self.status = AgentState::Thinking;
         self.input = new_input();
         self.reset_history_nav();
         // A cancelled turn must not poison the next one.
         self.cancel = crate::agent::cancel::CancelToken::new();
+        // Only an accepted turn takes a number, so a refusal above cannot leave
+        // a gap between the transcript and the stored trace.
+        self.turn_id += 1;
 
         Some(TurnRequest {
+            steer: self.steer.clone(),
             prompt,
             session_id: self.session_id,
+            turn_id: self.turn_id,
             store: self.store.clone(),
             cancel: self.cancel.clone(),
+            attachments,
         })
     }
 

@@ -28,7 +28,7 @@ mod toast;
 
 // The child test module reaches these through `use super::*`.
 #[cfg(test)]
-pub(crate) use {conversation::transcript_lines, splash::SPLASH, status_line::Orb};
+pub(crate) use {conversation::transcript_lines, splash::SPLASH, status_line::orb_cells};
 
 pub fn render(app: &App, frame: &mut Frame) {
     let input_height = app.input_height();
@@ -39,6 +39,9 @@ pub fn render(app: &App, frame: &mut Frame) {
     } else {
         0
     };
+    // Pending images get their own rows above the prompt, capped so a paste of
+    // ten never eats the transcript.
+    let attachment_height = app.pending_attachments.len().min(3) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -46,6 +49,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             Constraint::Min(3),                    // Conversation
             Constraint::Length(1),                 // Session title and agent state
             Constraint::Length(permission_height), // Permission question, when asked
+            Constraint::Length(attachment_height), // Pending images, above the prompt
             Constraint::Length(input_height),      // Prompt box
             Constraint::Length(1),                 // Footer: model, tokens, keys
         ])
@@ -54,8 +58,9 @@ pub fn render(app: &App, frame: &mut Frame) {
     let conversation = chunks[1];
     let status_bar = chunks[2];
     let permission_bar = chunks[3];
-    let input_area = chunks[4];
-    let footer = chunks[5];
+    let attachment_bar = chunks[4];
+    let input_area = chunks[5];
+    let footer = chunks[6];
 
     // 1. Header
     header::render(app, header, frame);
@@ -71,6 +76,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     // 4. Permission question: its own box above the composer, the tool and its
     // effect on one row, the four answers on the next.
     permission::render(app, permission_bar, frame);
+    composer::render_attachments(app, attachment_bar, frame);
     composer::render(app, input_area, frame);
 
     // 4b. Autocomplete overlays: slash menu, then `@` file/folder popup

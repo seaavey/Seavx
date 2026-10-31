@@ -51,11 +51,16 @@ seavx exec "Inspect Cargo.toml and list dependencies"
 
 ## 🧭 Modes
 
-- **Build** (default): all tools, including file writes and command execution.
-- **Plan**: read-only exploration; write and command tools are disabled.
+Four standing modes, cycled with `Ctrl+Tab` (`Shift+Tab` on terminals that do not report Ctrl+Tab):
 
-Use `/plan` to enter Plan Mode, `/plan off` to return to Build,
-or toggle with `Ctrl+Tab` (`Shift+Tab` on terminals that do not report Ctrl+Tab).
+- **Build** (default): all tools. A write inside the workspace and a command ask first, as `tool_permissions` says.
+- **Plan**: read-only exploration; write and command tools are disabled.
+- **Accept-edits**: a write inside the workspace runs without asking; a command and the network still ask.
+- **Auto**: a command and the network run without asking too.
+
+The matrix keeps its two floors in every mode: a write outside the workspace (memory files, skills) still asks, a destructive call is still refused, and a configured `tool_permissions = "deny"` is never lifted.
+
+`/plan` and `/plan off` jump straight between Plan and Build.
 
 ---
 
@@ -70,8 +75,8 @@ While you type, the prompt box completes from what you already wrote:
 - The newest match also grows back as a dimmed tail. `Tab`, `→` or `Enter`
   accepts it, and typing replaces it.
 - `Esc` closes the ghost suggestion, then an open menu, then cancels the
-  running turn; with nothing open or running it exits. `Ctrl+C` twice also
-  exits.
+  running turn; it never exits. Pressed twice on an idle prompt it clears the
+  line. `Ctrl+C` twice is the only way out.
 
 Prompts are kept per workspace in `.seavx/svx_history` (gitignored, newest 500),
 so recall survives restarts and picks up prompts written by another session.
@@ -117,6 +122,7 @@ stays session-free and writes nothing.
 ```bash
 seavx sessions list          # slug, age, messages, state, title
 seavx sessions show svx-2f124b69   # full transcript
+seavx sessions show svx-2f124b69 --events  # transcript plus the stored tool/turn trace
 seavx sessions export svx-2f124b69 > session.json
 seavx sessions resume svx-2f124b69 # open the TUI with that session
 seavx resume                 # list them and pick a number
@@ -196,8 +202,8 @@ produces them, rather than after the whole response arrives.
   prefix stays on screen and is stored with `partial` status, so a resumed
   session shows it and continues from there.
 - `Esc` cancels: it closes the ghost suggestion first, then an open menu, then
-  cancels the running turn, and only exits when nothing is open or running.
-  `Ctrl+C` twice still quits immediately.
+  cancels the running turn. It never quits; twice on an idle prompt clears the
+  input. `Ctrl+C` twice is the only way out.
 - A cancelled turn never looks complete. It ends with `System: cancelled`, the
   text received so far is kept as `partial` (or the row is `cancelled` when
   nothing arrived), and no further request is sent for it.
@@ -220,7 +226,7 @@ Configure a provider once per machine (base URL, API key, model, reasoning effor
 seavx setup providers
 ```
 
-This writes `~/.seavx/config.toml` with owner-only permissions. Before saving it calls the endpoint's `/models` and reports reachability, so a wrong URL or rejected key shows up immediately. A workspace `.seavx/config.toml` still takes precedence.
+`seavx setup` on its own runs the same wizard — providers is the only section, so the name is optional. This writes `~/.seavx/config.toml` with owner-only permissions. Before saving it calls the endpoint's `/models` and reports reachability, so a wrong URL or rejected key shows up immediately. A workspace `.seavx/config.toml` still takes precedence.
 
 Initialize project-local settings:
 
@@ -231,13 +237,14 @@ seavx init
 Configuration resides in `.seavx/config.toml`:
 
 ```toml
-model = "openai/gpt-4o-mini"
 max_turns = 100
-base_url = "https://api.openai.com/v1/"
+base_url = "https://your-gateway.example/v1/"
 api_key = "sk-..."
 reasoning_effort = "highx"
 stream = true
 ```
+
+No value here is built in: the endpoint and the model both come from `seavx setup` (or `seavx model`). A config that names no model is refused rather than sent to a provider you did not choose.
 
 `base_url` accepts any OpenAI-compatible endpoint. When a gateway routes several providers, prefix the model with its route (`<provider>/<model>`) and point `base_url` at that gateway.
 
@@ -246,7 +253,7 @@ stream = true
 ```bash
 seavx model
 # Or directly:
-seavx model openai/gpt-4o-mini --effort highx
+seavx model <provider>/<model> --effort highx
 ```
 
 ### TUI Slash Commands
@@ -262,7 +269,13 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/config get <key>`                           | Show one effective value with its source.                                                                                                                                                                                 |
 | `/config set [--global] <key> <value>`        | Validate and persist one key.                                                                                                                                                                                             |
 | `/config unset [--global] <key>`              | Remove one key.                                                                                                                                                                                                           |
-| `/plan [on\|off]`                             | Enter or leave Plan Mode.                                                                                                                                                                                                 |
+| `/plan [on\|off]`                             | Enter or leave Plan Mode. The standing mode is one of four, cycled with `Ctrl+Tab` (`Shift+Tab` as the fallback).                                                                                                         |
+| `/ask <question>`                             | Answer a question about the code in one read-only turn. Unavailable tools stay unavailable: no writes, no commands, no checkpoints, and the Plan/Build selection is untouched. Citations must point at a line this turn actually read; anything else is marked unverified.                                        |
+| `/review [working-tree\|staged\|commit <ref>\|base <ref>]` | Review a Git target without touching the index, worktree or refs. The diff is resolved on the host, bounded to 1 MiB with a 30-second Git timeout, and protected or symlinked paths are withheld (count only). Findings carry severity, evidence, path/line and confirmed-or-hypothesis; no test is claimed.     |
+| `/preset [name \| add <file.md>]`                  | Pick a prompt preset from a searchable list with a preview of its text, or load one by name into the next prompt. `/preset add <file.md>` copies that Markdown file into `.seavx/prompts/<stem>.md` (the `@` picker's `[file:…]` tag is accepted as the path), refusing a name that is already taken instead of overwriting it. A preset is static text from `.seavx/prompts/<name>.md` (project) or `~/.seavx/prompts/<name>.md` (user), project shadowing user. Names are restricted to letters, digits, `-` and `_`; symlinks, non-regular files and anything over 64 KiB are refused with the path and the reason. A preset can never change the mode, the permission policy or the security rules, and it never reaches the system prompt. |
+| `/test`                                        | Propose the test command the changed files justify — a `.rs` change or `Cargo.toml` in a Cargo workspace (`cargo test`), a script change or `package.json` in a package workspace (`npm test`); a docs-only change proposes nothing — and show it before anything runs. Execution goes through the same permission matrix as `run_command`: `deny` refuses, an already-permitted category runs, and only `ask` prompts, so a refusal is reported as *not run*, never as a failure. Pass/fail comes from the process exit status; Cargo's summary is parsed into passed/failed/ignored/not-run when present, and the counts say *unavailable* when the output was truncated or unrecognised. There is no automatic fix-and-retry loop. |
+| `/steer <text>`                                | Tell the running turn something. It is read at the next turn boundary — never mid-tool-call — and never through the cancellation token. The turn sees it as a user message and the session stores it as one, so a resumed session never shows an answer to an instruction it does not contain. One steer at a time; a second is refused with the reason. |
+| `/queue <prompt>`                              | Hold one prompt until the running turn finishes. It runs only after a success; a cancel or a failure drops it and says so. Memory only, never stored. |
 | `/clear`                                      | Clear the transcript and any compacted context.                                                                                                                                                                           |
 | `/new`                                        | Alias for `/clear`.                                                                                                                                                                                                       |
 | `/help`                                       | Show help and the command palette.                                                                                                                                                                                        |
@@ -271,8 +284,12 @@ Type `/` in the interactive prompt to list and run these commands:
 | `/memory [show\|project\|user\|path]` | Inspect persistent memory.                                                                                                                                                                                                                                   |
 | `/skills [list\|show <name>\|add <dir>\|install <url> [name...]\|remove <name> --yes\|path]` | List, inspect, install (from a directory or a git repository) or remove skills.                                                                                                                                                              |
 | `/undo`                                       | Restore files from the newest checkpoint and remove it; repeat to walk back. A file edited after the agent wrote it is left alone and named, so undo never overwrites newer work.                                         |
-| `/sessions [number]`                          | Pick a stored session with the arrow keys, or resume one by its number directly.                                                                                                                                          |
+| `/sessions [number]`                          | Pick a stored session with the arrow keys, or resume one by its number directly. `fork <id> [--at <n>]` copies a completed prefix into a new independent session; `archive <id>` / `unarchive <id>` hides or restores a row without deleting it; `find <text> [--all]` searches titles and messages literally in this workspace, 50 rows at most, with archived sessions only under `--all`. |
 | `/resume [number]`                            | Alias for `/sessions`.                                                                                                                                                                                                    |
+| `/goal <objective>`                           | Draft a durable goal for this workspace. Nothing runs until `/goal approve`; one active-or-blocked goal per workspace, and a refusal names the goal already holding it. The approved plan runs as one Build turn; `/goal complete` closes it once every criterion is satisfied with evidence or waived with a reason, and tasks are the plan, not the gate.                                                                                                                                                  |
+| `/goal edit [text]` / `/goal criteria add\|remove\|satisfy\|waive <n\|text>` / `/goal task add\|remove <n\|text>` | Edit a draft's objective, criteria and ordered task list, and move an approved goal's criteria: `criteria satisfy <n> <evidence>` records the proof, `criteria waive <n> <reason>` records the user's waiver. Only a draft is editable; approval is the only way to active, and completion needs every criterion satisfied with evidence or waived with a reason.                     |
+| `/tasks`                                      | List the current goal's ordered tasks and their states.                                                                                                                                                                                                                                   |
+| `/status`                                     | Show what the agent is doing right now: its state, the session, and whether persistence degraded. Works while a turn is running. No event history, arguments or output.                                                    |
 | `/exit`                                       | Quit the TUI.                                                                                                                                                                                                             |
 
 Permission keys, written by `/config set` and by the permission prompt itself:
@@ -338,6 +355,7 @@ query or userinfo.
   - `skill_view`: On-demand progressive disclosure skill loader.
   - `skill_write`: Create or fully rewrite a skill.
   - `skill_patch`: Exact string replacement inside an existing skill.
+  - `ask_user`: One structured question (single, multi, or free text) written to the store before it is shown. The turn pauses: no later tool call runs and no provider request starts until the answer arrives. Answer, skip and cancel each resolve once and produce exactly one correlated tool result; a restart restores the open question instead of inventing an interrupted result. Headless `exec` has no human, so it returns an explicit unavailable result instead of waiting.
 - **Batched edits**: one `apply_patch` call writes all its files or none. Each file is capped at 16 MB, a batch at 64 files and 128 MB of staged bytes; the checkpoint store keeps the newest 200 batches and never evicts a live one. Batch atomicity holds while the process lives; a crash is reported at the next start (`batch interrupted: …`) and undone with `/undo`. Nothing is rolled back automatically. A journal that cannot be appended after a rename is a commit failure, not a staging one: the files already renamed are put back and the error says which. A checkpoint whose manifest can no longer be read is reported (`batch checkpoint … is unreadable`) instead of being skipped.
 - **Autonomous Self-Improvement**: Post-task workflow evaluator with ≥ 75% confidence singularity gate, persisting reusable workflows to `.seavx/skills/`. Skills load from four roots in order — `.seavx/skills`, the repo's own `skills/`, `~/.seavx/skills`, `~/.agents/skills` — and a name found earlier shadows the same name later.
 

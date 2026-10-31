@@ -10,6 +10,7 @@
 - `skill_view`: Load a skill's full SKILL.md on demand (metadata index is already in context).
 - `skill_write`: Create a new skill or fully rewrite an existing one.
 - `skill_patch`: Surgical fix inside an existing skill via exact string replacement.
+- `ask_user`: Ask one structured question (single choice, multi choice, or free text) when a decision cannot be inferred from the workspace. The turn waits for the answer; every non-answer says plainly that no value may be assumed. Headless `exec` never waits.
 
 ## Editing contracts
 

@@ -25,12 +25,9 @@ pub(super) fn render(
     let items: Vec<ListItem> = visible
         .iter()
         .map(|model| {
-            let suffix = if model.as_str() == app.config.model {
-                " [active]"
-            } else {
-                ""
-            };
-            let style = if model.as_str() == app.config.model {
+            let active = Some(model.as_str()) == app.config.model.as_deref();
+            let suffix = if active { " [active]" } else { "" };
+            let style = if active {
                 Style::default().fg(Color::Cyan)
             } else {
                 Style::default().fg(Color::White)
@@ -41,10 +38,17 @@ pub(super) fn render(
 
     let title = if app.refreshing_models {
         // A spinner is the only sign of life while the gateway is
-        // slow; without it the frozen picker reads as a hang.
+        // slow; without it the frozen picker reads as a hang. The host
+        // says whose list is being fetched.
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = FRAMES[(millis / 80) as usize % FRAMES.len()];
-        format!(" Refreshing /models {frame} (Esc: close) ")
+        let host = app
+            .config
+            .base_url
+            .as_deref()
+            .map(crate::agent::models::ModelManager::domain_slug)
+            .unwrap_or_else(|| "no endpoint".to_string());
+        format!(" Fetching models from {host} {frame} (Esc: close) ")
     } else {
         // The filter is the picker's search box: type to narrow,
         // Backspace to widen.

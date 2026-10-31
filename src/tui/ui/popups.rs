@@ -12,8 +12,9 @@ use crate::tui::app::App;
 pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
     let matches = app.slash_matches();
     if !matches.is_empty() && !app.popups_dismissed() {
-        // Two border rows plus one row per command; the table is short enough to fit.
-        let menu_height = matches.len() as u16 + 2;
+        // Two border rows plus one row per command, capped to the space above
+        // the input: a 24-row terminal cannot show the whole table.
+        let menu_height = (matches.len() as u16 + 2).min(area.y.max(3));
         let menu_width = 62.min(frame.area().width.saturating_sub(4));
         let menu_y = area.y.saturating_sub(menu_height);
         let menu_area = Rect::new(area.x + 2, menu_y, menu_width, menu_height);
@@ -21,9 +22,14 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
         frame.render_widget(Clear, menu_area);
 
         let selected = app.slash_selected.min(matches.len() - 1);
+        // Scroll so the selected row stays on screen inside the capped height.
+        let rows = menu_height.saturating_sub(2) as usize;
+        let start = selected.saturating_sub(rows.saturating_sub(1));
         let items: Vec<ListItem> = matches
             .iter()
             .enumerate()
+            .skip(start)
+            .take(rows)
             .map(|(i, (cmd, desc))| {
                 let is_sel = i == selected;
                 let prefix = if is_sel { "> " } else { "  " };

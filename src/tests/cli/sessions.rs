@@ -1,8 +1,9 @@
 use crate::cli::sessions::{
-    export_text, list_text, parse_resume_number, relative_age, resume_target, session_rows,
-    show_text,
+    export_text, list_text, parse_resume_number, relative_age, resume_by_number, resume_target,
+    session_rows, show_text,
 };
-use crate::session::{MessageStatus, SessionStore};
+use crate::session::{MessageStatus, QuestionKind, QuestionState, SessionStore};
+use genai::chat::{ChatMessage, MessageContent};
 
 /// Two workspaces, one answered session each, same-second timestamps.
 fn fixture() -> (tempfile::TempDir, SessionStore) {
@@ -28,7 +29,7 @@ fn fixture() -> (tempfile::TempDir, SessionStore) {
 fn list_renders_columns_and_an_empty_message() {
     let (_dir, store) = fixture();
 
-    let text = list_text(&store, "/x").unwrap();
+    let text = list_text(&store, "/x", false).unwrap();
     let header = text.lines().next().unwrap();
     assert!(
         header.starts_with("slug"),
@@ -44,7 +45,7 @@ fn list_renders_columns_and_an_empty_message() {
     assert!(!text.contains("elsewhere"), "workspace filtered: {text}");
 
     assert_eq!(
-        list_text(&store, "/nowhere").unwrap(),
+        list_text(&store, "/nowhere", false).unwrap(),
         "No sessions yet for /nowhere.\n"
     );
 
@@ -60,7 +61,7 @@ fn list_renders_columns_and_an_empty_message() {
 fn unknown_id_names_the_list_command() {
     let (_dir, store) = fixture();
 
-    let error = show_text(&store, "/x", 999).unwrap_err();
+    let error = show_text(&store, "/x", 999, false).unwrap_err();
     assert_eq!(error, "Unknown session 999. Run 'seavx sessions list'.");
     let error = export_text(&store, "/x", 999).unwrap_err();
     assert_eq!(error, "Unknown session 999. Run 'seavx sessions list'.");
@@ -87,7 +88,7 @@ fn show_prints_the_header_and_the_transcript() {
         (summary.id, summary.slug.clone())
     };
 
-    let text = show_text(&store, "/x", id).unwrap();
+    let text = show_text(&store, "/x", id, false).unwrap();
     assert!(text.contains(&format!("Session {slug}")), "{text}");
     assert!(text.contains("older prompt"), "{text}");
     assert!(text.contains("payload format: genai-chat-v1"), "{text}");
@@ -100,13 +101,13 @@ fn show_and_export_refuse_a_session_from_another_workspace() {
     let id = store.list("/x").unwrap()[0].id;
 
     for error in [
-        show_text(&store, "/y", id).unwrap_err(),
+        show_text(&store, "/y", id, false).unwrap_err(),
         export_text(&store, "/y", id).unwrap_err(),
     ] {
         assert!(error.contains("/x"), "the error names the owner: {error}");
     }
 
-    assert!(show_text(&store, "/x", id).is_ok());
+    assert!(show_text(&store, "/x", id, false).is_ok());
     assert!(export_text(&store, "/x", id).is_ok());
 }
 
@@ -130,6 +131,62 @@ fn the_resume_prompt_accepts_only_a_number_it_printed() {
 }
 
 #[test]
+fn resume_by_number_restores_a_resolved_question_before_showing_it() {
+    let (_dir, store) = fixture();
+    let id = store.list("/x").unwrap()[0].id;
+    // The crash happened after the answer was stored, before the result row.
+    let call = ChatMessage::assistant(MessageContent::from_tool_calls(vec![
+        serde_json::from_value(serde_json::json!({
+            "call_id": "call_ask",
+            "fn_name": "ask_user",
+            "fn_arguments": { "question": "Which file?" },
+        }))
+        .unwrap(),
+    ]));
+    store
+        .record_message(id, &call, MessageStatus::Complete)
+        .unwrap();
+    let question = store
+        .ask_question(
+            "/x",
+            Some(id),
+            2,
+            "call_ask",
+            "Which file?",
+            QuestionKind::Text,
+            &[],
+        )
+        .unwrap();
+    store
+        .resolve_question("/x", question, QuestionState::Answered, "blue")
+        .unwrap();
+
+    let loaded = resume_by_number(&store, "/x", 1).expect("the session resumes");
+    let results: Vec<(String, String)> = loaded
+        .messages
+        .iter()
+        .filter_map(|row| serde_json::from_str::<ChatMessage>(&row.payload).ok())
+        .flat_map(|message| {
+            message
+                .content
+                .tool_responses()
+                .iter()
+                .map(|response| (response.call_id.clone(), response.content.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        results,
+        vec![(
+            "call_ask".to_string(),
+            "The user answered: blue".to_string()
+        )],
+        "the durable answer comes back as the tool result, not an interruption"
+    );
+    assert!(loaded.pending_calls.is_empty());
+}
+
+#[test]
 fn picker_rows_are_numbered_newest_first_and_carry_the_slug() {
     let (_dir, store) = fixture();
 
@@ -140,4 +197,144 @@ fn picker_rows_are_numbered_newest_first_and_carry_the_slug() {
     assert!(!rows[0].contains("elsewhere"), "{}", rows[0]);
 
     assert!(session_rows(&store, "/nowhere").unwrap().is_empty());
+}
+
+#[test]
+fn show_with_events_lists_the_trace_in_sequence_after_the_transcript() {
+    let (_dir, store) = fixture();
+    let id = store.list("/x").unwrap()[0].id;
+    for (turn, status, failure, call, summary) in [
+        (
+            1u64,
+            "queued",
+            None,
+            Some("call-9"),
+            "read_file(path=\"x\")",
+        ),
+        (1, "running", None, Some("call-9"), "read_file(path=\"x\")"),
+        (
+            1,
+            "completed",
+            None,
+            Some("call-9"),
+            "read_file(path=\"x\")",
+        ),
+        (1, "cancelled", Some("cleanup_unconfirmed"), None, ""),
+    ] {
+        store
+            .record_event(
+                id,
+                crate::session::NewEvent {
+                    turn_id: turn,
+                    kind: if call.is_some() { "tool" } else { "turn" },
+                    status,
+                    failure,
+                    tool_call_id: call,
+                    summary,
+                    pid: if call.is_none() { Some(4242) } else { None },
+                },
+            )
+            .unwrap();
+    }
+
+    let with_events = show_text(&store, "/x", id, true).unwrap();
+    // The transcript stays first and unchanged.
+    let transcript_at = with_events.find("older prompt").expect("transcript");
+    let trace_at = with_events.find("Trace:").expect("a trace section");
+    assert!(transcript_at < trace_at, "{with_events}");
+
+    let trace = &with_events[trace_at..];
+    let statuses: Vec<&str> = trace
+        .lines()
+        .filter_map(|line| {
+            ["queued", "running", "completed", "cancelled"]
+                .into_iter()
+                .find(|status| line.contains(status))
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        ["queued", "running", "completed", "cancelled"],
+        "rows come back in sequence: {with_events}"
+    );
+    assert!(trace.contains("call-9"), "{with_events}");
+    assert!(trace.contains("cleanup_unconfirmed"), "{with_events}");
+}
+
+#[test]
+fn show_without_events_is_byte_identical_to_the_plain_transcript() {
+    let (_dir, store) = fixture();
+    let id = store.list("/x").unwrap()[0].id;
+    store
+        .record_event(
+            id,
+            crate::session::NewEvent {
+                turn_id: 1,
+                kind: "turn",
+                status: "completed",
+                failure: None,
+                tool_call_id: None,
+                summary: "",
+                pid: None,
+            },
+        )
+        .unwrap();
+
+    let plain = show_text(&store, "/x", id, false).unwrap();
+    assert!(
+        !plain.contains("Trace:"),
+        "no trace without the flag: {plain}"
+    );
+    assert!(!plain.contains("completed"), "{plain}");
+    assert!(plain.contains("older prompt"), "{plain}");
+}
+
+#[test]
+fn fork_archive_and_search_are_reachable_from_the_cli() {
+    use crate::cli::sessions::search_text;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = SessionStore::open_at(&dir.path().join("sessions.db")).unwrap();
+    let id = store.create("/ws", None, Some("token parser")).unwrap();
+    let message = genai::chat::ChatMessage::user("look at the lexer");
+    store
+        .record_message(id, &message, MessageStatus::Complete)
+        .unwrap();
+
+    let hits = search_text(&store, "/ws", "lexer", false).unwrap();
+    assert!(hits.contains("token parser"), "{hits}");
+    assert!(
+        search_text(&store, "/ws", "missing", false)
+            .unwrap()
+            .contains("No session matches")
+    );
+
+    store.archive("/ws", id, true).unwrap();
+    assert!(
+        list_text(&store, "/ws", false)
+            .unwrap()
+            .contains("No sessions yet")
+    );
+    assert!(
+        list_text(&store, "/ws", true)
+            .unwrap()
+            .contains("token parser")
+    );
+    assert!(
+        search_text(&store, "/ws", "lexer", false)
+            .unwrap()
+            .contains("No session matches")
+    );
+    assert!(
+        search_text(&store, "/ws", "lexer", true)
+            .unwrap()
+            .contains("token parser")
+    );
+
+    store.archive("/ws", id, false).unwrap();
+    assert!(
+        list_text(&store, "/ws", false)
+            .unwrap()
+            .contains("token parser")
+    );
 }

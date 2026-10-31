@@ -38,15 +38,16 @@ impl ActionKind {
         }
     }
 
-    /// One-line effect sentence for the prompt, or for a denial message.
+    /// One-line effect, phrased to follow `wants to` in the prompt and
+    /// `Permission denied:` in a refusal.
     pub fn effect(self, detail: &str) -> String {
         match self {
-            ActionKind::Read => format!("reads {detail}"),
-            ActionKind::Write => format!("writes {detail} inside the workspace"),
-            ActionKind::GlobalWrite => format!("writes {detail} outside the workspace"),
-            ActionKind::Execute => format!("runs the command {detail}"),
-            ActionKind::Network => format!("reaches the network: {detail}"),
-            ActionKind::Destructive => format!("could destroy data: {detail}"),
+            ActionKind::Read => format!("read {detail}"),
+            ActionKind::Write => format!("write {detail} inside the workspace"),
+            ActionKind::GlobalWrite => format!("write {detail} outside the workspace"),
+            ActionKind::Execute => format!("run {detail}"),
+            ActionKind::Network => format!("reach the network at {detail}"),
+            ActionKind::Destructive => format!("destroy data in {detail}"),
         }
     }
 }
@@ -123,6 +124,49 @@ pub fn decide(mode: PermissionMode, permitted: &[ActionKind], kind: ActionKind) 
                 }
             }
         },
+    }
+}
+
+/// Ask the human for one action and honour the answer, including the two
+/// "remember this" answers. This is the half after [`decide`] said `Ask`: the
+/// agent loop and `/test` share it, so a category approval from either one
+/// records the same thing and a refusal reads the same.
+pub async fn approve(
+    confirm: &dyn Confirmer,
+    kind: ActionKind,
+    tool: &str,
+    detail: &str,
+    config_path: &Path,
+) -> Result<(), String> {
+    let denied = || format!("Permission denied: {}", kind.effect(detail));
+    let answer = confirm
+        .confirm(PermissionRequest::new(kind, tool, detail))
+        .await;
+    match answer {
+        Answer::Once => Ok(()),
+        Answer::Category => match crate::cli::config::append_permitted(config_path, kind) {
+            Ok(kinds) => {
+                tracing::info!(action = %kind.name(), ?kinds, "permitted action recorded");
+                Ok(())
+            }
+            // The user answered; a config that cannot record it must not turn
+            // an approval into a denial.
+            Err(error) => {
+                tracing::warn!(%error, action = %kind.name(), "could not record permitted action");
+                Ok(())
+            }
+        },
+        Answer::Unrestricted => {
+            if let Err(error) = crate::cli::config::set_value(
+                config_path,
+                crate::cli::config::ConfigKey::ToolPermissions,
+                "allow",
+            ) {
+                tracing::warn!(%error, "could not persist tool_permissions");
+            }
+            Ok(())
+        }
+        Answer::Deny => Err(denied()),
     }
 }
 

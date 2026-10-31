@@ -1,16 +1,23 @@
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
+use clipboard::{Clipboard, SystemClipboard};
+
+/// How long a second `Esc` still counts as a double press.
+const ESC_CLEARS_IN: std::time::Duration = std::time::Duration::from_millis(1500);
+
 use crate::agent::engine::AgentMode;
 use crate::tui::event::{Action, AgentState};
 
 mod actions;
+mod clipboard;
 mod completion;
 mod effects;
 mod input;
 mod keys;
 mod modal;
 mod mouse;
+mod paste;
 mod references;
 mod run;
 mod store;
@@ -38,7 +45,7 @@ pub(in crate::tui::app) use references::scan_workspace_entries_at;
 pub(in crate::tui::app) use modal::edit_query;
 #[cfg(test)]
 pub(in crate::tui::app) use modal::resolve_model_target;
-pub use modal::visible_models;
+pub use modal::{visible_models, visible_presets};
 // The worker stays reachable as `crate::tui::app::run_agent_worker` for both
 // submit paths and for callers outside the module.
 #[cfg(test)]
@@ -68,6 +75,14 @@ pub enum ModalSelection {
         options: Vec<&'static str>,
         selected: usize,
     },
+    /// Prompt presets: the name list, the preview of each one, and the search box.
+    /// The preview is read when the picker opens, never on the render path.
+    Preset {
+        names: Vec<String>,
+        previews: Vec<String>,
+        query: String,
+        selected: usize,
+    },
     /// One row per stored session, newest first: the order `/sessions <n>` reads.
     Session { rows: Vec<String>, selected: usize },
     /// The skills a fetched repository offers; `marked` is what Enter installs.
@@ -84,6 +99,8 @@ pub struct TranscriptCache {
     pub revision: u64,
     pub width: u16,
     pub lines: Vec<ratatui::text::Line<'static>>,
+    /// Rows those lines take once the widget wraps them: what scrolling counts.
+    pub rows: u16,
 }
 
 pub struct App<'a> {
@@ -92,6 +109,10 @@ pub struct App<'a> {
     /// agent's security policy both use.
     pub root: std::path::PathBuf,
     pub input: TextArea<'a>,
+    /// Injected so tests paste from a fake and production reads the real one.
+    pub clipboard: std::sync::Arc<dyn Clipboard>,
+    /// Images waiting on the next Enter; cleared by an accepted turn.
+    pub pending_attachments: Vec<crate::session::Attachment>,
     pub segments: Vec<Segment>,
     pub revision: u64,
     pub transcript_cache: std::cell::RefCell<Option<TranscriptCache>>,
@@ -109,8 +130,13 @@ pub struct App<'a> {
     ghost_typed: Option<usize>,
     /// Terminal width, refreshed each frame; fits ghost suggestions inside the box.
     pub terminal_width: u16,
+    /// Scroll offset in wrapped rows, the unit the widget paints in.
     pub scroll: u16,
     pub auto_scroll: bool,
+    /// Rows and viewport height of the last painted transcript. The scroll math
+    /// needs both, and only the frame knows them, so it leaves them here.
+    painted_rows: std::cell::Cell<u16>,
+    painted_height: std::cell::Cell<u16>,
     pub total_tokens: i32,
     pub prompt_tokens: i32,
     pub status: AgentState,
@@ -135,8 +161,16 @@ pub struct App<'a> {
     dismissed_popup: Option<String>,
     pub toast: Option<(String, std::time::Instant)>,
     pub last_ctrl_c: Option<std::time::Instant>,
+    /// When `Esc` was last pressed, for the clear-the-line double press.
+    pub last_esc: Option<std::time::Instant>,
     /// The question the worker is blocked on, until the user answers it.
     pub pending_permission: Option<PendingPermission>,
+    /// A clarification on screen; it owns the next key like a permission does.
+    pub pending_question: Option<PendingQuestion>,
+    /// The slot a `/steer` writes into; the worker reads it at each boundary.
+    pub steer: std::sync::Arc<std::sync::Mutex<SteerSlot>>,
+    /// A prompt held until the running turn succeeds. Memory only.
+    pub queued_prompt: Option<String>,
     /// The checkout the skill picker copied from; held so a candidate's source
     /// outlives the pick, and dropped when the picker is cancelled.
     pub pending_skills: Option<crate::cli::skills::Fetched>,
@@ -144,6 +178,11 @@ pub struct App<'a> {
     pub store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
     /// Session this transcript belongs to, `None` until the first prompt.
     pub session_id: Option<i64>,
+    /// 1-based number of the last submitted turn; the worker tags every stored
+    /// event with the turn it belongs to.
+    pub turn_id: u64,
+    /// The goal that holds this workspace, as `/status` shows it.
+    pub goal: Option<String>,
     /// One notice text when the store failed and the run continued unpersisted.
     pub persistence_error: Option<String>,
     /// Set when the loaded session cannot be appended to.
@@ -153,11 +192,17 @@ pub struct App<'a> {
 /// What the worker needs to run one turn: the raw prompt, the replayed history
 /// and the store handle the rows are written through.
 pub struct TurnRequest {
+    /// Shared with the UI so `/steer` can reach the running turn.
+    pub steer: std::sync::Arc<std::sync::Mutex<SteerSlot>>,
     pub prompt: String,
     pub session_id: Option<i64>,
+    /// The turn this request runs, so its events can be correlated.
+    pub turn_id: u64,
     pub store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
     /// This turn's cancel handle, shared with the UI thread.
     pub cancel: crate::agent::cancel::CancelToken,
+    /// Images the turn carries; each becomes a `Binary` part of the user row.
+    pub attachments: Vec<crate::session::Attachment>,
 }
 
 /// What Enter does with the line in the prompt.
@@ -174,6 +219,174 @@ pub enum EnterAction {
 pub struct PendingPermission {
     pub request: crate::agent::permissions::PermissionRequest,
     pub reply: tokio::sync::oneshot::Sender<crate::agent::permissions::Answer>,
+}
+
+/// A clarification on screen. `reply` is `None` when the question was restored
+/// from the store: no turn is waiting on it.
+pub struct PendingQuestion {
+    pub id: i64,
+    pub question: String,
+    pub kind: crate::session::QuestionKind,
+    pub options: Vec<String>,
+    pub selected: usize,
+    pub chosen: std::collections::BTreeSet<usize>,
+    pub text: String,
+    pub reply: Option<tokio::sync::oneshot::Sender<(crate::session::QuestionState, String)>>,
+}
+
+impl PendingQuestion {
+    /// The answer this view currently stands for.
+    pub fn outcome(&self) -> (crate::session::QuestionState, String) {
+        use crate::session::{QuestionKind, QuestionState};
+        match self.kind {
+            QuestionKind::Text => (QuestionState::Answered, self.text.clone()),
+            QuestionKind::Single => match self.options.get(self.selected) {
+                Some(option) => (QuestionState::Answered, option.clone()),
+                None => (QuestionState::Skipped, String::new()),
+            },
+            QuestionKind::Multi => {
+                let picked: Vec<String> = self
+                    .chosen
+                    .iter()
+                    .filter_map(|index| self.options.get(*index).cloned())
+                    .collect();
+                if picked.is_empty() {
+                    (QuestionState::Skipped, String::new())
+                } else {
+                    (QuestionState::Answered, picked.join(", "))
+                }
+            }
+        }
+    }
+}
+
+impl App<'_> {
+    /// Whether a steer is already waiting for the next boundary.
+    pub fn steer_waiting(&self) -> bool {
+        self.steer
+            .lock()
+            .map(|slot| slot.waiting.is_some())
+            .unwrap_or(false)
+    }
+
+    /// One steer at a time; a second would silently replace the first.
+    pub fn queue_steer(&self, text: String) {
+        if let Ok(mut slot) = self.steer.lock() {
+            slot.waiting = Some(text);
+        }
+    }
+}
+
+/// What the user said to a running turn, and whether the engine picked it up.
+#[derive(Default)]
+pub struct SteerSlot {
+    pub waiting: Option<String>,
+    pub applied: usize,
+}
+
+impl SteerSlot {
+    pub fn take(&mut self) -> Option<String> {
+        let text = self.waiting.take()?;
+        self.applied += 1;
+        Some(text)
+    }
+}
+
+/// Reads steering from the shared slot at each turn boundary. Never touches the
+/// cancellation token: steering redirects a running turn, it does not stop it.
+pub struct SharedSteer(pub std::sync::Arc<std::sync::Mutex<SteerSlot>>);
+
+impl crate::agent::steering::Steering for SharedSteer {
+    fn take(&self) -> Option<String> {
+        self.0.lock().ok()?.take()
+    }
+}
+
+/// Asks the human through the event loop; the worker waits on the oneshot.
+pub struct TuiQuestioner {
+    tx: mpsc::UnboundedSender<Action>,
+    store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
+    session: Option<i64>,
+    turn: u64,
+}
+
+impl TuiQuestioner {
+    pub fn new(
+        tx: mpsc::UnboundedSender<Action>,
+        store: Option<std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>>,
+        session: Option<i64>,
+        turn: u64,
+    ) -> Self {
+        Self {
+            tx,
+            store,
+            session,
+            turn,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::agent::questions::Questioner for TuiQuestioner {
+    async fn ask(
+        &self,
+        request: crate::agent::questions::QuestionRequest,
+    ) -> crate::agent::questions::QuestionAnswer {
+        use crate::agent::questions::QuestionAnswer;
+        use crate::session::QuestionState;
+
+        // Persist before anyone sees it: a crash after this point leaves a
+        // question the next start can restore.
+        let Some(store) = self.store.as_ref() else {
+            return QuestionAnswer::Unavailable;
+        };
+        let created = {
+            let guard = store::lock_store(store);
+            guard.ask_question(
+                &crate::session::workspace_key(),
+                self.session,
+                self.turn,
+                &request.call_id,
+                &request.question,
+                request.kind,
+                &request.options,
+            )
+        };
+        let Ok(id) = created else {
+            // Nothing durable was written, so showing it would create a question
+            // the next start cannot restore.
+            return QuestionAnswer::Unavailable;
+        };
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let sent = self.tx.send(Action::QuestionAsked {
+            id,
+            question: request.question.clone(),
+            kind: request.kind,
+            options: request.options.clone(),
+            reply,
+        });
+        if sent.is_err() {
+            return QuestionAnswer::Unavailable;
+        }
+
+        let (state, text) = match answer.await {
+            Ok(outcome) => outcome,
+            // The UI went away with the question on screen: cancel, do not guess.
+            Err(_) => (QuestionState::Cancelled, String::new()),
+        };
+        {
+            let guard = store::lock_store(store);
+            let _ = guard.resolve_question(&crate::session::workspace_key(), id, state, &text);
+        }
+
+        match state {
+            QuestionState::Answered => QuestionAnswer::Answered(text),
+            QuestionState::Skipped => QuestionAnswer::Skipped,
+            QuestionState::Cancelled => QuestionAnswer::Cancelled,
+            QuestionState::Pending => QuestionAnswer::Unavailable,
+        }
+    }
 }
 
 /// Answers asks through the event loop: the UI thread renders the question, the
@@ -237,6 +450,8 @@ impl<'a> App<'a> {
                 .root()
                 .to_path_buf(),
             input: new_input(),
+            clipboard: std::sync::Arc::new(SystemClipboard::default()),
+            pending_attachments: Vec::new(),
             segments: Vec::new(),
             revision: 0,
             transcript_cache: std::cell::RefCell::new(None),
@@ -250,6 +465,8 @@ impl<'a> App<'a> {
             terminal_width: 80,
             scroll: 0,
             auto_scroll: true,
+            painted_rows: std::cell::Cell::new(0),
+            painted_height: std::cell::Cell::new(0),
             total_tokens: 0,
             prompt_tokens: 0,
             status: AgentState::Idle,
@@ -267,10 +484,16 @@ impl<'a> App<'a> {
             dismissed_popup: None,
             toast: None,
             last_ctrl_c: None,
+            last_esc: None,
             pending_permission: None,
+            pending_question: None,
+            steer: std::sync::Arc::new(std::sync::Mutex::new(SteerSlot::default())),
+            queued_prompt: None,
             pending_skills: None,
             store: None,
             session_id: None,
+            turn_id: 0,
+            goal: None,
             persistence_error: None,
             read_only: None,
         }
@@ -294,8 +517,13 @@ impl<'a> App<'a> {
         if self.mode == mode {
             // A repeat is information, not a refusal: say what is already true.
             let label = match mode {
-                AgentMode::Plan => "Plan mode is already active",
                 AgentMode::Build => "Build mode is already active",
+                AgentMode::Plan => "Plan mode is already active",
+                AgentMode::AcceptEdits => "Accept-edits mode is already active",
+                AgentMode::Auto => "Auto mode is already active",
+                // Never reachable: the standing selection is one of the four.
+                AgentMode::Ask => "Ask is one turn at a time",
+                AgentMode::Review => "Review is one turn at a time",
             };
             self.push_mode_notice(label);
             return;
@@ -305,31 +533,41 @@ impl<'a> App<'a> {
         }
     }
 
-    pub fn toggle_mode(&mut self) {
-        let next = match self.mode {
-            AgentMode::Build => AgentMode::Plan,
-            AgentMode::Plan => AgentMode::Build,
-        };
-        self.request_mode(next);
+    /// `ctrl+tab` walks build, plan, accept-edits, auto and starts over.
+    pub fn cycle_mode(&mut self) {
+        self.request_mode(self.mode.next_standing());
     }
 
     fn push_mode_notice(&mut self, text: &str) {
         self.push_text(&format!("\nSystem: {text}\n"));
-        self.scroll = self.line_count();
+        self.scroll = self.max_scroll();
         self.auto_scroll = true;
     }
 
     /// Esc, in order: close the ghost, close a popup, cancel the running turn,
     /// and only quit when nothing else on screen claims the key.
+    /// `Esc` closes what is open, then cancels what runs; it never quits. Twice
+    /// while idle clears the line, the way a shell clears a half-typed command.
     pub fn escape(&mut self) {
         if self.ghost_active() {
             self.clear_ghost();
-        } else if self.popup_open() {
+            return;
+        }
+        if self.popup_open() {
             self.dismiss_popups();
-        } else if self.status != AgentState::Idle {
+            return;
+        }
+        if self.status != AgentState::Idle {
             self.cancel.cancel();
-        } else {
-            self.should_quit = true;
+            return;
+        }
+        let twice = self
+            .last_esc
+            .is_some_and(|previous| previous.elapsed() < ESC_CLEARS_IN);
+        self.last_esc = Some(std::time::Instant::now());
+        if twice && !self.input_text().is_empty() {
+            self.input = new_input();
+            self.reset_history_nav();
         }
     }
 }

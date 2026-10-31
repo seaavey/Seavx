@@ -61,11 +61,19 @@ async fn offline_skips_the_endpoint_probe() {
 #[tokio::test]
 async fn unauthorized_is_a_failure_and_404_is_a_warning() {
     let temp = tempdir().unwrap();
+    // The probe needs an endpoint to report on: none is filled in any more, so
+    // this workspace names one.
+    std::fs::create_dir_all(temp.path().join(".seavx")).unwrap();
+    std::fs::write(
+        temp.path().join(".seavx/config.toml"),
+        "base_url = \"https://gateway.test/v1/\"\n",
+    )
+    .unwrap();
     let unauthorized = FakeProbe {
         calls: AtomicUsize::new(0),
         result: ProbeResult::Unauthorized,
     };
-    let report = run_with_probe(options(temp.path()), &unauthorized).await;
+    let report = run_with_probe(options_with_home(temp.path()), &unauthorized).await;
     assert!(
         report
             .checks
@@ -77,7 +85,7 @@ async fn unauthorized_is_a_failure_and_404_is_a_warning() {
         calls: AtomicUsize::new(0),
         result: ProbeResult::NotFound,
     };
-    let report = run_with_probe(options(temp.path()), &not_found).await;
+    let report = run_with_probe(options_with_home(temp.path()), &not_found).await;
     assert!(
         report
             .checks
@@ -243,7 +251,7 @@ async fn doctor_reports_storage_permissions_and_streaming_without_secrets() {
     // A session database next to the config, at the path `home` resolves to.
     let store =
         crate::session::SessionStore::open_at(&workspace.join(".seavx/sessions.db")).unwrap();
-    crate::session::prepare_turn(&store, "ws", "m", None, "hello").unwrap();
+    crate::session::prepare_turn(&store, "ws", "m", None, "hello", &[]).unwrap();
     drop(store);
 
     let probe = FakeProbe {
@@ -364,7 +372,7 @@ async fn doctor_warns_when_the_schema_is_not_the_one_this_build_reads() {
     std::fs::create_dir_all(workspace.join(".seavx")).unwrap();
     let store =
         crate::session::SessionStore::open_at(&workspace.join(".seavx/sessions.db")).unwrap();
-    crate::session::prepare_turn(&store, "ws", "m", None, "hello").unwrap();
+    crate::session::prepare_turn(&store, "ws", "m", None, "hello", &[]).unwrap();
     // A newer build wrote this database: this one opens it read-only.
     store
         .connection()
@@ -412,4 +420,25 @@ async fn doctor_does_not_create_the_session_store_it_inspects() {
         !workspace.join(".seavx/sessions.db").exists(),
         "a read-only check must not create the store"
     );
+}
+
+/// With no endpoint configured there is no host to probe, and none to name.
+#[tokio::test]
+async fn doctor_without_an_endpoint_probes_no_host() {
+    let workspace = tempdir().unwrap();
+    let probe = FakeProbe {
+        calls: AtomicUsize::new(0),
+        result: ProbeResult::Ok { models: 3 },
+    };
+
+    let report = run_with_probe(options_with_home(workspace.path()), &probe).await;
+
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        0,
+        "no configured endpoint means no probe"
+    );
+    let endpoint = check(&report, "endpoint");
+    assert_eq!(endpoint.status, CheckStatus::Fail);
+    assert_eq!(endpoint.detail, "not set (run seavx setup)");
 }

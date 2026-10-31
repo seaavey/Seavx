@@ -12,6 +12,43 @@ use crate::cli::skills;
 use crate::tui::app::App;
 use crate::tui::event::AgentState;
 
+/// What `/goal` was asked to do. `id` defaults to the workspace's live goal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalAction {
+    New(String),
+    /// Replace the draft's objective, or show it when no text is given.
+    Edit(Option<String>),
+    CriteriaAdd(String),
+    CriteriaRemove(usize),
+    /// Satisfy a criterion with the evidence that proves it.
+    CriteriaSatisfy {
+        index: usize,
+        evidence: String,
+    },
+    /// Waive a criterion, which needs the user's reason.
+    CriteriaWaive {
+        index: usize,
+        reason: String,
+    },
+    TaskAdd(String),
+    TaskRemove(usize),
+    Approve,
+    Show(Option<i64>),
+    Pause(Option<i64>),
+    Resume(Option<i64>),
+    /// Mark a goal done; the store refuses until every criterion is settled.
+    Complete(Option<i64>),
+    Cancel(Option<i64>),
+}
+
+/// The session verbs that act on a stored session rather than open it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionsOp {
+    Fork { id: String, at: Option<i64> },
+    Archive { id: String, archived: bool },
+    Search { query: String, all: bool },
+}
+
 /// One command's identity, independent of how it is spelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandId {
@@ -19,6 +56,8 @@ pub enum CommandId {
     Compact,
     Config,
     Plan,
+    Ask,
+    Review,
     Clear,
     New,
     Help,
@@ -29,6 +68,13 @@ pub enum CommandId {
     Undo,
     Sessions,
     Resume,
+    Goal,
+    Tasks,
+    Test,
+    Preset,
+    Steer,
+    Queue,
+    Status,
     Exit,
 }
 
@@ -66,6 +112,42 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "/plan [on|off]",
         summary: "Enter plan mode (read-only)",
         id: CommandId::Plan,
+    },
+    CommandSpec {
+        name: "/ask",
+        usage: "/ask <question>",
+        summary: "Ask a question about the code, read-only, one turn",
+        id: CommandId::Ask,
+    },
+    CommandSpec {
+        name: "/review",
+        usage: "/review [working-tree|staged|commit <ref>|base <ref>]",
+        summary: "Review a git target and report findings, read-only",
+        id: CommandId::Review,
+    },
+    CommandSpec {
+        name: "/preset",
+        usage: "/preset [name | add <file.md>]",
+        summary: "Apply a prompt preset, or copy one in from a .md file",
+        id: CommandId::Preset,
+    },
+    CommandSpec {
+        name: "/test",
+        usage: "/test",
+        summary: "Propose the test command for the changed files, then run it",
+        id: CommandId::Test,
+    },
+    CommandSpec {
+        name: "/steer",
+        usage: "/steer <text>",
+        summary: "Tell the running turn something; applied at its next step",
+        id: CommandId::Steer,
+    },
+    CommandSpec {
+        name: "/queue",
+        usage: "/queue <prompt>",
+        summary: "Run this prompt after the current turn succeeds",
+        id: CommandId::Queue,
     },
     CommandSpec {
         name: "/clear",
@@ -117,8 +199,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/sessions",
-        usage: "/sessions [number]",
-        summary: "Pick a stored session, or resume one by its number",
+        usage: "/sessions [number] | fork <id> [--at <n>] | archive <id> | unarchive <id> | find <text> [--all]",
+        summary: "Pick a stored session, resume one, or fork, archive and search them",
         id: CommandId::Sessions,
     },
     CommandSpec {
@@ -126,6 +208,24 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "/resume [number]",
         summary: "Alias for /sessions",
         id: CommandId::Resume,
+    },
+    CommandSpec {
+        name: "/goal",
+        usage: "/goal <objective> | edit [text] | criteria add|remove|satisfy|waive <n|text> | task add|remove <n|text> | approve | show | pause | resume | complete | cancel [id]",
+        summary: "Draft, approve and track a durable goal",
+        id: CommandId::Goal,
+    },
+    CommandSpec {
+        name: "/tasks",
+        usage: "/tasks",
+        summary: "Show the current goal's ordered tasks",
+        id: CommandId::Tasks,
+    },
+    CommandSpec {
+        name: "/status",
+        usage: "/status",
+        summary: "Show what the agent is doing right now",
+        id: CommandId::Status,
     },
     CommandSpec {
         name: "/exit",
@@ -150,10 +250,46 @@ pub enum SlashCommand {
         effort: Option<String>,
     },
     Clear,
+    /// List presets, or preview and apply one to the next prompt.
+    Preset {
+        name: Option<String>,
+    },
+    /// Copy one Markdown file into the project presets.
+    PresetAdd {
+        path: String,
+    },
+    /// Propose and, once permitted, run the workspace's test command.
+    Test,
+    /// Fork, archive or search a stored session.
+    SessionsOp {
+        op: SessionsOp,
+    },
+    /// Talk to the turn that is running; delivered at its next safe boundary.
+    Steer {
+        text: String,
+    },
+    /// Hold a prompt until the running turn finishes successfully.
+    Queue {
+        prompt: String,
+    },
     /// Switch the runtime mode; the mode marker already shows the result.
     Plan {
         mode: AgentMode,
     },
+    /// One read-only question about the code. The standing mode is untouched.
+    Ask {
+        question: String,
+    },
+    /// One read-only review of a resolved Git target.
+    Review {
+        target: crate::agent::git_review::ReviewTarget,
+    },
+    /// Create, edit, approve, inspect or move a goal.
+    Goal {
+        action: crate::tui::commands::GoalAction,
+    },
+    /// Inspect the current goal's tasks.
+    Tasks,
     Help,
     Exit,
     Init,
@@ -174,6 +310,8 @@ pub enum SlashCommand {
     },
     /// Restore files from the newest checkpoint.
     Undo,
+    /// Compact, read-only view of the current state.
+    Status,
     /// Open the session picker, or resume one by its listed number.
     Sessions {
         index: Option<u32>,
@@ -195,15 +333,46 @@ pub enum SkillsAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandEffect {
     Handled,
-    SkillsAdd { dir: std::path::PathBuf },
-    SkillsRemove { name: String },
-    SkillsFetch { url: String, names: Vec<String> },
+    SkillsAdd {
+        dir: std::path::PathBuf,
+    },
+    SkillsRemove {
+        name: String,
+    },
+    SkillsFetch {
+        url: String,
+        names: Vec<String>,
+    },
     Quit,
     OpenModelPicker,
-    RunDoctor { offline: bool },
-    RunCompact { instructions: Option<String> },
+    RunDoctor {
+        offline: bool,
+    },
+    RunCompact {
+        instructions: Option<String>,
+    },
     RunUndo,
-    RunSessions { number: u32 },
+    RunSessions {
+        number: u32,
+    },
+    /// Submit one Ask turn; the worker runs it in `AgentMode::Ask`.
+    RunAsk {
+        question: String,
+    },
+    /// Resolve the target off the UI thread, then run one Review turn.
+    RunReview {
+        target: crate::agent::git_review::ReviewTarget,
+    },
+    /// One goal operation, run against the store off the UI thread.
+    RunGoal {
+        action: GoalAction,
+    },
+    RunSessionsOp {
+        op: SessionsOp,
+    },
+    RunTest,
+    /// Read the current goal's tasks.
+    RunTasks,
     OpenSessionPicker,
 }
 
@@ -255,6 +424,118 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         CommandId::Exit => no_args(&args, trimmed, SlashCommand::Exit),
         CommandId::Init => no_args(&args, trimmed, SlashCommand::Init),
         CommandId::Undo => no_args(&args, trimmed, SlashCommand::Undo),
+        CommandId::Status => no_args(&args, trimmed, SlashCommand::Status),
+        // Empty arguments mean `working-tree`; a bad form is a typo, not a run.
+        CommandId::Review => match crate::agent::git_review::parse_target(&args) {
+            Ok(target) => SlashCommand::Review { target },
+            Err(_) => SlashCommand::Unknown(trimmed.to_string()),
+        },
+        // The whole remainder is the question. A bare `/ask` still parses: it
+        // answers with its usage instead of reading as a typo.
+        CommandId::Tasks => no_args(&args, trimmed, SlashCommand::Tasks),
+        CommandId::Goal => match args.as_slice() {
+            // A bare `/goal` shows the current one, so the registry stays
+            // parseable without arguments like every other command.
+            [] => SlashCommand::Goal {
+                action: GoalAction::Show(None),
+            },
+            ["edit"] => SlashCommand::Goal {
+                action: GoalAction::Edit(None),
+            },
+            ["edit", objective @ ..] => SlashCommand::Goal {
+                action: GoalAction::Edit(Some(objective.join(" "))),
+            },
+            ["criteria", "add", text @ ..] if !text.is_empty() => SlashCommand::Goal {
+                action: GoalAction::CriteriaAdd(text.join(" ")),
+            },
+            ["task", "add", text @ ..] if !text.is_empty() => SlashCommand::Goal {
+                action: GoalAction::TaskAdd(text.join(" ")),
+            },
+            [kind @ ("criteria" | "task"), "remove", number] => match number.parse::<usize>() {
+                Ok(index) if index > 0 => SlashCommand::Goal {
+                    action: if *kind == "criteria" {
+                        GoalAction::CriteriaRemove(index - 1)
+                    } else {
+                        GoalAction::TaskRemove(index - 1)
+                    },
+                },
+                _ => SlashCommand::Unknown(trimmed.to_string()),
+            },
+            // A missing number, a zero index or a missing reason is a typo, not
+            // a new objective: these forms never fall through to `New`.
+            ["criteria", "satisfy", number, text @ ..] => {
+                match (number.parse::<usize>(), text.is_empty()) {
+                    (Ok(index), false) if index > 0 => SlashCommand::Goal {
+                        action: GoalAction::CriteriaSatisfy {
+                            index: index - 1,
+                            evidence: text.join(" "),
+                        },
+                    },
+                    _ => SlashCommand::Unknown(trimmed.to_string()),
+                }
+            }
+            ["criteria", "waive", number, text @ ..] => {
+                match (number.parse::<usize>(), text.is_empty()) {
+                    (Ok(index), false) if index > 0 => SlashCommand::Goal {
+                        action: GoalAction::CriteriaWaive {
+                            index: index - 1,
+                            reason: text.join(" "),
+                        },
+                    },
+                    _ => SlashCommand::Unknown(trimmed.to_string()),
+                }
+            }
+            ["approve"] => SlashCommand::Goal {
+                action: GoalAction::Approve,
+            },
+            [
+                verb @ ("show" | "pause" | "resume" | "cancel" | "complete"),
+                rest @ ..,
+            ] => {
+                let id = match rest {
+                    [] => None,
+                    [number] => match number.parse::<i64>() {
+                        Ok(id) if id > 0 => Some(id),
+                        _ => return Some(SlashCommand::Unknown(trimmed.to_string())),
+                    },
+                    _ => return Some(SlashCommand::Unknown(trimmed.to_string())),
+                };
+                let action = match *verb {
+                    "show" => GoalAction::Show(id),
+                    "pause" => GoalAction::Pause(id),
+                    "resume" => GoalAction::Resume(id),
+                    "complete" => GoalAction::Complete(id),
+                    _ => GoalAction::Cancel(id),
+                };
+                SlashCommand::Goal { action }
+            }
+            objective => SlashCommand::Goal {
+                action: GoalAction::New(objective.join(" ")),
+            },
+        },
+        CommandId::Ask => SlashCommand::Ask {
+            question: args.join(" "),
+        },
+        CommandId::Preset => match args.as_slice() {
+            [] => SlashCommand::Preset { name: None },
+            // `add` owns the rest of the line, so a tagged path with spaces in
+            // it survives. A bare `add` is a usage error, not the preset named
+            // "add": the subcommand takes that word.
+            ["add", rest @ ..] => SlashCommand::PresetAdd {
+                path: preset_add_path(&rest.join(" ")).unwrap_or_default(),
+            },
+            [name] => SlashCommand::Preset {
+                name: Some((*name).to_string()),
+            },
+            _ => SlashCommand::Unknown(trimmed.to_string()),
+        },
+        CommandId::Test => no_args(&args, trimmed, SlashCommand::Test),
+        CommandId::Steer => SlashCommand::Steer {
+            text: args.join(" "),
+        },
+        CommandId::Queue => SlashCommand::Queue {
+            prompt: args.join(" "),
+        },
         CommandId::Compact => SlashCommand::Compact {
             instructions: (!args.is_empty()).then(|| args.join(" ")),
         },
@@ -266,6 +547,37 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         // One grammar for both spellings; `/resume` is the alias.
         CommandId::Sessions | CommandId::Resume => match args.as_slice() {
             [] => SlashCommand::Sessions { index: None },
+            ["fork", id] => SlashCommand::SessionsOp {
+                op: SessionsOp::Fork {
+                    id: (*id).to_string(),
+                    at: None,
+                },
+            },
+            ["fork", id, "--at", at] => match at.parse::<i64>() {
+                Ok(at) if at > 0 => SlashCommand::SessionsOp {
+                    op: SessionsOp::Fork {
+                        id: (*id).to_string(),
+                        at: Some(at),
+                    },
+                },
+                _ => SlashCommand::Unknown(trimmed.to_string()),
+            },
+            [verb @ ("archive" | "unarchive"), id] => SlashCommand::SessionsOp {
+                op: SessionsOp::Archive {
+                    id: (*id).to_string(),
+                    archived: *verb == "archive",
+                },
+            },
+            ["find", rest @ ..] if !rest.is_empty() => {
+                let query = rest.join(" ");
+                let (query, all) = match query.strip_suffix(" --all") {
+                    Some(query) => (query.to_string(), true),
+                    None => (query, false),
+                };
+                SlashCommand::SessionsOp {
+                    op: SessionsOp::Search { query, all },
+                }
+            }
             [number] => match number.parse::<u32>() {
                 Ok(number) if number > 0 => SlashCommand::Sessions {
                     index: Some(number),
@@ -333,6 +645,19 @@ fn no_args(args: &[&str], raw: &str, command: SlashCommand) -> SlashCommand {
     }
 }
 
+/// The path `/preset add` was given. The `@` picker inserts a `[file:…]` tag,
+/// so the wrapper is prompt syntax and not part of the path.
+fn preset_add_path(raw: &str) -> Option<String> {
+    let raw = raw.trim().trim_start_matches('@');
+    let path = raw
+        .strip_prefix("[file:")
+        .or_else(|| raw.strip_prefix("[folder:"))
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(raw)
+        .trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
 /// `/config` has its own grammar: only `set`/`unset` accept `--global`, and
 /// only immediately after the verb, so a value may contain the word itself.
 fn parse_config(args: &[&str], raw: &str) -> SlashCommand {
@@ -385,6 +710,182 @@ fn parse_config(args: &[&str], raw: &str) -> SlashCommand {
     }
 }
 
+/// One compact line per fact: what the agent is doing, which session it is
+/// doing it in, and whether persistence degraded. `/status` is not a trace
+/// viewer, so it never lists stored events, arguments or output.
+pub fn status_text(app: &App) -> String {
+    let state = match &app.status {
+        AgentState::Idle => "idle".to_string(),
+        AgentState::Thinking => "thinking".to_string(),
+        AgentState::Streaming => "streaming".to_string(),
+        AgentState::ExecutingTool(tool) => format!("executing {tool}"),
+        AgentState::Checking => "checking the model".to_string(),
+        AgentState::Compacting => "compacting".to_string(),
+    };
+    let mut lines = vec![
+        format!("state: {state}"),
+        // The model is what a turn is spent on: `/status` names it or says it
+        // is missing, in which case every turn is refused.
+        format!(
+            "model: {}",
+            app.config.model.as_deref().unwrap_or("not set")
+        ),
+    ];
+    if let Some(pending) = &app.pending_permission {
+        lines.push(format!(
+            "waiting for permission: {} ({})",
+            pending.request.effect,
+            pending.request.kind.name()
+        ));
+    }
+    if let Some(pending) = &app.pending_question {
+        // One bounded line: the question itself is on screen, and a status view
+        // that wraps into the transcript is what the reader cannot scan.
+        let first = pending.question.lines().next().unwrap_or_default();
+        lines.push(format!(
+            "waiting for an answer: {} ({})",
+            crate::agent::events::bounded(first, 80),
+            pending.kind.as_str()
+        ));
+    }
+    let session = match (app.session_id, app.session_title.as_deref()) {
+        (Some(id), Some(title)) => format!("{id} ({title})"),
+        (Some(id), None) => id.to_string(),
+        (None, _) => "none".to_string(),
+    };
+    lines.push(format!("session: {session}"));
+    if let Some(goal) = &app.goal {
+        lines.push(format!("goal: {goal}"));
+    }
+    if let Ok(slot) = app.steer.lock() {
+        if let Some(text) = &slot.waiting {
+            lines.push(format!("steer: waiting ({text})"));
+        } else if slot.applied > 0 {
+            lines.push(format!("steer: {} applied", slot.applied));
+        }
+    }
+    if let Some(prompt) = &app.queued_prompt {
+        lines.push(format!("queued: {prompt}"));
+    }
+    if let Some(error) = &app.persistence_error {
+        lines.push(format!("persistence: degraded ({error})"));
+    }
+    lines.join("\n")
+}
+
+// ---- /test: propose, then verify ---------------------------------------
+
+/// The command a test run would use, with the evidence that justifies it.
+///
+/// A guess is not a proposal: the command is only offered when a manifest in
+/// the changed set (or at the root) actually declares tests.
+pub(crate) fn propose_test(
+    changed: &[String],
+    root_has_cargo: bool,
+    root_has_package: bool,
+) -> Option<(String, String)> {
+    // The command runs at the workspace root, so that manifest has to be there,
+    // and something it covers has to have changed. A README or a stylesheet does
+    // not justify running a suite.
+    let count = |suffix: &str| changed.iter().filter(|path| path.ends_with(suffix)).count();
+    let manifest = |name: &str| {
+        changed
+            .iter()
+            .any(|path| path == name || path.ends_with(&format!("/{name}")))
+    };
+
+    if root_has_cargo && (manifest("Cargo.toml") || count(".rs") > 0) {
+        let evidence = if manifest("Cargo.toml") {
+            "Cargo.toml changed".to_string()
+        } else {
+            format!("{} changed Rust file(s)", count(".rs"))
+        };
+        return Some(("cargo test".to_string(), evidence));
+    }
+
+    let scripts = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]
+        .iter()
+        .map(|suffix| count(suffix))
+        .sum::<usize>();
+    if root_has_package && (manifest("package.json") || scripts > 0) {
+        let evidence = if manifest("package.json") {
+            "package.json changed".to_string()
+        } else {
+            format!("{scripts} changed script file(s)")
+        };
+        return Some(("npm test --silent".to_string(), evidence));
+    }
+    None
+}
+
+/// Cargo's own summary, when it is there to read: passed, failed, ignored,
+/// not-run. Anything unrecognised or truncated answers `None` for every count;
+/// success is never inferred from text.
+pub(crate) fn summarize_test_output(
+    output: &str,
+    truncated: bool,
+) -> (Option<usize>, Option<usize>, Option<usize>, Option<usize>) {
+    if truncated {
+        return (None, None, None, None);
+    }
+    let Some(line) = output
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with("test result:"))
+    else {
+        return (None, None, None, None);
+    };
+    let number = |label: &str| -> Option<usize> {
+        let at = line.find(label)?;
+        line[..at]
+            .split_whitespace()
+            .last()
+            .and_then(|value| value.parse().ok())
+    };
+    let passed = number(" passed");
+    let failed = number(" failed");
+    let ignored = number(" ignored");
+    let not_run = number(" filtered out");
+    if passed.is_none() && failed.is_none() {
+        return (None, None, None, None);
+    }
+    (passed, failed, ignored, not_run)
+}
+
+/// The line the user reads after a `/test`.
+pub(crate) fn test_report(
+    command: &str,
+    status: Option<i32>,
+    output: &str,
+    truncated: bool,
+) -> String {
+    let (passed, failed, ignored, not_run) = summarize_test_output(output, truncated);
+    let verdict = match status {
+        Some(0) => "passed",
+        Some(_) => "failed",
+        None => "did not finish",
+    };
+    let counts = if passed.is_none() && failed.is_none() {
+        "counts unavailable (output truncated or unrecognised)".to_string()
+    } else {
+        format!(
+            "passed {}{} ignored {}{}",
+            passed.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+            failed.map(|n| format!(", failed {n}")).unwrap_or_default(),
+            ignored.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+            not_run
+                .map(|n| format!(", filtered out {n}"))
+                .unwrap_or_default()
+        )
+    };
+    format!(
+        "`{command}` {verdict} (exit {})\n{counts}",
+        status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
+}
+
 /// Apply a parsed command. Anything that needs the async event loop is
 /// returned as an effect instead of being performed here.
 pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
@@ -398,6 +899,41 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         // Mode switching reports its own refusal, so it skips the busy gate.
         SlashCommand::Plan { mode } => {
             app.request_mode(mode);
+            return CommandEffect::Handled;
+        }
+        // A running turn is exactly what the user is asking about.
+        SlashCommand::Status => {
+            app.push_notice(status_text(app));
+            return CommandEffect::Handled;
+        }
+        // Steering and queuing exist for a running turn, so they skip the gate
+        // that refuses everything else while one is busy.
+        SlashCommand::Steer { text } => {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                app.push_notice("Usage: /steer <text>".to_string());
+            } else if app.status == AgentState::Idle {
+                app.push_notice("No turn is running; send it as a prompt instead.".to_string());
+            } else if app.steer_waiting() {
+                app.push_notice("A steer is already waiting for the next step.".to_string());
+            } else {
+                app.queue_steer(text);
+                app.push_notice("Steer queued: delivered at the next safe boundary.");
+            }
+            return CommandEffect::Handled;
+        }
+        SlashCommand::Queue { prompt } => {
+            let prompt = prompt.trim().to_string();
+            if prompt.is_empty() {
+                app.push_notice("Usage: /queue <prompt>".to_string());
+            } else if app.status == AgentState::Idle {
+                app.push_notice("No turn is running; nothing to queue behind.".to_string());
+            } else if app.queued_prompt.is_some() {
+                app.push_notice("A prompt is already queued.".to_string());
+            } else {
+                app.queued_prompt = Some(prompt);
+                app.push_notice("Prompt queued: it runs only after this turn succeeds.");
+            }
             return CommandEffect::Handled;
         }
         _ => {}
@@ -469,6 +1005,41 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
         SlashCommand::Doctor { offline } => CommandEffect::RunDoctor { offline },
         SlashCommand::Compact { instructions } => CommandEffect::RunCompact { instructions },
         SlashCommand::Undo => CommandEffect::RunUndo,
+        SlashCommand::Review { target } => CommandEffect::RunReview { target },
+        SlashCommand::Goal { action } => CommandEffect::RunGoal { action },
+        SlashCommand::Tasks => CommandEffect::RunTasks,
+        SlashCommand::Ask { question } => {
+            if question.trim().is_empty() {
+                app.push_notice("Usage: /ask <question>".to_string());
+                CommandEffect::Handled
+            } else {
+                CommandEffect::RunAsk { question }
+            }
+        }
+        // Handled above the busy gate; unreachable here, but the match must
+        // still say so.
+        SlashCommand::Steer { .. } | SlashCommand::Queue { .. } => CommandEffect::Handled,
+        SlashCommand::Preset { name } => {
+            match name {
+                // No name means choose: the picker filters as the user types and
+                // shows the text before it is applied.
+                None => {
+                    app.open_preset_picker();
+                }
+                Some(name) => app.apply_preset(&name),
+            }
+            CommandEffect::Handled
+        }
+        SlashCommand::PresetAdd { path } => {
+            if path.is_empty() {
+                app.push_notice("Usage: /preset add <file.md>".to_string());
+            } else {
+                app.add_preset(&path);
+            }
+            CommandEffect::Handled
+        }
+        SlashCommand::SessionsOp { op } => CommandEffect::RunSessionsOp { op },
+        SlashCommand::Test => CommandEffect::RunTest,
         SlashCommand::Sessions { index } => match index {
             // The picker is the list: no number means "let me choose".
             None => CommandEffect::OpenSessionPicker,
@@ -478,7 +1049,10 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
             match config::init_workspace(std::path::Path::new(".")) {
                 Ok((path, true)) => {
                     app.config = AgentConfig::load(std::path::Path::new("."));
-                    app.push_notice(format!("Created default config at {}", path.display()));
+                    app.push_notice(format!(
+                        "Created default config at {} — no model yet: run `seavx setup`",
+                        path.display()
+                    ));
                 }
                 Ok((path, false)) => {
                     app.push_notice(format!("Config already exists at {}", path.display()));
@@ -494,9 +1068,10 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
             CommandEffect::Handled
         }
         // Handled before the busy gate above.
-        SlashCommand::Help | SlashCommand::Exit | SlashCommand::Plan { .. } => {
-            CommandEffect::Handled
-        }
+        SlashCommand::Help
+        | SlashCommand::Exit
+        | SlashCommand::Plan { .. }
+        | SlashCommand::Status => CommandEffect::Handled,
     }
 }
 

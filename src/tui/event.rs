@@ -4,12 +4,24 @@ use crate::cli::doctor::DoctorReport;
 
 #[derive(Debug)]
 pub enum Action {
-    Tick,
     Key(KeyEvent),
     Mouse(MouseEvent),
+    /// Bracketed paste: text the terminal handed over as one string, never as
+    /// keystrokes, so a pasted newline cannot submit a turn.
+    Paste(String),
     AgentToken(String),
+    /// One `/goal` or `/tasks` operation finished: its report, and the goal
+    /// line `/status` should show from now on.
+    GoalDone {
+        result: Result<String, String>,
+        goal: Option<String>,
+        /// Set when the approved plan should start one Build turn.
+        start: Option<String>,
+    },
+    /// `/review` finished resolving a Git target off the UI thread.
+    ReviewResolved(Result<crate::agent::git_review::ReviewInput, String>),
     AgentThinking(String),
-    AgentToolStart(String),
+    AgentTool(crate::agent::events::ToolEvent),
     /// The session the title belongs to: a late answer must not rename the
     /// session the user already started.
     AgentTitle {
@@ -49,8 +61,29 @@ pub enum Action {
     /// `/sessions`: the numbered list, or the reason it could not be read.
     /// `/sessions <n>`: the session to open, or the refusal with its reason.
     SessionResume(Result<crate::session::LoadedSession, String>),
+    /// The picker's rows, read off the event loop.
+    SessionPickerOpened(Result<Vec<String>, String>),
     /// A tool call needs an answer. The worker blocks on `reply`; dropping it
     /// (quit, panic) resolves as a denial.
+    /// A clarification, already persisted; the reply resolves it once.
+    QuestionAsked {
+        id: i64,
+        question: String,
+        kind: crate::session::QuestionKind,
+        options: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<(crate::session::QuestionState, String)>,
+    },
+    /// A `/test` proposal is on screen and waiting for the user's permission.
+    TestProposed {
+        command: String,
+        evidence: String,
+        changed: usize,
+    },
+    /// The result of a `/test` run, or the reason it did not run.
+    TestDone(String),
+    /// A `/sessions fork|archive|unarchive|find` finished: its report, or why
+    /// it did nothing.
+    SessionsOpDone(String),
     PermissionAsk {
         request: crate::agent::permissions::PermissionRequest,
         reply: tokio::sync::oneshot::Sender<crate::agent::permissions::Answer>,

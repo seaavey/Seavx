@@ -50,9 +50,24 @@ jobs:
       - name: Cargo check
         run: cargo check --all-targets
 
+  check-macos:
+    name: Check (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache Action
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo check
+        run: cargo check --all-targets
+
   build:
     name: Build (${{ matrix.os_name }})
-    needs: [check-and-test, check-windows]
+    needs: [check-and-test, check-windows, check-macos]
     # Every push to master produces a downloadable build; PRs only run the checks.
     if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
@@ -76,6 +91,14 @@ jobs:
             platform: windows-x86_64
             exe: seavx.exe
             binary_name: seavx-windows-x86_64.exe
+          # `install.sh` maps Darwin-arm64 to `latest/macos/arm64`, which the
+          # worker resolves through `latest-macos-arm64.json`.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            os_name: macos
+            platform: macos-arm64
+            exe: seavx
+            binary_name: seavx-macos-arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -158,3 +181,32 @@ jobs:
           files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-notes:
+    name: Release notes
+    needs: [build]
+    # The assets job above creates the release on a tag; this one writes its
+    # body, so a release always carries its counts, stats, PRs and contributors.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags and full history: the notes are the range between two tags.
+          fetch-depth: 0
+
+      - name: Write the release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: bash .github/scripts/release-notes.sh > release-notes.md
+
+      - name: Attach the body to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --notes-file release-notes.md

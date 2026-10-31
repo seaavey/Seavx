@@ -145,9 +145,48 @@ mod test_cases {
         assert_eq!(url, "http://custom-proxy.internal:8080/v1/");
 
         // Domain already having /v1
-        let (url, adapters) = normalize_base_url("https://api.openai.com/v1");
-        assert_eq!(url, "https://api.openai.com/v1/");
+        let (url, adapters) = normalize_base_url("https://openai.example/v1");
+        assert_eq!(url, "https://openai.example/v1/");
         assert!(adapters.contains(&AdapterKind::OpenAI));
+    }
+
+    #[test]
+    fn a_base_url_must_be_http_or_https_with_a_host() {
+        // The wiring convenience: a bare host is read as https.
+        assert_eq!(
+            crate::agent::engine::validate_base_url("seavx.ai.id").unwrap(),
+            "https://seavx.ai.id/v1/"
+        );
+        assert_eq!(
+            crate::agent::engine::validate_base_url("http://127.0.0.1:8080/v1/").unwrap(),
+            "http://127.0.0.1:8080/v1/"
+        );
+        assert_eq!(
+            crate::agent::engine::validate_base_url("HTTPS://gateway.example/v1").unwrap(),
+            "HTTPS://gateway.example/v1/"
+        );
+
+        for refused in [
+            "",
+            "   ",
+            "ftp://host/v1/",
+            "file:///etc/passwd",
+            "ws://host/v1/",
+            "https://",
+            "http://host with a space/v1/",
+            "/v1/",
+        ] {
+            assert!(
+                crate::agent::engine::validate_base_url(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+
+        // The refusal names the scheme, never the rest of the input.
+        let error = crate::agent::engine::validate_base_url("ftp://user:token@host/v1/")
+            .expect_err("a non-web scheme is refused");
+        assert!(error.contains("'ftp://'"), "{error}");
+        assert!(!error.contains("token"), "{error}");
     }
 
     #[test]
@@ -187,7 +226,7 @@ mod test_cases {
         let _ = std::fs::write(seavx_dir.join("config.toml"), toml_content);
 
         let config = crate::agent::engine::AgentConfig::load(&temp_dir);
-        assert_eq!(config.model, "test-model-xyz");
+        assert_eq!(config.model.as_deref(), Some("test-model-xyz"));
         assert_eq!(config.max_turns, 42);
         assert_eq!(config.api_key.as_deref(), Some("secret-test-key"));
 
@@ -331,6 +370,84 @@ mod test_cases {
     }
 
     #[test]
+    fn review_mode_exports_only_workspace_file_tools() {
+        assert_eq!(
+            tool_names(AgentMode::Review),
+            vec![
+                "list_directory".to_string(),
+                "read_file".to_string(),
+                "search_files".to_string()
+            ],
+            "review reads context through the workspace tools only"
+        );
+    }
+
+    #[test]
+    fn review_mode_denies_non_file_tools_at_dispatch() {
+        let registry = ToolRegistry::with_default_tools();
+        for name in [
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "run_command",
+            "save_memory",
+            "skill_view",
+            "skill_write",
+            "skill_patch",
+        ] {
+            let err = registry
+                .get_for_mode(name, AgentMode::Review)
+                .err()
+                .unwrap_or_else(|| panic!("{name} should be blocked in Review Mode"));
+            assert!(err.contains("disabled in Review Mode"), "{err}");
+        }
+        for name in ["read_file", "list_directory", "search_files"] {
+            assert!(registry.get_for_mode(name, AgentMode::Review).is_ok());
+        }
+    }
+
+    #[test]
+    fn ask_mode_exports_only_workspace_file_tools() {
+        assert_eq!(
+            tool_names(AgentMode::Ask),
+            vec![
+                "list_directory".to_string(),
+                "read_file".to_string(),
+                "search_files".to_string()
+            ],
+            "Ask is narrower than Plan: every citation must be workspace-validated"
+        );
+    }
+
+    #[test]
+    fn ask_mode_rejects_every_non_file_tool_at_dispatch() {
+        let registry = ToolRegistry::with_default_tools();
+        for name in [
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "run_command",
+            "save_memory",
+            "skill_view",
+            "skill_write",
+            "skill_patch",
+        ] {
+            let err = registry
+                .get_for_mode(name, AgentMode::Ask)
+                .err()
+                .unwrap_or_else(|| panic!("{name} should be blocked in Ask Mode"));
+            assert!(err.contains("disabled in Ask Mode"), "{err}");
+        }
+
+        for name in ["read_file", "list_directory", "search_files"] {
+            assert!(
+                registry.get_for_mode(name, AgentMode::Ask).is_ok(),
+                "{name} must stay reachable"
+            );
+        }
+    }
+
+    #[test]
     fn plan_mode_exports_only_read_only_tools() {
         assert_eq!(
             tool_names(AgentMode::Plan),
@@ -405,13 +522,16 @@ mod test_cases {
 #[cfg(test)]
 mod engine_seam {
     use crate::agent::backend::ChatBackend;
+    use crate::agent::cancel::TurnStatus;
     use crate::agent::engine::{AgentConfig, AgentMode, AgentRuntime};
-    use crate::agent::permissions::DenyingConfirmer;
+    use crate::agent::events::{AgentEvent, FailureKind, ToolEvent, ToolStatus};
+    use crate::agent::permissions::{Answer, Confirmer, DenyingConfirmer, PermissionRequest};
     use crate::agent::security::WorkspaceSecurity;
     use genai::adapter::AdapterKind;
     use genai::chat::{
         ChatMessage, ChatOptions, ChatRequest, ChatResponse, MessageContent, ToolResponse,
     };
+    use serde_json::json;
 
     pub(super) fn response(content: MessageContent) -> ChatResponse {
         let model = genai::ModelIden::new(AdapterKind::OpenAI, "fake-model");
@@ -488,12 +608,13 @@ mod engine_seam {
         }
     }
 
-    fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path) -> AgentRuntime {
+    pub(super) fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path) -> AgentRuntime {
         let mut config = AgentConfig::load(workspace);
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
         let security = WorkspaceSecurity::new(workspace);
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         AgentRuntime::with_backend(config, security, Box::new(backend.clone()))
     }
 
@@ -515,7 +636,7 @@ mod engine_seam {
         let mut reported: Vec<ChatMessage> = Vec::new();
         let answer = runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 history,
                 &DenyingConfirmer,
@@ -567,7 +688,7 @@ mod engine_seam {
         ];
         runtime
             .execute_task(
-                "now",
+                genai::chat::ChatMessage::user("now"),
                 AgentMode::Build,
                 history,
                 &DenyingConfirmer,
@@ -600,6 +721,802 @@ mod engine_seam {
         );
         assert_eq!(messages[3].content.tool_responses()[0].content, "file body");
         assert_eq!(messages[4].content.first_text(), Some("now"));
+    }
+
+    /// A confirmer that grants everything, for the tools that ask.
+    struct AllowingConfirmer;
+
+    #[async_trait::async_trait]
+    impl Confirmer for AllowingConfirmer {
+        async fn confirm(&self, _request: PermissionRequest) -> Answer {
+            Answer::Unrestricted
+        }
+    }
+
+    fn tool_call_with(
+        call_id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> genai::chat::ToolCall {
+        serde_json::from_value(json!({
+            "call_id": call_id,
+            "fn_name": name,
+            "fn_arguments": arguments,
+        }))
+        .unwrap()
+    }
+
+    fn tool_lifecycles(events: &[AgentEvent]) -> Vec<ToolEvent> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Tool(tool) => Some(tool.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_emits_one_correlated_lifecycle_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "body").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "read_file", json!({ "path": "note.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text("done")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let tool = tool_lifecycles(&events);
+        assert_eq!(
+            tool.iter().map(|event| event.status).collect::<Vec<_>>(),
+            [
+                ToolStatus::Queued,
+                ToolStatus::Running,
+                ToolStatus::Completed
+            ],
+            "{tool:?}"
+        );
+        for event in &tool {
+            assert_eq!(event.call_id, "call-1");
+            assert_eq!(event.name, "read_file");
+        }
+        let terminal = tool.last().unwrap();
+        assert!(terminal.elapsed.is_some(), "the terminal event is timed");
+        assert_eq!(terminal.failure, None);
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Turn {
+                    status: TurnStatus::Completed,
+                    failure: None,
+                    ..
+                })
+            ),
+            "the turn closes the stream once: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_tool_is_recorded_as_a_permission_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with(
+                "call-2",
+                "write_file",
+                json!({ "path": "made.txt", "content": "x" }),
+            ),
+        ])));
+        fake.push(response(MessageContent::from_text("gave up")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let tool = tool_lifecycles(&events);
+        let terminal = tool.last().expect("a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Failed);
+        assert_eq!(terminal.failure, Some(FailureKind::PermissionDenied));
+        assert!(
+            !tool
+                .iter()
+                .any(|event| event.status == ToolStatus::Completed),
+            "a denial never reads as success: {tool:?}"
+        );
+        assert!(!temp.path().join("made.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_tool_error_is_recorded_as_a_tool_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-3", "read_file", json!({ "path": "missing.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text("gave up")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let terminal = tool_lifecycles(&events).pop().expect("a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Failed);
+        assert_eq!(terminal.failure, Some(FailureKind::Tool));
+    }
+
+    #[tokio::test]
+    async fn a_tool_the_mode_does_not_export_is_an_internal_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with(
+                "call-4",
+                "write_file",
+                json!({ "path": "made.txt", "content": "x" }),
+            ),
+        ])));
+        fake.push(response(MessageContent::from_text("gave up")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("do it"),
+                AgentMode::Plan,
+                Vec::new(),
+                &AllowingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let terminal = tool_lifecycles(&events).pop().expect("a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Failed);
+        assert_eq!(
+            terminal.failure,
+            Some(FailureKind::Internal),
+            "a tool missing from the mode is a dispatch bug, not a tool that ran"
+        );
+        assert!(!temp.path().join("made.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_provider_failure_ends_the_turn_with_a_failed_turn_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("connection reset");
+        let runtime = runtime_with(&fake, temp.path());
+
+        let mut events = Vec::new();
+        let outcome = runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await;
+
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Turn {
+                    status: TurnStatus::Failed,
+                    failure: Some(FailureKind::Provider),
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_tool_is_never_completed() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-5", "run_command", json!({ "command": "sleep 5" })),
+        ])));
+        fake.push(response(MessageContent::from_text("unreachable")));
+        let runtime = runtime_with(&fake, temp.path());
+        let cancel = crate::agent::cancel::CancelToken::new();
+        let clone = cancel.clone();
+
+        let turn = tokio::spawn(async move {
+            let mut events = Vec::new();
+            let outcome = runtime
+                .execute_task(
+                    genai::chat::ChatMessage::user("do it"),
+                    AgentMode::Build,
+                    Vec::new(),
+                    &AllowingConfirmer,
+                    &clone,
+                    |event| events.push(event),
+                    |_, _| {},
+                )
+                .await;
+            (outcome, events)
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        cancel.cancel();
+
+        let (outcome, events) = tokio::time::timeout(std::time::Duration::from_secs(3), turn)
+            .await
+            .expect("the turn must return after the cancel")
+            .unwrap();
+
+        assert_eq!(outcome.status, TurnStatus::Cancelled);
+        let tool = tool_lifecycles(&events);
+        assert_eq!(
+            tool.last().map(|event| event.status),
+            Some(ToolStatus::Cancelled),
+            "{tool:?}"
+        );
+        assert!(
+            !tool
+                .iter()
+                .any(|event| event.status == ToolStatus::Completed),
+            "a cancelled call never completes: {tool:?}"
+        );
+    }
+
+    /// One Ask turn: answer, reported rows, and every event the sink saw.
+    async fn run_ask(
+        runtime: &AgentRuntime,
+        question: &str,
+    ) -> (String, Vec<ChatMessage>, Vec<AgentEvent>) {
+        let mut events = Vec::new();
+        let mut reported: Vec<ChatMessage> = Vec::new();
+        let answer = runtime
+            .execute_task(
+                genai::chat::ChatMessage::user(question),
+                AgentMode::Ask,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |message, _| reported.push(message.clone()),
+            )
+            .await
+            .result
+            .unwrap();
+        (answer, reported, events)
+    }
+
+    #[tokio::test]
+    async fn ask_keeps_only_the_citations_the_turn_actually_read() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(temp.path().join(".env"), "SECRET=1\n").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "read_file", json!({ "path": "note.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text(
+            "Line one is `note.txt:1`.\n\
+             Out of range: `note.txt:99`.\n\
+             Never read: `other.txt:2`.\n\
+             Protected: `.env:1`.",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, reported, events) = run_ask(&runtime, "explain the file").await;
+
+        assert!(
+            answer.contains("`note.txt:1`"),
+            "a line this turn read stays untouched: {answer}"
+        );
+        for unverified in ["note.txt:99", "other.txt:2", ".env:1"] {
+            assert!(
+                answer.contains(&format!("{unverified} (unverified")),
+                "{unverified} must be marked: {answer}"
+            );
+        }
+        let row = reported.last().expect("the answer row is persisted");
+        assert_eq!(
+            row.content.first_text(),
+            Some(answer.as_str()),
+            "the stored answer is the validated one"
+        );
+        let tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Token(token) => Some(token.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![answer.as_str()],
+            "Ask emits the validated answer once, not the raw deltas"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_listing_does_not_authorize_a_citation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "one\ntwo\n").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "list_directory", json!({ "path": "." })),
+        ])));
+        fake.push(response(MessageContent::from_text(
+            "The file is `note.txt:1`.",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, _, _) = run_ask(&runtime, "what is in note.txt").await;
+
+        assert!(
+            answer.contains("note.txt:1 (unverified"),
+            "a name in a listing is not content: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_file_shaped_tokens_are_treated_as_citations() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "one\ntwo\n").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "read_file", json!({ "path": "note.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text(
+            "At 10:30 the run finished; the handler is http://localhost:8080/x and it is read at `note.txt:1`.",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, _, _) = run_ask(&runtime, "where is the handler").await;
+
+        // A clock time and a URL port are not citations, and the answer keeps
+        // them intact instead of being annotated into nonsense.
+        assert!(answer.contains("10:30"), "{answer}");
+        assert!(!answer.contains("10:30 (unverified"), "{answer}");
+        assert!(answer.contains("http://localhost:8080/x"), "{answer}");
+        assert!(!answer.contains("8080 (unverified"), "{answer}");
+        // The one real citation was read this turn, so it carries no marker.
+        assert!(answer.contains("note.txt:1`"), "{answer}");
+        assert!(!answer.contains("note.txt:1 (unverified"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_conceptual_answer_needs_no_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_text(
+            "The tool loop lives in run_turn, one turn at a time.",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, _, _) = run_ask(&runtime, "how does the loop work").await;
+
+        assert_eq!(
+            answer, "The tool loop lives in run_turn, one turn at a time.",
+            "no citation to validate, nothing to change"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_does_not_cross_ask_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "one\ntwo\n").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "read_file", json!({ "path": "note.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text("First: `note.txt:2`.")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let (first, _, _) = run_ask(&runtime, "read it").await;
+        assert!(first.contains("`note.txt:2`"), "{first}");
+
+        fake.push(response(MessageContent::from_text(
+            "Second turn, no reads: `note.txt:2`.",
+        )));
+        let (second, _, _) = run_ask(&runtime, "and again").await;
+        assert!(
+            second.contains("note.txt:2 (unverified"),
+            "the previous turn's reads do not authorize this one: {second}"
+        );
+    }
+
+    async fn run_review(runtime: &AgentRuntime) -> (Result<String, String>, Vec<AgentEvent>) {
+        let mut events = Vec::new();
+        let outcome = runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("review the working tree"),
+                AgentMode::Review,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |_, _| {},
+            )
+            .await;
+        (outcome.result.map_err(|error| error.to_string()), events)
+    }
+
+    #[tokio::test]
+    async fn a_review_answer_is_rendered_from_its_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_text(
+            "```json\n{\"target\":\"working-tree\",\"findings\":[{\"severity\":\"high\",\"title\":\"Unvalidated join\",\"impact\":\"reads outside the root\",\"remediation\":\"validate first\",\"path\":\"src/x.rs\",\"line_start\":12,\"confidence\":\"confirmed\"}],\"limitations\":[\"one file only\"]}\n```",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, events) = run_review(&runtime).await;
+        let answer = answer.expect("a report renders");
+
+        assert!(answer.contains("working-tree"), "{answer}");
+        assert!(
+            answer.contains("[high] Unvalidated join (confirmed)"),
+            "{answer}"
+        );
+        assert!(answer.contains("src/x.rs:12"), "{answer}");
+        assert!(answer.contains("one file only"), "{answer}");
+        assert!(answer.contains("No tests were run"), "{answer}");
+        let tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Token(token) => Some(token.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![answer.as_str()],
+            "the validated report is shown once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_review_answer_that_is_not_a_report_fails_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_text("Looks fine to me.")));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let (answer, _) = run_review(&runtime).await;
+        let error = answer.expect_err("prose is not a clean review");
+        assert!(error.contains("not a valid report"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_is_never_a_clean_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push_error("connection reset");
+        let runtime = runtime_with(&fake, temp.path());
+
+        let (answer, _) = run_review(&runtime).await;
+        assert!(answer.is_err(), "a provider failure cannot be clean");
+    }
+
+    /// Records what was asked and answers with a fixed value.
+    #[derive(Default)]
+    struct RecordingQuestioner {
+        asked: std::sync::Mutex<Vec<crate::agent::questions::QuestionRequest>>,
+        answer: Option<crate::agent::questions::QuestionAnswer>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::agent::questions::Questioner for RecordingQuestioner {
+        async fn ask(
+            &self,
+            request: crate::agent::questions::QuestionRequest,
+        ) -> crate::agent::questions::QuestionAnswer {
+            self.asked.lock().unwrap().push(request);
+            self.answer
+                .clone()
+                .unwrap_or(crate::agent::questions::QuestionAnswer::Answered(
+                    "b.rs".to_string(),
+                ))
+        }
+    }
+
+    fn ask_call(call_id: &str, question: &str) -> genai::chat::ToolCall {
+        serde_json::from_value(serde_json::json!({
+            "call_id": call_id,
+            "fn_name": "ask_user",
+            "fn_arguments": { "question": question, "kind": "text" },
+        }))
+        .unwrap()
+    }
+
+    fn write_call(call_id: &str, path: &str, content: &str) -> genai::chat::ToolCall {
+        serde_json::from_value(serde_json::json!({
+            "call_id": call_id,
+            "fn_name": "write_file",
+            "fn_arguments": { "path": path, "content": content },
+        }))
+        .unwrap()
+    }
+
+    fn tool_responses(messages: &[ChatMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .flat_map(|message| message.content.tool_responses())
+            .map(|response| response.call_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_question_is_answered_before_the_dependent_call_gets_a_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            ask_call("call_ask", "Which file should I change?"),
+            tool_call("call_read", "list_directory"),
+        ])));
+        fake.push(response(MessageContent::from_text("done")));
+        let questioner = std::sync::Arc::new(RecordingQuestioner::default());
+        let runtime = runtime_with(&fake, temp.path()).with_questioner(questioner.clone());
+
+        runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let asked = questioner.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1, "the host was asked exactly once");
+        assert_eq!(asked[0].question, "Which file should I change?");
+        assert_eq!(asked[0].call_id, "call_ask");
+
+        let last = fake.requests().last().cloned().unwrap();
+        assert_eq!(
+            tool_responses(&last),
+            vec!["call_ask".to_string(), "call_read".to_string()],
+            "one correlated result each, in call order"
+        );
+        let answer = last
+            .iter()
+            .flat_map(|message| message.content.tool_responses())
+            .find(|response| response.call_id == "call_ask")
+            .map(|response| response.content.clone())
+            .unwrap();
+        assert!(answer.contains("b.rs"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn without_a_human_the_question_returns_unavailable_and_the_turn_ends() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![ask_call(
+            "call_ask",
+            "Which file?",
+        )])));
+        fake.push(response(MessageContent::from_text(
+            "I could not determine that",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+
+        let answer = runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+        assert_eq!(answer, "I could not determine that");
+
+        let last = fake.requests().last().cloned().unwrap();
+        let unavailable = last
+            .iter()
+            .flat_map(|message| message.content.tool_responses())
+            .find(|response| response.call_id == "call_ask")
+            .map(|response| response.content.clone())
+            .unwrap();
+        assert!(
+            unavailable.contains("No human is available"),
+            "{unavailable}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_question_stops_the_sibling_calls_and_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            ask_call("call_ask", "Write it?"),
+            write_call("call_write", "created.txt", "must not land"),
+        ])));
+        let questioner = std::sync::Arc::new(RecordingQuestioner {
+            answer: Some(crate::agent::questions::QuestionAnswer::Cancelled),
+            ..Default::default()
+        });
+        let runtime = runtime_with(&fake, temp.path()).with_questioner(questioner);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut rows: Vec<ChatMessage> = Vec::new();
+        let outcome = runtime
+            .execute_task(
+                ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |message, _| rows.push(message.clone()),
+            )
+            .await;
+
+        assert_eq!(outcome.status, TurnStatus::Cancelled);
+        assert!(
+            !temp.path().join("created.txt").exists(),
+            "a sibling write must not run after the question is cancelled"
+        );
+        assert_eq!(
+            fake.requests().len(),
+            1,
+            "no request is sent after the cancelled turn"
+        );
+        assert_eq!(
+            tool_responses(&rows),
+            vec!["call_ask".to_string()],
+            "only the question is answered"
+        );
+        let terminal = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Tool(tool) if tool.call_id == "call_ask" && tool.elapsed.is_some() => {
+                    Some(tool)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("the cancelled call has a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Cancelled);
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Turn {
+                status: TurnStatus::Cancelled,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_steer_reaches_the_next_request_as_a_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![tool_call(
+            "call_a",
+            "list_directory",
+        )])));
+        fake.push(response(MessageContent::from_text("redirected")));
+
+        let slot =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::tui::app::SteerSlot::default()));
+        // The user types `/steer` while the first request is in flight.
+        let typed = slot.clone();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = seen.clone();
+        let sink = move |event: crate::agent::events::AgentEvent| {
+            events.lock().unwrap().push(event);
+            let Ok(mut slot) = typed.lock() else { return };
+            if slot.waiting.is_none() && slot.applied == 0 {
+                slot.waiting = Some("focus on the tests".to_string());
+            }
+        };
+        let runtime = runtime_with(&fake, temp.path()).with_steering(std::sync::Arc::new(
+            crate::tui::app::SharedSteer(slot.clone()),
+        ));
+
+        runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("do it"),
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                sink,
+                |_, _| {},
+            )
+            .await
+            .result
+            .unwrap();
+
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[0]
+                .iter()
+                .any(|m| m.content.first_text() == Some("focus on the tests")),
+            "the first request was already in flight"
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .any(|m| m.content.first_text() == Some("focus on the tests")),
+            "the steer lands on the next turn as a user message"
+        );
+        let slot = slot.lock().unwrap();
+        assert_eq!(slot.applied, 1, "taken exactly once");
+        assert!(slot.waiting.is_none(), "and not left behind");
+        drop(slot);
+
+        // The steer is reported as its own event, because the worker stores it
+        // as a user row: a `Token` would persist it as model output or not at
+        // all, and the resumed transcript would hold an answer to nothing.
+        let events = seen.lock().unwrap();
+        let steers: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::agent::events::AgentEvent::Steer(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steers,
+            vec![&"focus on the tests".to_string()],
+            "exactly one steer event: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                crate::agent::events::AgentEvent::Token(text) if text.contains("[steer]")
+            )),
+            "the steer is never model text: {events:?}"
+        );
     }
 }
 
@@ -653,7 +1570,7 @@ mod context_budget {
 
     fn runtime(workspace: &std::path::Path) -> AgentRuntime {
         let mut config = AgentConfig::load(workspace);
-        config.model = "deepseek-chat".to_string(); // 128k window
+        config.model = Some("deepseek-chat".to_string()); // 128k window
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
         AgentRuntime::new(config, WorkspaceSecurity::new(workspace))
@@ -673,23 +1590,36 @@ mod context_budget {
         Vec::new()
     }
 
+    /// A sink that keeps the engine's notices: what these tests assert on.
+    fn notice_sink<'a>(
+        notices: &'a mut Vec<String>,
+    ) -> impl FnMut(crate::agent::events::AgentEvent) + 'a {
+        move |event| {
+            if let crate::agent::events::AgentEvent::Notice(note) = event {
+                notices.push(note);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn an_over_budget_history_compacts_once_and_continues() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = runtime(temp.path());
         let summarizer = ScriptedSummarizer::ok(valid_summary());
         let mut notices = notices();
-        let mut sink = |notice: &str| notices.push(notice.to_string());
+        let mut sink = notice_sink(&mut notices);
 
         let request = runtime
             .prepare_request(
                 over_budget_history(),
-                "current task",
+                &genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 &summarizer,
                 &mut sink,
             )
             .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
 
         assert!(summarizer.calls() >= 2, "chunk calls plus a merge");
         let summary_message = request
@@ -733,17 +1663,19 @@ mod context_budget {
         let runtime = runtime(temp.path());
         let summarizer = ScriptedSummarizer::failing();
         let mut notices = notices();
-        let mut sink = |notice: &str| notices.push(notice.to_string());
+        let mut sink = notice_sink(&mut notices);
 
         let request = runtime
             .prepare_request(
                 over_budget_history(),
-                "current task",
+                &genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 &summarizer,
                 &mut sink,
             )
             .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
 
         let failing = notices
             .iter()
@@ -775,17 +1707,19 @@ mod context_budget {
         );
         let summarizer = ScriptedSummarizer::ok(huge);
         let mut notices = notices();
-        let mut sink = |notice: &str| notices.push(notice.to_string());
+        let mut sink = notice_sink(&mut notices);
 
         let request = runtime
             .prepare_request(
                 over_budget_history(),
-                "current task",
+                &genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 &summarizer,
                 &mut sink,
             )
             .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
 
         assert!(
             summarizer.calls() >= 4,
@@ -812,7 +1746,7 @@ mod context_budget {
         let runtime = runtime(temp.path());
         let summarizer = ScriptedSummarizer::ok(valid_summary());
         let mut notices = notices();
-        let mut sink = |notice: &str| notices.push(notice.to_string());
+        let mut sink = notice_sink(&mut notices);
 
         let history = vec![
             ChatMessage::user("huge question"),
@@ -821,12 +1755,14 @@ mod context_budget {
         let request: ChatRequest = runtime
             .prepare_request(
                 history,
-                "current task",
+                &genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 &summarizer,
                 &mut sink,
             )
             .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
 
         assert_eq!(summarizer.calls(), 0, "nothing older exists to summarize");
         let warning = notices
@@ -876,10 +1812,11 @@ mod retry_budget {
         stream: bool,
     ) -> AgentRuntime {
         let mut config = AgentConfig::load(workspace);
-        config.model = "deepseek-chat".to_string();
+        config.model = Some("deepseek-chat".to_string());
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
         config.stream = stream;
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         AgentRuntime::with_backend(
             config,
             WorkspaceSecurity::new(workspace),
@@ -911,7 +1848,7 @@ mod retry_budget {
 
         let answer = runtime
             .execute_task(
-                "current task",
+                genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -955,7 +1892,7 @@ mod retry_budget {
 
         let error = runtime
             .execute_task(
-                "current task",
+                genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -984,7 +1921,7 @@ mod retry_budget {
 
         let error = runtime
             .execute_task(
-                "current task",
+                genai::chat::ChatMessage::user("current task"),
                 AgentMode::Build,
                 history(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1066,9 +2003,10 @@ mod repeated_actions {
         }
 
         let mut config = AgentConfig::load(temp.path());
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 10;
         config.system_prompt = Some("system prompt".to_string());
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         let runtime = AgentRuntime::with_backend(
             config,
             WorkspaceSecurity::new(temp.path()),
@@ -1078,7 +2016,7 @@ mod repeated_actions {
         let mut messages: Vec<(String, crate::session::MessageStatus)> = Vec::new();
         let result = runtime
             .execute_task(
-                "look around",
+                genai::chat::ChatMessage::user("look around"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1116,6 +2054,75 @@ mod repeated_actions {
     }
 
     #[tokio::test]
+    async fn a_repeated_error_records_the_terminal_result_of_the_stopped_call() {
+        use crate::agent::events::{AgentEvent, ToolStatus};
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        // Different arguments, so the repeated-action guard does not fire
+        // first; the OS reports the same missing-file error for both.
+        for (call_id, path) in [("call_one", "missing-a.txt"), ("call_two", "missing-b.txt")] {
+            fake.push(response(MessageContent::from_tool_calls(vec![tool_call(
+                call_id,
+                "read_file",
+                path,
+            )])));
+        }
+
+        let runtime = super::engine_seam::runtime_with(&fake, temp.path());
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut rows: Vec<(String, crate::session::MessageStatus)> = Vec::new();
+        let result = runtime
+            .execute_task(
+                ChatMessage::user("read the file"),
+                AgentMode::Build,
+                Vec::<ChatMessage>::new(),
+                &crate::agent::permissions::DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |event| events.push(event),
+                |message, status| {
+                    for response in message.content.tool_responses() {
+                        rows.push((response.call_id.clone(), status));
+                    }
+                },
+            )
+            .await
+            .result
+            .unwrap();
+
+        assert!(
+            result.contains("the same error repeated twice"),
+            "the summary still stops the loop: {result}"
+        );
+        let terminal = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Tool(tool) if tool.call_id == "call_two" && tool.elapsed.is_some() => {
+                    Some(tool)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("the stopped call has a terminal event");
+        assert_eq!(terminal.status, ToolStatus::Failed);
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "call_one".to_string(),
+                    crate::session::MessageStatus::Complete
+                ),
+                (
+                    "call_two".to_string(),
+                    crate::session::MessageStatus::Complete
+                ),
+            ],
+            "every call the loop ran gets its result, including the one it stopped on"
+        );
+    }
+
+    #[tokio::test]
     async fn a_repeated_call_does_not_echo_a_secret_argument() {
         let temp = tempfile::tempdir().unwrap();
         let fake = FakeBackend::default();
@@ -1128,9 +2135,10 @@ mod repeated_actions {
         }
 
         let mut config = AgentConfig::load(temp.path());
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 10;
         config.system_prompt = Some("system prompt".to_string());
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         let runtime = AgentRuntime::with_backend(
             config,
             WorkspaceSecurity::new(temp.path()),
@@ -1140,7 +2148,7 @@ mod repeated_actions {
         let mut last = String::new();
         let result = runtime
             .execute_task(
-                "look around",
+                genai::chat::ChatMessage::user("look around"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1183,16 +2191,17 @@ mod transcript_redaction {
         fake.push(response(MessageContent::from_text("done")));
 
         let mut config = AgentConfig::load(temp.path());
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 4;
         config.system_prompt = Some("system prompt".to_string());
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         let runtime =
             AgentRuntime::with_backend(config, WorkspaceSecurity::new(temp.path()), Box::new(fake));
 
         let mut seen: Vec<String> = Vec::new();
         let answer = runtime
             .execute_task(
-                "look around",
+                genai::chat::ChatMessage::user("look around"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1233,9 +2242,10 @@ mod backend_seam {
         fake.push(response(MessageContent::from_text("through the seam")));
 
         let mut config = AgentConfig::load(temp.path());
-        config.model = "fake-model".to_string();
+        config.model = Some("fake-model".to_string());
         config.max_turns = 2;
         config.system_prompt = Some("system prompt".to_string());
+        config.base_url = Some("https://gateway.test/v1/".to_string());
         let runtime = AgentRuntime::with_backend(
             config,
             WorkspaceSecurity::new(temp.path()),
@@ -1244,7 +2254,7 @@ mod backend_seam {
 
         let answer = runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::<ChatMessage>::new(),
                 &crate::agent::permissions::DenyingConfirmer,
@@ -1259,4 +2269,168 @@ mod backend_seam {
         assert_eq!(answer, "through the seam");
         assert_eq!(fake.requests().len(), 1, "exactly one backend call");
     }
+
+    /// The config's registered adapters are the routing table: an id genai does
+    /// not recognise must not reach the Ollama adapter's localhost default.
+    #[tokio::test]
+    async fn a_configured_gateway_never_routes_to_ollama() {
+        use crate::agent::engine::{AgentConfig, AgentRuntime, normalize_base_url};
+
+        let base_url = "https://gateway.example/v1/";
+        let (_, adapters) = normalize_base_url(base_url);
+        let config = AgentConfig {
+            base_url: Some(base_url.to_string()),
+            api_key: Some("sk-test".to_string()),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(config, WorkspaceSecurity::new("."));
+
+        let target = runtime
+            .client()
+            .expect("the config named a gateway")
+            .resolve_service_target("totally-unlisted-model")
+            .await
+            .expect("an unlisted id resolves against the configured gateway");
+
+        assert_eq!(
+            target.model.adapter_kind, adapters[0],
+            "a model the provider does not list resolves to the primary registered adapter"
+        );
+    }
+
+    #[test]
+    fn routing_never_leaves_the_registered_adapters() {
+        use crate::agent::engine::route_to_configured;
+        use genai::adapter::AdapterKind;
+
+        let both = [AdapterKind::Anthropic, AdapterKind::OpenAI];
+        assert_eq!(
+            route_to_configured(&both, AdapterKind::Ollama),
+            AdapterKind::Anthropic,
+            "an unrecognised id goes to the configured primary"
+        );
+        assert_eq!(
+            route_to_configured(&[AdapterKind::OpenAI], AdapterKind::Anthropic),
+            AdapterKind::OpenAI
+        );
+        assert_eq!(
+            route_to_configured(&both, AdapterKind::Anthropic),
+            AdapterKind::Anthropic,
+            "a registered verdict is left alone"
+        );
+        assert_eq!(
+            route_to_configured(&[AdapterKind::OpenAI], AdapterKind::OpenAI),
+            AdapterKind::OpenAI
+        );
+        // No table cannot route: the verdict comes back instead of a panic, and
+        // a runtime with no provider is refused before any of this runs.
+        assert_eq!(
+            route_to_configured(&[], AdapterKind::Ollama),
+            AdapterKind::Ollama
+        );
+    }
+
+    /// No model means no request: the refusal names the command that fixes it.
+    #[tokio::test]
+    async fn a_config_without_a_model_fails_before_the_provider() {
+        use crate::agent::cancel::TurnStatus;
+        use crate::agent::permissions::DenyingConfirmer;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        let config = AgentConfig {
+            model: None,
+            base_url: Some("https://gateway.test/v1/".to_string()),
+            api_key: None,
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let outcome = runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("hi"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await;
+
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        let error = outcome.result.unwrap_err().to_string();
+        assert!(error.contains("no model configured"), "{error}");
+        assert!(error.contains("seavx setup"), "{error}");
+        assert_eq!(
+            fake.requests().len(),
+            0,
+            "a config with no model must not reach a provider"
+        );
+    }
+
+    /// A key whose host is unknown is not a provider: the turn is refused, and
+    /// nothing is sent anywhere.
+    #[tokio::test]
+    async fn a_key_without_an_endpoint_refuses_the_turn() {
+        use crate::agent::cancel::TurnStatus;
+        use crate::agent::permissions::DenyingConfirmer;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake = FakeBackend::default();
+        let config = AgentConfig {
+            model: Some("fake-model".to_string()),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            api_key_env: Some("SEAVX_API_KEY"),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::with_backend(
+            config,
+            WorkspaceSecurity::new(temp.path()),
+            Box::new(fake.clone()),
+        );
+
+        let outcome = runtime
+            .execute_task(
+                genai::chat::ChatMessage::user("hi"),
+                AgentMode::Build,
+                Vec::new(),
+                &DenyingConfirmer,
+                &crate::agent::cancel::CancelToken::new(),
+                |_| {},
+                |_, _| {},
+            )
+            .await;
+
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        let error = outcome.result.unwrap_err().to_string();
+        assert!(error.contains("seavx setup"), "{error}");
+        assert_eq!(
+            fake.requests().len(),
+            0,
+            "no request may reach a host the config did not name"
+        );
+    }
+}
+
+#[test]
+fn a_failure_is_shown_as_one_bounded_line() {
+    let dump =
+        "Error while generating a ChatResponse\nRequest: {\"messages\":[...]}\nCause: signature";
+    let shown = crate::agent::engine::one_line(dump);
+
+    assert_eq!(
+        shown, "Error while generating a ChatResponse",
+        "first line only"
+    );
+
+    let long = format!("{}\nmore", "x".repeat(400));
+    let bounded = crate::agent::engine::one_line(&long);
+    assert_eq!(bounded.chars().count(), 161, "160 chars and the ellipsis");
+    assert!(bounded.ends_with('…'));
 }

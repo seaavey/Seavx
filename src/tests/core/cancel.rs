@@ -85,9 +85,10 @@ async fn wait_until_gone(pid: i32) -> bool {
 
 fn runtime_with(backend: &SlowBackend, workspace: &std::path::Path, stream: bool) -> AgentRuntime {
     let mut config = AgentConfig::load(workspace);
-    config.model = "fake-model".to_string();
+    config.model = Some("fake-model".to_string());
     config.max_turns = 4;
     config.stream = stream;
+    config.base_url = Some("https://gateway.test/v1/".to_string());
     AgentRuntime::with_backend(
         config,
         WorkspaceSecurity::new(workspace),
@@ -108,7 +109,7 @@ async fn cancelling_while_awaiting_the_provider_drops_the_future() {
             let mut rows = Vec::new();
             let outcome = runtime
                 .execute_task(
-                    "do it",
+                    genai::chat::ChatMessage::user("do it"),
                     AgentMode::Build,
                     Vec::new(),
                     &DenyingConfirmer,
@@ -149,15 +150,15 @@ async fn cancelling_mid_stream_keeps_what_arrived() {
 
     let turn = tokio::spawn(async move {
         let mut rows = Vec::new();
-        let mut events = Vec::new();
+        let mut events: Vec<crate::agent::events::AgentEvent> = Vec::new();
         let outcome = runtime
             .execute_task(
-                "do it",
+                genai::chat::ChatMessage::user("do it"),
                 AgentMode::Build,
                 Vec::new(),
                 &DenyingConfirmer,
                 &clone,
-                |event| events.push(event.to_string()),
+                |event| events.push(event),
                 |message, status| rows.push((message.content.texts().join(""), status)),
             )
             .await;
@@ -185,7 +186,9 @@ async fn cancelling_mid_stream_keeps_what_arrived() {
         "a cancelled stream is never resumed"
     );
     assert!(
-        events.iter().any(|event| event == "TOKEN:three"),
+        events
+            .iter()
+            .any(|event| matches!(event, crate::agent::events::AgentEvent::Token(token) if token == "three")),
         "the deltas reached the sink: {events:?}"
     );
 }
@@ -220,7 +223,7 @@ async fn cancelling_between_turns_is_immediate() {
 
     let outcome = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,

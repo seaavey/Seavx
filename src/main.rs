@@ -41,10 +41,10 @@ enum Commands {
     /// Initialize SEAVX configuration
     Init,
 
-    /// Configure providers and other SEAVX settings
+    /// Configure providers and other SEAVX settings (default: providers)
     Setup {
         #[command(subcommand)]
-        section: SetupSection,
+        section: Option<SetupSection>,
     },
 
     /// Check the installation
@@ -200,18 +200,44 @@ async fn main() -> anyhow::Result<()> {
             let mut streamed = false;
             let result = runtime
                 .execute_task(
-                    &task,
+                    genai::chat::ChatMessage::user(&task),
                     agent::engine::AgentMode::Build,
                     Vec::new(),
                     &agent::permissions::DenyingConfirmer,
                     &agent::cancel::CancelToken::new(),
-                    |evt| {
-                        // Reasoning blocks are a TUI concern; headless runs skip them.
-                        if let Some(token) = evt.strip_prefix("TOKEN:") {
-                            streamed = true;
-                            print!("{token}");
-                        } else if !evt.starts_with("THINKING:") {
-                            println!("{evt}");
+                    |event| {
+                        // Reasoning blocks are a TUI concern; headless runs skip
+                        // them, and the turn's status has nothing to print.
+                        match event {
+                            agent::events::AgentEvent::Token(token) => {
+                                streamed = true;
+                                print!("{token}");
+                            }
+                            // One line per call: the same event arrives queued,
+                            // running and finished, and only the outcome is news.
+                            agent::events::AgentEvent::Tool(tool)
+                                if matches!(
+                                    tool.status,
+                                    agent::events::ToolStatus::Completed
+                                        | agent::events::ToolStatus::Failed
+                                        | agent::events::ToolStatus::Cancelled
+                                ) =>
+                            {
+                                println!(
+                                    "Tool: {}({}) {}",
+                                    tool.name,
+                                    tool.summary,
+                                    tool.status.as_str()
+                                );
+                            }
+                            agent::events::AgentEvent::Notice(note) => println!("{note}"),
+                            agent::events::AgentEvent::Thinking(_)
+                            | agent::events::AgentEvent::Usage { .. }
+                            // A call that has not finished has nothing to report yet.
+                            | agent::events::AgentEvent::Tool(_)
+                            // Nothing steers a headless run: no human is attached.
+                            | agent::events::AgentEvent::Steer(_)
+                            | agent::events::AgentEvent::Turn { .. } => {}
                         }
                     },
                     // `seavx exec` stays session-free: no row is ever written.
@@ -236,8 +262,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("Config already exists at {}", config_path.display());
             }
         }
+        // `seavx setup` is the providers wizard: the only section, so naming it
+        // is optional rather than a usage error.
         Some(Commands::Setup { section }) => match section {
-            SetupSection::Providers => cli::setup::providers().await?,
+            None | Some(SetupSection::Providers) => cli::setup::providers().await?,
         },
         Some(Commands::Doctor { offline }) => {
             let report = cli::doctor::run(cli::doctor::DoctorOptions {

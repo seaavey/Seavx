@@ -48,12 +48,26 @@ pub trait ChatBackend: Send + Sync {
 
 /// The production backend: genai over the configured endpoint.
 pub struct GenaiBackend {
-    client: Client,
+    /// `None` when the config named no provider: every call reports that instead
+    /// of reaching a host the user never configured.
+    client: Option<Client>,
 }
 
 impl GenaiBackend {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client: Some(client),
+        }
+    }
+
+    pub(crate) fn unavailable() -> Self {
+        Self { client: None }
+    }
+
+    fn client(&self) -> Result<&Client, BackendError> {
+        self.client.as_ref().ok_or_else(|| {
+            std::io::Error::other("no provider configured: run `seavx setup`").into()
+        })
     }
 }
 
@@ -65,7 +79,7 @@ impl ChatBackend for GenaiBackend {
         request: ChatRequest,
         options: Option<&ChatOptions>,
     ) -> Result<ChatResponse, BackendError> {
-        Ok(self.client.exec_chat(model, request, options).await?)
+        Ok(self.client()?.exec_chat(model, request, options).await?)
     }
 
     async fn stream(
@@ -85,7 +99,7 @@ impl ChatBackend for GenaiBackend {
             .with_capture_tool_calls(true);
 
         let response = self
-            .client
+            .client()?
             .exec_chat_stream(model, request, Some(&options))
             .await?;
         let model_iden = response.model_iden.clone();

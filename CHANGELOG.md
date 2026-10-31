@@ -3,6 +3,178 @@
 All notable changes to Seavx are recorded here, grouped by category. One entry
 per landed change; no entry describes behaviour that is not in the code.
 
+## Unreleased
+
+### feat
+
+- An image on the clipboard is a turn attachment: `Ctrl+V` reads it on a worker
+  thread, encodes the pixels to PNG once, refuses anything over 24 MP or 4 MiB,
+  dedupes by SHA-256, labels it in the transcript as
+  `[image #1 1280×720 png 214 KiB]`, and sends it as a `Binary` part of the same
+  user message the session stores. The model sees the image; a resumed session
+  replays the same line. What waits on the next Enter is drawn on its own strip
+  above the prompt (newest three, clipped before the prompt box), never in the
+  transcript.
+
+### breaking
+
+- `Esc` no longer exits and `Ctrl+D`/`Ctrl+Q` are not shortcuts any more:
+  `Ctrl+C` twice within 1.5 s is the only way out of the TUI. `Esc` still closes
+  the ghost, an open menu and the running turn, and twice on an idle prompt it
+  clears the line.
+
+### fix
+
+- Background requests no longer inherit the turn's reasoning budget: a session
+  title, a compaction summary and the skill evaluator are short transforms, and
+  a proxy adapter answers extended thinking without the block `signature` genai
+  requires, which failed the whole request. The evaluator's failure notice is
+  also one bounded line now, not the serialized request.
+- One key press runs once: `KeyEventKind::Release` is no longer translated into
+  an action, so `Ctrl+V` stopped pasting twice and toggling twice.
+- `Ctrl+V` and `Alt+V` paste text off the clipboard on every platform, read
+  on a worker thread with a 2 s deadline so an unresponsive owner app cannot
+  freeze the frame; an empty or failing clipboard says so instead of doing
+  nothing.
+- A paste lands in the composer instead of running as keystrokes: bracketed
+  paste arrives as one string, CRLF is normalized, C0 controls are stripped, and
+  text past the 256 KiB cap is truncated with a notice. Pasting three lines no
+  longer submits three turns.
+- Routing is decided by the config, never by the model id: only the adapters
+  `normalize_base_url` registers can be reached, so an id genai does not
+  recognise goes to the configured primary instead of the Ollama adapter's
+  `localhost:11434`, and a client that fails to build is reported instead of
+  being replaced by genai's built-in provider set.
+- A key with no endpoint is no longer a provider. `OPENAI_API_KEY` and
+  `ANTHROPIC_API_KEY` bind their own adapter; `SEAVX_API_KEY` alone, or a key
+  read from a file, refuses the first turn with
+  `no provider configured: run `seavx setup``.
+
+### breaking
+
+- A config that names no model is refused instead of calling a built-in one.
+  `model` is now optional, `seavx init` writes no `model` key, and a config that
+  relied on the built-in `openai/gpt-4o-mini` fails its first turn with
+  `no model configured: run `seavx setup`or`seavx model <name>``.
+`/config`, `/status`, `doctor`and the footer say`not set` instead of an id.
+
+## 0.1.3 — 2026-10-30
+
+### feature
+
+- Every tool call has a typed lifecycle event (`queued`, `running`, `completed`,
+  `failed`, `cancelled`) correlated by session, turn and provider call id, and
+  stored in one append-only `agent_events` table (schema v3). Summaries are
+  redacted and capped at 512 characters; a permission denial is never recorded as a
+  completed call.
+- `/status` shows the current state, running tool, pending permission or
+  question and the active goal. It works mid-turn and never dumps event history
+  or raw arguments.
+- `/ask <question>` runs exactly one turn in the read-only Ask mode without
+  changing the standing Plan/Build selection. Answers cite `path:line`, and a
+  citation is only accepted when this turn's `read_file`/`search_files`
+  actually returned those lines.
+- `/review [working-tree|staged|commit <ref>|base <ref>]` resolves the diff
+  host-side (fixed arguments, no shell, 30 s timeout, 1 MiB cap, protected and
+  symlinked paths withheld and counted) and reviews it in a read-only mode. It
+  never stages, commits or writes.
+- Goals are durable (schema v4): `/goal <objective>`, `/goal edit`, `criteria
+add|remove`, `task add|remove`, `approve`, `show`, `pause`, `resume`,
+  `cancel`, and `/tasks`. One active-or-blocked goal per workspace; completion
+  needs every criterion satisfied with evidence or waived with a reason.
+- `ask_user` gives the model one structured question (single, multi, free text).
+  The question is stored before it is shown (schema v5), survives a restart as
+  pending, and the recovery pass never fabricates an interrupted result for it.
+- `/steer <text>` reaches the running turn at its next safe boundary without
+  touching the cancellation token; `/queue <prompt>` holds one prompt until the
+  turn succeeds and drops it on cancel or failure. Both refuse a second request
+  while one is pending.
+- `/test` proposes the command the changed files' manifest declares (`cargo
+test` for a Cargo manifest, `npm test --silent` for a package manifest), shows
+  it, and runs it only after the permission matrix agrees: `deny` refuses, an
+  already-permitted category runs, and only `ask` prompts. Pass/fail comes from
+  the exit status; Cargo counts are parsed when present and reported as
+  unavailable when the output was truncated or unrecognised.
+- `/sessions fork <id> [--at <n>]`, `archive <id>`, `unarchive <id>` and
+  `find <text> [--all]` (schema v6: `parent_session_id`, `fork_seq`,
+  `archived_at`), plus `seavx sessions fork|archive|unarchive|search`. A fork
+  copies a completed prefix into an independent session; archiving hides a row
+  without deleting anything.
+- `/preset [name]` applies static prompt text from `.seavx/prompts/<name>.md`,
+  falling back to `~/.seavx/prompts/<name>.md`. Project presets shadow user
+  presets; traversal names, symlinks, non-regular and oversized files are
+  refused. A preset only fills the next prompt. `/preset add <file.md>` copies
+  a Markdown file into the project presets under its stem, accepting the `@`
+  picker's `[file:…]` tag as the path and refusing an existing name instead of
+  overwriting it.
+
+### fix
+
+- The `/sessions` picker reads the store on the blocking pool instead of the
+  event thread, like every other store call.
+- `/goal criteria satisfy <n> <evidence>` and `/goal criteria waive <n>
+<reason>`: a goal carrying criteria could not be completed before, because
+  nothing in the shipped commands could move a criterion out of `pending`.
+- `/test` runs through the permission matrix with the command's real kind, so
+  `tool_permissions = "deny"` refuses it instead of prompting and running.
+- A goal task is completed by a turn that succeeded, blocked by a failed turn
+  and cancelled by a cancel; `/tasks` no longer reports a failure as finished.
+- `fork` requires the end of a completed turn and defaults to the newest one, so
+  a fork never copies a tool call without its result or an unanswered prompt.
+- `/status` reports a pending clarification, not only a pending permission.
+- `/steer` is stored as the user row the model received, so a resumed session
+  never replays an answer to an instruction it does not contain.
+- `/review` fails when Git output could not be read to the end instead of
+  reviewing a truncated diff, and kills the Git process group on timeout.
+- Ask only annotates `path:line` tokens that name a file, so a clock time or a
+  URL port is left alone.
+- `/preset` opens a searchable picker: typing filters the names, the selected
+  preset's first lines are previewed, and Enter puts it in the next prompt.
+  `/preset <name>` still applies one directly.
+- `/test` proposes a suite only when the change is one that suite covers: a
+  `.rs` file or `Cargo.toml` in a Cargo workspace, a script file or
+  `package.json` in a package workspace. A README-only change proposes nothing
+  instead of running the whole suite.
+- The standing mode is one of four, cycled with `Ctrl+Tab` (`Shift+Tab` where
+  the terminal does not report it): build, plan, accept-edits and auto.
+  Accept-edits lifts the question for a write inside the workspace, auto lifts
+  every ask, and the matrix keeps its two floors in both: a write outside the
+  workspace still asks, a destructive call is still refused, and a configured
+  `deny` is never lifted.
+- A tool call reads as a verb and its object (`⚡ run  cargo clippy
+--all-targets`), not as the argument list the model wrote, on the live
+  transcript, the session line and `sessions show`. The permission prompt names
+  the category the `a` key records and states the effect in words instead of
+  repeating the arguments after "wants to runs the command".
+- The session line carries the session title, a five-cell orb from
+  `seaavey/thinking-orbs-rs` and one state word (`working`, `thinking`,
+  `streaming`), never the command being run: the transcript shows the call and
+  `/status` names it. The orb is still while idle.
+- `/review` reads the paths Git reported literally, so a file named `:(top).env`
+  cannot pull a withheld `.env` into the diff; a target whose changes are all
+  withheld says so and counts them, and reviewing a root commit includes the
+  changes that commit made.
+- Resume — `seavx resume`, `seavx sessions resume` and the TUI picker — rebuilds
+  a clarification's result from the stored answer instead of interrupting it,
+  and leaves a question that is still pending alone.
+- `fork` refuses a prefix in which an assistant row has a tool call without its
+  result, not only a boundary row.
+- Esc on `ask_user` cancels the turn: the remaining calls in the same response
+  never run.
+- A turn stopped by the same error twice records that call's failed event and
+  its result before returning the summary.
+- `/test` and every `/goal` operation hold the TUI busy until they finish, so a
+  second prompt cannot run beside them; the goal prompt starts once the slot is
+  free.
+- `/test <extra>` is a usage error instead of running the proposed suite.
+- Rebuilding the `agent_events` table keeps each event's `goal_id` instead of
+  nulling it.
+
+### tests
+
+- Session migrations are covered from the v1, v2, v3, v4 and v5 schemas and
+  from a database a real 0.1.2 binary wrote.
+
 ## 0.1.2 — 2026-10-30
 
 ### feature
@@ -53,6 +225,18 @@ per landed change; no entry describes behaviour that is not in the code.
   shows `matched/total`. Letters are text now, so `j`/`k` no longer navigate and
   the `/models` refresh moved to `ctrl+r`. The wheel moves the picker's cursor
   instead of scrolling the transcript behind it.
+- `seavx setup` and a bare `seavx model` ask with a list instead of a typed
+  name: the endpoint's own models first (arrows move, typing filters
+  case-insensitively, ten rows at a time with `↑/↓ N more`, the configured model
+  preselected), then the reasoning-effort levels as a short arrow list that needs
+  no search box. Esc exits non-zero and writes nothing. A piped run keeps the
+  typed prompts, so scripted setup is unchanged. The live form also shows the
+  protocols inferred for the endpoint and the model as soon as it is chosen.
+- A base URL is accepted only when it is a web endpoint: `http` or `https` with
+  a host. A bare `host:port` is read as `https`; `ftp://`, `file://`, a path such
+  as `/v1/`, or a value containing whitespace is refused with the scheme named —
+  never the rest of the input, which may carry a token — before any request is
+  made. `HTTPS://host` is no longer prefixed into a broken URL.
 
 ### refactor
 

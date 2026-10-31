@@ -3,8 +3,8 @@ use tokio::sync::mpsc;
 
 use super::modal::{next_index, prev_index};
 use super::{
-    App, EnterAction, ModalSelection, apply_command_effect, edit_query, new_input,
-    run_agent_worker, spawn_session_resume, visible_models,
+    App, EnterAction, ModalSelection, apply_command_effect, clipboard, edit_query, new_input,
+    paste, run_agent_worker, spawn_session_resume, visible_models,
 };
 use crate::agent::engine::EFFORT_LEVELS;
 use crate::tui::event::Action;
@@ -32,6 +32,15 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
     // dropping its reply, which the confirmer treats as a denial, so
     // Ctrl+D cannot approve anything on the way out.
     if quit_shortcut(app, &key) {
+        return;
+    }
+
+    // A clarification owns the next key: arrows move, Enter answers, Ctrl+S
+    // skips, Esc cancels. Nothing else runs until it is resolved.
+    if app.pending_question.is_some() {
+        if let Some(notice) = app.answer_question(&key) {
+            app.push_notice(notice);
+        }
         return;
     }
 
@@ -84,21 +93,7 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                     {
                         // The fetch runs off the UI thread: awaiting it
                         // here froze the terminal for its whole timeout.
-                        app.refreshing_models = true;
-                        let base_url =
-                            app.config.base_url.clone().unwrap_or_else(|| {
-                                crate::agent::engine::DEFAULT_BASE_URL.to_string()
-                            });
-                        let api_key = app.config.api_key.clone();
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let model_mgr =
-                                crate::agent::models::ModelManager::new(std::path::Path::new("."));
-                            let outcome = model_mgr
-                                .refresh_remote_models(&base_url, api_key.as_deref())
-                                .await;
-                            let _ = tx.send(Action::ModelsRefreshed(outcome));
-                        });
+                        app.spawn_model_refresh(tx);
                     }
                     KeyCode::Enter => {
                         let chosen = visible_models(&models, &query)
@@ -112,6 +107,37 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                             options,
                             selected: eff_sel,
                         });
+                    }
+                    _ => {}
+                }
+            }
+            ModalSelection::Preset {
+                names,
+                previews,
+                query,
+                selected,
+            } => {
+                if let Some(query) = edit_query(&query, &key) {
+                    app.modal = Some(ModalSelection::Preset {
+                        names,
+                        previews,
+                        query,
+                        selected: 0,
+                    });
+                    return;
+                }
+                match key.code {
+                    KeyCode::Esc => app.modal = None,
+                    KeyCode::Up => app.step_preset_picker(false),
+                    KeyCode::Down => app.step_preset_picker(true),
+                    KeyCode::Enter => {
+                        let chosen = crate::tui::app::modal::visible_presets(&names, &query)
+                            .get(selected)
+                            .map(|index| names[*index].clone());
+                        app.modal = None;
+                        if let Some(name) = chosen {
+                            app.apply_preset(&name);
+                        }
                     }
                     _ => {}
                 }
@@ -142,7 +168,7 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                 }
                 KeyCode::Enter => {
                     let chosen_effort = options[selected].to_string();
-                    app.config.model = model.clone();
+                    app.config.model = Some(model.clone());
                     app.config.reasoning_effort = Some(chosen_effort.clone());
 
                     // Persist through the one config writer.
@@ -154,7 +180,7 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                     };
                     app.set_text(format!(
                         "Switched model to: {}\nReasoning effort: {}\n{saved_line}",
-                        app.config.model,
+                        app.config.model.as_deref().unwrap_or("not set"),
                         app.config.reasoning_effort.as_deref().unwrap_or("none")
                     ));
                     app.scroll = 0;
@@ -260,7 +286,7 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
     }
 
     if is_mode_shortcut(&key) {
-        app.toggle_mode();
+        app.cycle_mode();
         return;
     }
 
@@ -326,6 +352,18 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
+        // The terminal's own paste arrives as `Event::Paste`; this is the path
+        // for a terminal that does not send one (and for `Alt+V`, which will
+        // force text once images exist).
+        KeyCode::Char('v')
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            paste_from_clipboard(app).await;
+        }
+        // Some terminals encode Ctrl+V as SYN and drop the modifier.
+        KeyCode::Char('\u{16}') => paste_from_clipboard(app).await,
         KeyCode::PageUp => app.scroll_up(5),
         KeyCode::PageDown => app.scroll_down(5),
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -400,6 +438,8 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
             }
         }
         _ => {
+            // Any other key disarms the second-Esc clear.
+            app.last_esc = None;
             app.reset_history_nav();
             // Cursor moves dismiss the ghost; edits regrow it.
             app.clear_ghost();
@@ -411,18 +451,30 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
     }
 }
 
-/// The three ways out of the TUI, checked before anything that could swallow a
-/// key: `Ctrl+D`/`Ctrl+Q` quit at once, `Ctrl+C` needs a second press within
-/// 1.5 s. Returns `true` when the key was consumed.
+/// `Ctrl+V`/`Alt+V`: the read is bounded (see `clipboard::read`), and a clipboard
+/// that is empty or failed says so instead of doing nothing.
+async fn paste_from_clipboard(app: &mut App<'_>) {
+    let text = clipboard::read(&app.clipboard, |clipboard| clipboard.text()).await;
+    if let Ok(text) = &text
+        && !text.is_empty()
+    {
+        return paste::handle(app, text);
+    }
+    // No text on the clipboard: it may be holding an image.
+    match clipboard::read(&app.clipboard, |clipboard| clipboard.image()).await {
+        Ok(image) => paste::handle_image(app, image),
+        Err(reason) => app.push_notice(format!("clipboard {reason}")),
+    }
+}
+
+/// The one way out of the TUI, checked before anything that could swallow a key:
+/// `Ctrl+C`, twice within 1.5 s. `Esc` never quits — it clears the line instead.
+/// Returns `true` when the key was consumed.
 pub(super) fn quit_shortcut(app: &mut App, key: &KeyEvent) -> bool {
     if !key.modifiers.contains(KeyModifiers::CONTROL) {
         return false;
     }
     match key.code {
-        KeyCode::Char('d') | KeyCode::Char('q') => {
-            app.should_quit = true;
-            true
-        }
         KeyCode::Char('c') => {
             if let Some(prev) = app.last_ctrl_c
                 && prev.elapsed() < std::time::Duration::from_millis(1500)

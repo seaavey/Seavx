@@ -1,11 +1,12 @@
 use crate::agent::backend::{BackendError, ChatBackend, GenaiBackend, StreamDelta};
 use crate::agent::cancel::{CancelToken, Cleanup, TurnState, TurnStatus};
-use crate::agent::permissions::{
-    self, ActionKind, Answer, Confirmer, PermissionMode, PermissionRequest, Verdict,
+use crate::agent::events::{
+    AgentEvent, FailureKind, SUMMARY_LIMIT, ToolEvent, ToolStatus, bounded,
 };
-use crate::agent::prompt::{PLAN_POLICY, load_system_prompt};
+use crate::agent::permissions::{self, ActionKind, Confirmer, PermissionMode, Verdict};
+use crate::agent::prompt::{ASK_POLICY, PLAN_POLICY, REVIEW_POLICY, load_system_prompt};
 use crate::agent::security::{self, WorkspaceSecurity};
-use crate::agent::tools::ToolRegistry;
+use crate::agent::tools::{self, ToolRegistry};
 use crate::session::MessageStatus;
 use genai::Client;
 use genai::adapter::AdapterKind;
@@ -28,6 +29,17 @@ pub enum AgentMode {
     #[default]
     Build,
     Plan,
+    /// One-shot codebase Q&A. Ephemeral: never persisted in the config and never
+    /// the user's standing selection.
+    Ask,
+    /// One-shot code review of a resolved Git target. Ephemeral too.
+    Review,
+    /// Build, without the question for a write inside the workspace.
+    AcceptEdits,
+    /// Build, without the question for a workspace write, a command or the
+    /// network. The matrix keeps its own two floors: a write outside the
+    /// workspace still asks, and a destructive call is still refused.
+    Auto,
 }
 
 impl AgentMode {
@@ -35,20 +47,64 @@ impl AgentMode {
         match self {
             Self::Build => "build",
             Self::Plan => "plan",
+            Self::Ask => "ask",
+            Self::Review => "review",
+            Self::AcceptEdits => "accept-edits",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// The four modes `ctrl+tab` cycles, in order. Ask and Review last one turn
+    /// and are never part of the ring.
+    pub fn next_standing(self) -> Self {
+        match self {
+            Self::Build => Self::Plan,
+            Self::Plan => Self::AcceptEdits,
+            Self::AcceptEdits => Self::Auto,
+            Self::Auto | Self::Ask | Self::Review => Self::Build,
         }
     }
 }
 
-/// A completed task is only a skill candidate in Build Mode.
+/// The matrix a mode runs: AcceptEdits lifts the workspace write, Auto lifts
+/// every ask, and a configured `deny` is never lifted by either.
+pub(crate) fn mode_permissions(
+    mode: AgentMode,
+    configured: PermissionMode,
+    permitted: Vec<ActionKind>,
+) -> (PermissionMode, Vec<ActionKind>) {
+    let mut kinds = permitted;
+    if matches!(mode, AgentMode::AcceptEdits | AgentMode::Auto)
+        && !kinds.contains(&ActionKind::Write)
+    {
+        kinds.push(ActionKind::Write);
+    }
+    let configured = match mode {
+        AgentMode::Auto if configured != PermissionMode::Deny => PermissionMode::Allow,
+        _ => configured,
+    };
+    (configured, kinds)
+}
+
+/// A completed task is only a skill candidate in a build turn.
 pub(crate) fn should_auto_distill(mode: AgentMode, step_count: usize) -> bool {
-    mode == AgentMode::Build && step_count >= 2
+    matches!(
+        mode,
+        AgentMode::Build | AgentMode::AcceptEdits | AgentMode::Auto
+    ) && step_count >= 2
 }
 
 /// Append the read-only planning policy after the base prompt has been resolved.
 pub(crate) fn with_mode_policy(mut prompt: String, mode: AgentMode) -> String {
-    if mode == AgentMode::Plan {
+    let policy = match mode {
+        AgentMode::Build | AgentMode::AcceptEdits | AgentMode::Auto => None,
+        AgentMode::Plan => Some(PLAN_POLICY),
+        AgentMode::Ask => Some(ASK_POLICY),
+        AgentMode::Review => Some(REVIEW_POLICY),
+    };
+    if let Some(policy) = policy {
         prompt.push_str("\n\n");
-        prompt.push_str(PLAN_POLICY);
+        prompt.push_str(policy);
     }
     prompt
 }
@@ -60,19 +116,12 @@ pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx
 /// Turn budget a new config starts with. An existing file keeps its own value.
 pub const DEFAULT_MAX_TURNS: usize = 100;
 
-/// Model a new config starts with. An existing file keeps its own value.
-pub const DEFAULT_MODEL: &str = "openai/gpt-4o-mini";
-
-fn default_model() -> String {
-    DEFAULT_MODEL.to_string()
-}
-
 fn default_max_turns() -> usize {
     DEFAULT_MAX_TURNS
 }
 
-/// Endpoint used when the config does not set `base_url`.
-pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1/";
+/// What a turn says when the config names no provider at all.
+const NO_PROVIDER: &str = "no provider configured: run `seavx setup`";
 
 /// Config keys that can appear in a config file, in display order.
 pub const CONFIG_KEYS: [&str; 9] = [
@@ -128,8 +177,8 @@ impl ConfigReport {
 pub struct AgentConfig {
     // Every field has a default so a hand-written file that sets only one key
     // is merged with the built-in values instead of failing to parse.
-    #[serde(default = "default_model")]
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
     #[serde(default)]
@@ -150,6 +199,11 @@ pub struct AgentConfig {
     /// Stream the answer instead of waiting for the whole response.
     #[serde(default = "default_stream")]
     pub stream: bool,
+    /// Which environment variable supplied `api_key`; `None` when the key came
+    /// from a file. A key with no endpoint names a provider only through this,
+    /// because a bare key's host is unknowable.
+    #[serde(skip)]
+    pub api_key_env: Option<&'static str>,
 }
 
 fn default_tool_permissions() -> String {
@@ -167,20 +221,35 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    /// The model id, or `""` when none is configured. An empty id never reaches
+    /// a request: `AgentRuntime::config_refusal` refuses that turn first.
+    pub fn model_name(&self) -> &str {
+        self.model.as_deref().unwrap_or_default()
+    }
+
     /// Build the built-in defaults from an injected environment, so tests
     /// never depend on the caller's real variables.
     fn from_env(env: impl Fn(&str) -> Option<String>) -> Self {
-        let model = env("SEAVX_MODEL").unwrap_or_else(default_model);
+        let model = env("SEAVX_MODEL");
         let base_url = env("SEAVX_BASE_URL");
-        let api_key = env("SEAVX_API_KEY")
-            .or_else(|| env("OPENAI_API_KEY"))
-            .or_else(|| env("ANTHROPIC_API_KEY"));
+        // The same precedence as before, now remembering which name won: a key
+        // is only a provider when its variable says which provider it is for.
+        let mut api_key = None;
+        let mut api_key_env = None;
+        for name in ["SEAVX_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"] {
+            if let Some(key) = env(name) {
+                api_key = Some(key);
+                api_key_env = Some(name);
+                break;
+            }
+        }
         let reasoning_effort = env("SEAVX_REASONING_EFFORT");
         Self {
             model,
             max_turns: DEFAULT_MAX_TURNS,
             base_url,
             api_key,
+            api_key_env,
             reasoning_effort,
             system_prompt: None,
             tool_permissions: default_tool_permissions(),
@@ -247,9 +316,13 @@ pub fn parse_reasoning_effort(effort: &str) -> Option<ReasoningEffort> {
     }
 }
 
+/// Infer adapters from the host and make sure the URL is usable.
 pub fn normalize_base_url(url: &str) -> (String, Vec<AdapterKind>) {
     let mut trimmed = url.trim().to_string();
-    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+    // Scheme detection is case-insensitive: `HTTPS://host` is already a URL, and
+    // prefixing it would make `HTTPS` the host.
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
         trimmed = format!("https://{trimmed}");
     }
 
@@ -280,6 +353,63 @@ pub fn normalize_base_url(url: &str) -> (String, Vec<AdapterKind>) {
     }
 
     (trimmed, protocols)
+}
+
+/// A base URL the client can use: `http` or `https` only, with a host.
+///
+/// A scheme-less value is read as a host — the wizard accepts `host:port` — and
+/// gets `https://`. Returns the normalized URL, so a caller stores exactly what
+/// it validated.
+pub fn validate_base_url(input: &str) -> Result<String, String> {
+    const NO_HOST: &str = "base_url has no host, e.g. https://gateway.example/v1/";
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("base_url is empty".to_string());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("base_url contains whitespace".to_string());
+    }
+    let rest = match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            let scheme = scheme.to_ascii_lowercase();
+            if scheme != "http" && scheme != "https" {
+                // The scheme only: the rest may carry a token.
+                return Err(format!(
+                    "'{scheme}://' is not a web scheme; use http:// or https://"
+                ));
+            }
+            rest
+        }
+        // No scheme at all: the whole value is host[:port][/path].
+        None => trimmed,
+    };
+    // `/v1/` and `:8080` are paths and ports, not hosts.
+    if rest.split('/').next().unwrap_or_default().is_empty() || rest.starts_with(':') {
+        return Err(NO_HOST.to_string());
+    }
+
+    let (normalized, _) = normalize_base_url(trimmed);
+    match reqwest::Url::parse(&normalized) {
+        Ok(url) if url.host().is_some() && matches!(url.scheme(), "http" | "https") => {
+            Ok(normalized)
+        }
+        _ => Err(NO_HOST.to_string()),
+    }
+}
+
+/// The registered adapters are the routing table. genai decides an adapter from
+/// the model id and falls back to its local-daemon adapter for anything it does
+/// not recognise, so a verdict this config never registered resolves to the
+/// configured primary instead of a host the user did not name.
+pub(crate) fn route_to_configured(
+    registered: &[AdapterKind],
+    requested: AdapterKind,
+) -> AdapterKind {
+    match registered.first() {
+        Some(&primary) if !registered.contains(&requested) => primary,
+        _ => requested,
+    }
 }
 
 impl AgentConfig {
@@ -418,9 +548,12 @@ fn apply_env_overrides(
             continue;
         };
         match key {
-            "model" => config.model = value,
+            "model" => config.model = Some(value),
             "base_url" => config.base_url = Some(value),
-            "api_key" => config.api_key = Some(value),
+            "api_key" => {
+                config.api_key = Some(value);
+                config.api_key_env = Some(variable);
+            }
             "reasoning_effort" => config.reasoning_effort = Some(value),
             _ => {}
         }
@@ -633,6 +766,19 @@ fn redacted_value(value: &serde_json::Value) -> serde_json::Value {
 /// A loop that stops early still ends with one assistant row, so a resumed
 /// session can see why the turn ended instead of a completed turn with no
 /// answer. The reason is already redacted by the caller.
+/// One line, bounded. An error that carries a whole request body is logged as it
+/// is and shown as its first line, because a transcript is not a log file.
+pub(super) fn one_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    let mut chars = line.chars();
+    let short: String = chars.by_ref().take(160).collect();
+    if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
 fn report_stopped(
     on_message: &mut impl FnMut(&ChatMessage, MessageStatus),
     text: String,
@@ -653,12 +799,20 @@ fn report_cancelled(on_message: &mut impl FnMut(&ChatMessage, MessageStatus), re
 }
 
 pub struct AgentRuntime {
-    client: Client,
+    /// `None` when the config named no provider or the client failed to build:
+    /// every turn is then refused instead of reaching a default host.
+    client: Option<Client>,
     backend: Box<dyn ChatBackend>,
+    /// Why no turn can run, when that is known before the first request.
+    routing_error: Option<String>,
     summarizer: Option<std::sync::Arc<dyn crate::tui::compact::Summarizer>>,
     registry: ToolRegistry,
     security: WorkspaceSecurity,
     config: AgentConfig,
+    /// Who answers `ask_user`. Headless runs keep the default: nobody.
+    questioner: std::sync::Arc<dyn crate::agent::questions::Questioner>,
+    /// Where a running turn is steered from. Default: nowhere.
+    steering: std::sync::Arc<dyn crate::agent::steering::Steering>,
 }
 
 impl AgentRuntime {
@@ -670,48 +824,91 @@ impl AgentRuntime {
             .as_ref()
             .map(|k| AuthData::from_single(k.clone()));
 
+        // Only these adapters may ever be reached. An empty list means the
+        // config named no provider, and no request is attempted.
+        let mut registered: Vec<AdapterKind> = Vec::new();
+        let mut routing_error = None;
+
         if let Some(ref base_url) = config.base_url {
             let (normalized, adapters) = normalize_base_url(base_url);
             tracing::info!(base_url = %normalized, "Configured custom API endpoint");
 
             let endpoint = Endpoint::from_owned(normalized);
-            for adapter in adapters {
+            for adapter in &adapters {
                 if let Some(ref auth) = auth_data {
                     builder =
-                        builder.append_provider_config(adapter, (endpoint.clone(), auth.clone()));
+                        builder.append_provider_config(*adapter, (endpoint.clone(), auth.clone()));
                 } else {
-                    builder = builder.append_provider_config(adapter, endpoint.clone());
+                    builder = builder.append_provider_config(*adapter, endpoint.clone());
                 }
             }
-
-            // Custom gateway mapping: ensure unknown models map to OpenAI adapter instead of Ollama
-            builder = builder.with_model_mapper_fn(|model_iden: genai::ModelIden| {
-                if model_iden.adapter_kind == AdapterKind::Ollama {
-                    Ok(genai::ModelIden::new(
-                        AdapterKind::OpenAI,
-                        model_iden.model_name,
-                    ))
-                } else {
-                    Ok(model_iden)
-                }
-            });
+            registered = adapters;
         } else if let Some(ref auth) = auth_data {
-            builder = builder.append_provider_config(AdapterKind::OpenAI, auth.clone());
-            builder = builder.append_provider_config(AdapterKind::Anthropic, auth.clone());
+            // A key with no endpoint is a provider only when its variable names
+            // one; `SEAVX_API_KEY` and a key from a file have no host to call.
+            match config.api_key_env {
+                Some("OPENAI_API_KEY") => registered.push(AdapterKind::OpenAI),
+                Some("ANTHROPIC_API_KEY") => registered.push(AdapterKind::Anthropic),
+                _ => routing_error = Some(NO_PROVIDER.to_string()),
+            }
+            for adapter in &registered {
+                builder = builder.append_provider_config(*adapter, auth.clone());
+            }
+        } else {
+            routing_error = Some(NO_PROVIDER.to_string());
         }
 
-        let client = builder
-            .build()
-            .unwrap_or_else(|_| Client::new().expect("Failed to initialize genai Client"));
-        let backend = Box::new(GenaiBackend::new(client.clone()));
+        if !registered.is_empty() {
+            let routing = registered.clone();
+            builder = builder.with_model_mapper_fn(move |model_iden: genai::ModelIden| {
+                Ok(genai::ModelIden::new(
+                    route_to_configured(&routing, model_iden.adapter_kind),
+                    model_iden.model_name,
+                ))
+            });
+        }
+
+        let (client, build_error) = match builder.build() {
+            Ok(client) => (Some(client), None),
+            // genai reports the failure; installing its own provider set here is
+            // what used to point a misconfigured run at somebody else's host.
+            Err(error) => (None, Some(format!("no provider client: {error}"))),
+        };
+        let backend: Box<dyn ChatBackend> = match &client {
+            Some(client) => Box::new(GenaiBackend::new(client.clone())),
+            None => Box::new(GenaiBackend::unavailable()),
+        };
         Self {
             client,
             backend,
+            routing_error: routing_error.or(build_error),
             summarizer: None,
             registry: ToolRegistry::with_default_tools(),
             security,
             config,
+            questioner: std::sync::Arc::new(crate::agent::questions::UnavailableQuestioner),
+            steering: std::sync::Arc::new(crate::agent::steering::NoSteering),
         }
+    }
+
+    /// Swap where steering comes from. Nothing is delivered mid-call: the loop
+    /// reads it at a turn boundary, so a running tool is never interrupted.
+    pub fn with_steering(
+        mut self,
+        steering: std::sync::Arc<dyn crate::agent::steering::Steering>,
+    ) -> Self {
+        self.steering = steering;
+        self
+    }
+
+    /// Swap who answers `ask_user`. The TUI sets a human; `exec` keeps the
+    /// default, so a headless run never waits.
+    pub fn with_questioner(
+        mut self,
+        questioner: std::sync::Arc<dyn crate::agent::questions::Questioner>,
+    ) -> Self {
+        self.questioner = questioner;
+        self
     }
 
     /// Swap the provider seam; only tests use it, production always talks genai.
@@ -737,8 +934,21 @@ impl AgentRuntime {
         self
     }
 
-    pub fn client(&self) -> &Client {
-        &self.client
+    /// The provider client, when the config named one. `None` means every turn
+    /// is refused, so a caller outside the turn loop skips its request.
+    pub fn client(&self) -> Option<&Client> {
+        self.client.as_ref()
+    }
+
+    /// The first reason no turn can run, if the config already decided one.
+    fn config_refusal(&self) -> Option<String> {
+        if let Some(reason) = &self.routing_error {
+            return Some(reason.clone());
+        }
+        self.config
+            .model
+            .is_none()
+            .then(|| "no model configured: run `seavx setup` or `seavx model <name>`".to_string())
     }
 
     /// Options for every request. Effort is always sent explicitly: with no effort in the
@@ -750,7 +960,7 @@ impl AgentRuntime {
             .reasoning_effort
             .as_deref()
             .and_then(parse_reasoning_effort)
-            .or_else(|| ReasoningEffort::from_model_name(&self.config.model).0);
+            .or_else(|| ReasoningEffort::from_model_name(self.config.model_name()).0);
 
         let options = ChatOptions::default()
             .with_capture_reasoning_content(true)
@@ -769,18 +979,25 @@ impl AgentRuntime {
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_task(
         &self,
-        task: &str,
+        user: ChatMessage,
         mode: AgentMode,
         history: Vec<ChatMessage>,
         confirm: &dyn Confirmer,
         cancel: &CancelToken,
-        event_sink: impl FnMut(&str) + Send,
+        mut event_sink: impl FnMut(AgentEvent) + Send,
         on_message: impl FnMut(&ChatMessage, MessageStatus),
     ) -> TurnOutcome {
         let mut turn = TurnState::new();
         let result = match self
             .run_turn(
-                task, mode, history, confirm, cancel, &mut turn, event_sink, on_message,
+                &user,
+                mode,
+                history,
+                confirm,
+                cancel,
+                &mut turn,
+                &mut event_sink,
+                on_message,
             )
             .await
         {
@@ -800,9 +1017,27 @@ impl AgentRuntime {
             }
         };
 
+        let cleanup = turn.cleanup();
+        let status = turn.status();
+        // The provider is the only turn-level failure there is: a tool failure
+        // is reported on its own call, not here.
+        let failure = match status {
+            TurnStatus::Failed => Some(FailureKind::Provider),
+            TurnStatus::Cancelled if cleanup == Some(Cleanup::Unconfirmed) => {
+                Some(FailureKind::CleanupUnconfirmed)
+            }
+            _ => None,
+        };
+        event_sink(AgentEvent::Turn {
+            status,
+            failure,
+            cleanup,
+            pid: turn.pid(),
+        });
+
         TurnOutcome {
-            status: turn.status(),
-            cleanup: turn.cleanup(),
+            status,
+            cleanup,
             pid: turn.pid(),
             result,
         }
@@ -812,19 +1047,27 @@ impl AgentRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
-        task: &str,
+        user: &ChatMessage,
         mode: AgentMode,
         history: Vec<ChatMessage>,
         confirm: &dyn Confirmer,
         cancel: &CancelToken,
         turn_state: &mut TurnState,
-        mut event_sink: impl FnMut(&str) + Send,
+        event_sink: &mut (impl FnMut(AgentEvent) + Send),
         mut on_message: impl FnMut(&ChatMessage, MessageStatus),
     ) -> Result<String, TurnError> {
         if cancel.is_cancelled() {
             // The same reporting path every other cancel uses.
             return Err(cancelled(turn_state));
         }
+        // A config that names no provider is refused here, before the
+        // summarizer, the request log or any provider call.
+        if let Some(reason) = self.config_refusal() {
+            return Err(TurnError::Failed(std::io::Error::other(reason).into()));
+        }
+        // What this one Ask turn actually read. Not persisted, not shared with
+        // the next turn: an answer may only cite its own turn's reads.
+        let mut evidence = Evidence::new();
         let summarizer: std::sync::Arc<dyn crate::tui::compact::Summarizer> = match &self.summarizer
         {
             Some(summarizer) => summarizer.clone(),
@@ -834,11 +1077,11 @@ impl AgentRuntime {
         };
         let retry_history = history.clone();
         let mut chat_req = self
-            .prepare_request(history, task, mode, &*summarizer, &mut event_sink)
+            .prepare_request(history, user, mode, &*summarizer, event_sink)
             .await;
         let mut retry = RetryBudget::default();
 
-        tracing::info!(model = %self.config.model, "Starting Seavx agent task");
+        tracing::info!(model = %self.config.model_name(), "Starting Seavx agent task");
 
         let chat_options = self.chat_options();
 
@@ -856,9 +1099,18 @@ impl AgentRuntime {
             }
             tracing::debug!(turn = turn, "Executing chat request");
 
+            // A steer lands between turns: after the previous response (tool
+            // results included), before this request. Never mid-call.
+            if let Some(steer) = self.steering.take() {
+                chat_req = chat_req.append_message(genai::chat::ChatMessage::user(steer.clone()));
+                // The worker persists this as a user row: a resumed session that
+                // held the answer but not the instruction is a broken transcript.
+                event_sink(AgentEvent::Steer(steer));
+            }
+
             // Log full request payload to .seavx/request.log
             Self::log_request_payload(
-                &self.config.model,
+                self.config.model_name(),
                 turn,
                 &chat_req,
                 &chat_options,
@@ -878,17 +1130,22 @@ impl AgentRuntime {
                         match delta {
                             StreamDelta::Token(token) => {
                                 received.push_str(&token);
-                                event_sink(&format!("TOKEN:{token}"));
+                                // Ask answers are shown once, after their
+                                // citations are validated; a delta would show
+                                // an unverified reference.
+                                if !matches!(mode, AgentMode::Ask | AgentMode::Review) {
+                                    event_sink(AgentEvent::Token(token));
+                                }
                             }
                             StreamDelta::Thinking(thoughts) => {
                                 streamed_thinking = true;
-                                event_sink(&format!("THINKING:{thoughts}"));
+                                event_sink(AgentEvent::Thinking(thoughts));
                             }
                         }
                     };
                     self.backend
                         .stream(
-                            &self.config.model,
+                            self.config.model_name(),
                             chat_req.clone(),
                             Some(&chat_options),
                             &mut on_delta,
@@ -896,7 +1153,11 @@ impl AgentRuntime {
                         .await
                 } else {
                     self.backend
-                        .send(&self.config.model, chat_req.clone(), Some(&chat_options))
+                        .send(
+                            self.config.model_name(),
+                            chat_req.clone(),
+                            Some(&chat_options),
+                        )
                         .await
                 }
             };
@@ -936,7 +1197,7 @@ impl AgentRuntime {
                         Some(RetryTrigger::ReplayRejection) => chat_req = halve_turns(&chat_req),
                         Some(RetryTrigger::CapacityError) => {
                             chat_req = self
-                                .aggressive_request(&retry_history, task, mode, &*summarizer)
+                                .aggressive_request(&retry_history, user, mode, &*summarizer)
                                 .await
                         }
                         // The same request, unstreamed: nothing to rebuild.
@@ -945,7 +1206,7 @@ impl AgentRuntime {
                     // A failure here is the turn's failure: it never buys a
                     // second retry.
                     let retry_send = self.backend.send(
-                        &self.config.model,
+                        self.config.model_name(),
                         chat_req.clone(),
                         Some(&chat_options),
                     );
@@ -962,7 +1223,10 @@ impl AgentRuntime {
             // Track real usage tokens from provider response
             if let Some(total) = response.usage.total_tokens {
                 let prompt = response.usage.prompt_tokens.unwrap_or(0);
-                event_sink(&format!("USAGE:{total}:{prompt}"));
+                event_sink(AgentEvent::Usage {
+                    total_tokens: total,
+                    prompt_tokens: prompt,
+                });
             }
 
             // Surface the model's reasoning so the TUI can render it as a gray
@@ -971,13 +1235,30 @@ impl AgentRuntime {
             if !streamed_thinking && let Some(ref thoughts) = response.reasoning_content {
                 let trimmed = thoughts.trim();
                 if !trimmed.is_empty() {
-                    event_sink(&format!("THINKING:{trimmed}"));
+                    event_sink(AgentEvent::Thinking(trimmed.to_string()));
                 }
             }
 
             let tool_calls = response.tool_calls();
             if tool_calls.is_empty() {
                 let final_text = response.clone().into_first_text().unwrap_or_default();
+                let final_text = if mode == AgentMode::Review {
+                    // A review answer is a report or an error; free prose is not
+                    // a clean result, so it fails the turn instead.
+                    let report = crate::agent::review::parse_report(&final_text)
+                        .map_err(|error| TurnError::Failed(std::io::Error::other(error).into()))?;
+                    let rendered = crate::agent::review::render_report(&report);
+                    event_sink(AgentEvent::Token(rendered.clone()));
+                    rendered
+                } else if mode == AgentMode::Ask {
+                    let validated = sanitize_citations(&final_text, &evidence, &self.security);
+                    if !validated.trim().is_empty() {
+                        event_sink(AgentEvent::Token(validated.clone()));
+                    }
+                    validated
+                } else {
+                    final_text
+                };
 
                 // The filler is not model output: only real text is reported.
                 if !final_text.trim().is_empty() {
@@ -1002,7 +1283,8 @@ impl AgentRuntime {
                 // Auto-Skill Evaluation: a completed task that ran at least two tools is a
                 // candidate workflow (a single call is not), regardless of how many turns it took.
                 if should_auto_distill(mode, steps.len()) {
-                    self.auto_distill_skill(task, &steps, &mut event_sink).await;
+                    let task = user.content.first_text().unwrap_or_default();
+                    self.auto_distill_skill(task, &steps, event_sink).await;
                 }
 
                 return Ok(return_text);
@@ -1036,59 +1318,116 @@ impl AgentRuntime {
                 }
                 last_action = Some(signature);
 
-                let args_summary = match &call.fn_arguments {
-                    serde_json::Value::Object(map) => {
-                        let parts: Vec<String> = map
-                            .iter()
-                            .map(|(k, v)| {
-                                let val_str = match v {
-                                    serde_json::Value::String(s) => {
-                                        // char-safe: byte slicing panics on multibyte args
-                                        if s.chars().count() > 60 {
-                                            let head: String = s.chars().take(57).collect();
-                                            format!("\"{head}...\"")
-                                        } else {
-                                            format!("\"{s}\"")
-                                        }
-                                    }
-                                    other => other.to_string(),
-                                };
-                                format!("{k}={val_str}")
-                            })
-                            .collect();
-                        parts.join(", ")
-                    }
-                    other => other.to_string(),
-                };
+                // The human words for this call, never the arguments the model
+                // wrote: a command, a path, a question.
+                let args_summary = tools::describe_call(tool_name, &call.fn_arguments);
 
                 let args_summary = security::redact(&args_summary);
-                event_sink(&format!("Tool: {tool_name}({args_summary})"));
-                Self::log_tool_call(tool_name, &args_summary, &call.call_id);
+                let call_id = call.call_id.clone();
+                let summary = bounded(&args_summary, SUMMARY_LIMIT);
+                let started_at = crate::util::epoch_secs() as i64;
+                let started = std::time::Instant::now();
+                let mut lifecycle =
+                    |status: ToolStatus,
+                     failure: Option<FailureKind>,
+                     elapsed: Option<std::time::Duration>| {
+                        event_sink(AgentEvent::Tool(ToolEvent {
+                            call_id: call_id.clone(),
+                            name: tool_name.clone(),
+                            summary: summary.clone(),
+                            status,
+                            failure,
+                            started_at,
+                            elapsed,
+                        }));
+                    };
+                lifecycle(ToolStatus::Queued, None, None);
+                Self::log_tool_call(tool_name, &args_summary, &call_id);
                 steps.push(format!("{tool_name}({args_summary})"));
 
-                let (result_str, is_err) = match self.registry.get_for_mode(tool_name, mode) {
-                    Ok(tool) => {
-                        let args = call.fn_arguments.clone();
-                        let destination = tool.destination(&args, &self.security);
-                        let kind = effective_kind(
-                            crate::home::dir().as_deref(),
-                            &self.security,
-                            tool.classify(&args, &self.security),
-                            destination.as_deref(),
-                        );
-                        let detail = destination
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| args_summary.clone());
-                        match self.gate(confirm, kind, tool_name, &detail).await {
-                            Ok(()) => match tool.execute(args, &self.security, cancel).await {
-                                Ok(res) => (res, false),
-                                Err(err) => (format!("Error executing {tool_name}: {err}"), true),
-                            },
-                            Err(denied) => (denied, true),
+                // How the call ended. Kept apart from the result string because
+                // a denial and a failed command must not be the same event.
+                enum ToolEnd {
+                    Done,
+                    Failed(FailureKind),
+                    Cancelled,
+                }
+
+                lifecycle(ToolStatus::Running, None, None);
+                let (result_str, end) = if tool_name == "ask_user" {
+                    // The engine asks the human itself: no later tool call runs
+                    // until the answer arrives, and no provider request starts.
+                    match crate::agent::questions::parse_request(&call_id, &call.fn_arguments) {
+                        Ok(request) => {
+                            let answer = self.questioner.ask(request).await;
+                            // Esc on a question cancels the turn: the sibling
+                            // calls in this response must not run after it.
+                            if answer == crate::agent::questions::QuestionAnswer::Cancelled {
+                                let result = security::redact(&answer.tool_result());
+                                lifecycle(ToolStatus::Cancelled, None, Some(started.elapsed()));
+                                let response =
+                                    ChatMessage::from(ToolResponse::new(call_id.clone(), result));
+                                on_message(&response, crate::session::MessageStatus::Complete);
+                                return Err(cancelled(turn_state));
+                            }
+                            (answer.tool_result(), ToolEnd::Done)
                         }
+                        Err(error) => (
+                            format!("Error executing ask_user: {error}"),
+                            ToolEnd::Failed(FailureKind::Tool),
+                        ),
                     }
-                    Err(err) => (format!("Error executing {tool_name}: {err}"), true),
+                } else {
+                    match self.registry.get_for_mode(tool_name, mode) {
+                        Ok(tool) => {
+                            let args = call.fn_arguments.clone();
+                            let destination = tool.destination(&args, &self.security);
+                            let kind = effective_kind(
+                                crate::home::dir().as_deref(),
+                                &self.security,
+                                tool.classify(&args, &self.security),
+                                destination.as_deref(),
+                            );
+                            let detail = destination
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| args_summary.clone());
+                            match self.gate(mode, confirm, kind, tool_name, &detail).await {
+                                Ok(()) => match tool.execute(args, &self.security, cancel).await {
+                                    // A tool that returns after the cancel landed did
+                                    // not complete: it was cut short, whatever the
+                                    // command itself printed.
+                                    Ok(res) => {
+                                        let end = if cancel.is_cancelled() {
+                                            ToolEnd::Cancelled
+                                        } else {
+                                            ToolEnd::Done
+                                        };
+                                        (res, end)
+                                    }
+                                    Err(err) => {
+                                        let message = format!("Error executing {tool_name}: {err}");
+                                        let end = if cancel.is_cancelled() {
+                                            ToolEnd::Cancelled
+                                        } else {
+                                            ToolEnd::Failed(FailureKind::for_tool_error(&message))
+                                        };
+                                        (message, end)
+                                    }
+                                },
+                                Err(denied) => {
+                                    (denied, ToolEnd::Failed(FailureKind::PermissionDenied))
+                                }
+                            }
+                        }
+                        // The tool exists but this mode does not export it: a
+                        // dispatch bug, not a tool that failed.
+                        Err(err) => (
+                            format!("Error executing {tool_name}: {err}"),
+                            ToolEnd::Failed(FailureKind::Internal),
+                        ),
+                    }
                 };
+                let is_err = !matches!(end, ToolEnd::Done);
 
                 let result_str = security::redact(&result_str);
                 // A cancelled command reports what the OS said; the turn carries it.
@@ -1098,8 +1437,30 @@ impl AgentRuntime {
 
                 Self::log_tool_result(tool_name, is_err, &result_str);
 
+                if mode == AgentMode::Ask && !is_err {
+                    record_evidence(
+                        &mut evidence,
+                        tool_name,
+                        &call.fn_arguments,
+                        &result_str,
+                        &self.security,
+                    );
+                }
+
                 if is_err {
                     if last_failure.as_deref() == Some(result_str.as_str()) {
+                        // This call ends the loop, so it still owes its
+                        // terminal event and its result row before the return.
+                        let failure = match end {
+                            ToolEnd::Failed(failure) => Some(failure),
+                            _ => None,
+                        };
+                        lifecycle(ToolStatus::Failed, failure, Some(started.elapsed()));
+                        let tool_message = ChatMessage::from(ToolResponse::new(
+                            call.call_id.clone(),
+                            result_str.clone(),
+                        ));
+                        on_message(&tool_message, crate::session::MessageStatus::Complete);
                         return Ok(report_stopped(
                             &mut on_message,
                             format!("stopped: the same error repeated twice: {result_str}"),
@@ -1110,15 +1471,17 @@ impl AgentRuntime {
                     last_failure = None;
                 }
 
-                // Emit preview snippet of tool output (first 3 lines or 150 chars)
-                let preview = result_str.lines().take(3).collect::<Vec<_>>().join("\n");
-                let truncated_preview = if result_str.lines().count() > 3 {
-                    format!("{preview}\n  ... (truncated)")
-                } else {
-                    preview
-                };
-
-                event_sink(&format!("Output:\n{truncated_preview}"));
+                match end {
+                    ToolEnd::Done => {
+                        lifecycle(ToolStatus::Completed, None, Some(started.elapsed()))
+                    }
+                    ToolEnd::Failed(failure) => {
+                        lifecycle(ToolStatus::Failed, Some(failure), Some(started.elapsed()));
+                    }
+                    ToolEnd::Cancelled => {
+                        lifecycle(ToolStatus::Cancelled, None, Some(started.elapsed()));
+                    }
+                }
 
                 let tool_message =
                     ChatMessage::from(ToolResponse::new(call.call_id.clone(), result_str));
@@ -1136,7 +1499,7 @@ impl AgentRuntime {
 
         let forced = self
             .backend
-            .send(&self.config.model, forced_req, Some(&chat_options));
+            .send(self.config.model_name(), forced_req, Some(&chat_options));
         let response = match until_cancelled(cancel, forced).await {
             Some(result) => result?,
             None => {
@@ -1166,18 +1529,18 @@ impl AgentRuntime {
     pub(crate) async fn prepare_request(
         &self,
         history: Vec<ChatMessage>,
-        task: &str,
+        user: &ChatMessage,
         mode: AgentMode,
         summarizer: &dyn crate::tui::compact::Summarizer,
-        event_sink: &mut impl FnMut(&str),
+        event_sink: &mut impl FnMut(AgentEvent),
     ) -> ChatRequest {
         use crate::agent::budget::{
             compact, estimate_tokens, keep_recent_budget, request_budget, window_start,
         };
 
-        let limit = model_context_limit(&self.config.model);
+        let limit = model_context_limit(self.config.model_name());
         let budget = request_budget(limit.tokens);
-        let request = self.chat_request(None, &history, task, mode);
+        let request = self.chat_request(None, &history, user, mode);
         if estimate_tokens(&request) <= budget {
             return request;
         }
@@ -1191,15 +1554,15 @@ impl AgentRuntime {
                     let candidate = self.chat_request(
                         Some(&compaction.summary),
                         &compaction.history,
-                        task,
+                        user,
                         mode,
                     );
                     let after = estimate_tokens(&candidate);
                     if after <= budget {
-                        event_sink(&format!(
-                            "System: context compacted ({} → {after} tokens est.)",
+                        event_sink(AgentEvent::Notice(format!(
+                            "context compacted ({} → {after} tokens est.)",
                             compaction.before
-                        ));
+                        )));
                         return candidate;
                     }
                 }
@@ -1207,10 +1570,10 @@ impl AgentRuntime {
                     // A bad summary is worse than none: drop the older turns.
                     let split = window_start(&history, keep);
                     if split > 0 {
-                        event_sink(&format!(
-                            "System: compaction failed ({error}); older turns dropped"
-                        ));
-                        return self.chat_request(None, &history[split..], task, mode);
+                        event_sink(AgentEvent::Notice(format!(
+                            "compaction failed ({error}); older turns dropped"
+                        )));
+                        return self.chat_request(None, &history[split..], user, mode);
                     }
                     break;
                 }
@@ -1220,15 +1583,17 @@ impl AgentRuntime {
 
         // Last resort: the newest turn alone, never truncated.
         let split = window_start(&history, 0);
-        let request = self.chat_request(None, &history[split..], task, mode);
+        let request = self.chat_request(None, &history[split..], user, mode);
         let estimate = estimate_tokens(&request);
         if estimate > budget {
-            event_sink(&format!(
-                "System: {estimate} tokens exceeds the {budget} budget for {}; sending the newest turn anyway",
-                self.config.model
-            ));
+            event_sink(AgentEvent::Notice(format!(
+                "{estimate} tokens exceeds the {budget} budget for {}; sending the newest turn anyway",
+                self.config.model_name()
+            )));
         } else {
-            event_sink("System: compaction did not fit the budget; older turns dropped");
+            event_sink(AgentEvent::Notice(
+                "compaction did not fit the budget; older turns dropped".to_string(),
+            ));
         }
         request
     }
@@ -1237,7 +1602,7 @@ impl AgentRuntime {
         &self,
         summary: Option<&str>,
         history: &[ChatMessage],
-        task: &str,
+        user: &ChatMessage,
         mode: AgentMode,
     ) -> ChatRequest {
         let system_prompt = self
@@ -1259,7 +1624,8 @@ impl AgentRuntime {
         for message in history {
             request = request.append_message(message.clone());
         }
-        request.append_message(ChatMessage::user(task))
+        // The store's own row: one text part, one part per image.
+        request.append_message(user.clone())
     }
 
     /// The capacity-error retry: compact against 40 % of the budget, keep the
@@ -1267,21 +1633,21 @@ impl AgentRuntime {
     async fn aggressive_request(
         &self,
         history: &[ChatMessage],
-        task: &str,
+        user: &ChatMessage,
         mode: AgentMode,
         summarizer: &dyn crate::tui::compact::Summarizer,
     ) -> ChatRequest {
         use crate::agent::budget::{compact, request_budget, window_start};
 
-        let limit = model_context_limit(&self.config.model);
+        let limit = model_context_limit(self.config.model_name());
         let aggressive = request_budget(limit.tokens) * 40 / 100;
         match compact(history, aggressive, summarizer).await {
             Ok(compaction) => {
-                self.chat_request(Some(&compaction.summary), &compaction.history, task, mode)
+                self.chat_request(Some(&compaction.summary), &compaction.history, user, mode)
             }
             Err(_) => {
                 let split = window_start(history, 0);
-                self.chat_request(None, &history[split..], task, mode)
+                self.chat_request(None, &history[split..], user, mode)
             }
         }
     }
@@ -1290,61 +1656,35 @@ impl AgentRuntime {
     /// answer's persistence. A denial is a tool result, never a turn failure.
     pub(crate) async fn gate(
         &self,
+        mode: AgentMode,
         confirm: &dyn Confirmer,
         kind: ActionKind,
         tool: &str,
         detail: &str,
     ) -> Result<(), String> {
         let denied = || format!("Permission denied: {}", kind.effect(detail));
-        match permissions::decide(self.permission_mode(), &self.permitted_kinds(), kind) {
+        let (permission_mode, permitted) = self.permissions(mode);
+        match permissions::decide(permission_mode, &permitted, kind) {
             Verdict::Allow => return Ok(()),
             Verdict::Deny => return Err(denied()),
             Verdict::Ask => {}
         }
 
-        let answer = confirm
-            .confirm(PermissionRequest::new(kind, tool, detail))
-            .await;
         let path = crate::cli::config::workspace_config_path(self.security.root());
-        match answer {
-            Answer::Once => Ok(()),
-            Answer::Category => match crate::cli::config::append_permitted(&path, kind) {
-                Ok(kinds) => {
-                    tracing::info!(action = %kind.name(), ?kinds, "permitted action recorded");
-                    Ok(())
-                }
-                // The user answered; a config that cannot record it must not
-                // turn an approval into a denial.
-                Err(error) => {
-                    tracing::warn!(%error, action = %kind.name(), "could not record permitted action");
-                    Ok(())
-                }
-            },
-            Answer::Unrestricted => {
-                if let Err(error) = crate::cli::config::set_value(
-                    &path,
-                    crate::cli::config::ConfigKey::ToolPermissions,
-                    "allow",
-                ) {
-                    tracing::warn!(%error, "could not persist tool_permissions");
-                }
-                Ok(())
-            }
-            Answer::Deny => Err(denied()),
-        }
+        permissions::approve(confirm, kind, tool, detail, &path).await
     }
 
     /// An invalid mode asks rather than allowing: a broken config must not widen
     /// permissions.
-    fn permission_mode(&self) -> PermissionMode {
-        permissions::parse_mode(&self.config.tool_permissions).unwrap_or_else(|error| {
-            tracing::warn!(%error, "tool_permissions is invalid; asking");
-            PermissionMode::Ask
-        })
-    }
-
-    fn permitted_kinds(&self) -> Vec<ActionKind> {
-        permissions::parse_permitted(&self.config.permitted_actions).unwrap_or_default()
+    fn permissions(&self, mode: AgentMode) -> (PermissionMode, Vec<ActionKind>) {
+        let configured =
+            permissions::parse_mode(&self.config.tool_permissions).unwrap_or_else(|error| {
+                tracing::warn!(%error, "tool_permissions is invalid; asking");
+                PermissionMode::Ask
+            });
+        let permitted =
+            permissions::parse_permitted(&self.config.permitted_actions).unwrap_or_default();
+        mode_permissions(mode, configured, permitted)
     }
 
     /// The only place tool activity is logged, so redaction cannot be forgotten
@@ -1436,9 +1776,11 @@ impl AgentRuntime {
         &self,
         task: &str,
         steps: &[String],
-        event_sink: &mut (impl FnMut(&str) + Send),
+        event_sink: &mut (impl FnMut(AgentEvent) + Send),
     ) {
-        event_sink("System: evaluating workflow for automatic skill synthesis...");
+        event_sink(AgentEvent::Notice(
+            "evaluating workflow for automatic skill synthesis...".to_string(),
+        ));
         let trace = steps
             .iter()
             .enumerate()
@@ -1454,17 +1796,29 @@ impl AgentRuntime {
             task, trace
         );
 
+        // No client means no provider: the evaluator is skipped, not retried.
+        let Some(client) = &self.client else {
+            return;
+        };
         let req = ChatRequest::from_user(prompt);
-        let options = self.chat_options();
-        let res = match self
-            .client
-            .exec_chat(&self.config.model, req, Some(&options))
+        // Deliberately not `chat_options`: the evaluator asks for one short
+        // classification, and a reasoning budget turns it into extended thinking
+        // — which an anthropic-shaped proxy can answer without the block
+        // signature genai requires, failing the request outright.
+        let options = ChatOptions::default();
+        let res = match client
+            .exec_chat(self.config.model_name(), req, Some(&options))
             .await
         {
             Ok(res) => res,
             Err(err) => {
                 tracing::warn!(error = %err, "Skill synthesis skipped: evaluator request failed");
-                event_sink(&format!("System: skill evaluator request failed: {err}"));
+                // One line: the error carries the whole request body, and that
+                // belongs in the log, not in the transcript.
+                event_sink(AgentEvent::Notice(format!(
+                    "skill evaluator skipped: {}",
+                    one_line(&err.to_string())
+                )));
                 return;
             }
         };
@@ -1473,7 +1827,9 @@ impl AgentRuntime {
         let trimmed = text.trim();
         if !(trimmed.starts_with("---") && trimmed.contains("name:")) {
             tracing::info!("Skill synthesis skipped: evaluator returned no skill");
-            event_sink("System: no repeatable workflow found, skill not saved");
+            event_sink(AgentEvent::Notice(
+                "no repeatable workflow found, skill not saved".to_string(),
+            ));
             return;
         }
 
@@ -1483,7 +1839,9 @@ impl AgentRuntime {
                 ?confidence,
                 "Skill synthesis skipped: confidence below threshold"
             );
-            event_sink("System: workflow rated below singularity threshold, skill not saved");
+            event_sink(AgentEvent::Notice(
+                "workflow rated below singularity threshold, skill not saved".to_string(),
+            ));
             return;
         }
 
@@ -1494,17 +1852,187 @@ impl AgentRuntime {
         match mgr.save_skill(&name, trimmed) {
             Ok(saved_path) => {
                 tracing::info!(skill = %name, "Automatically created high-confidence skill from workflow");
-                event_sink(&format!(
-                    "System: skill synthesized -> {}",
+                event_sink(AgentEvent::Notice(format!(
+                    "skill synthesized -> {}",
                     saved_path.display()
-                ));
+                )));
             }
             Err(err) => {
                 tracing::warn!(error = %err, "Skill synthesis failed: cannot persist skill");
-                event_sink(&format!("System: skill synthesis failed: {err}"));
+                event_sink(AgentEvent::Notice(format!("skill synthesis failed: {err}")));
             }
         }
     }
+}
+
+/// Lines one Ask turn actually observed: canonical path -> 1-based lines.
+///
+/// Only `read_file` content and `search_files` content hits feed it. A directory
+/// listing names files without showing them, so it authorizes nothing.
+type Evidence = std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<usize>>;
+
+/// Record what a successful read or content search returned, keyed by the
+/// canonical path the security check produced.
+fn record_evidence(
+    evidence: &mut Evidence,
+    tool: &str,
+    args: &serde_json::Value,
+    output: &str,
+    security: &WorkspaceSecurity,
+) {
+    match tool {
+        "read_file" => {
+            let Some(requested) = args.get("path").and_then(|value| value.as_str()) else {
+                return;
+            };
+            let Ok(path) = security.validate_path(requested) else {
+                return;
+            };
+            let lines = evidence.entry(path).or_default();
+            for line in output.lines() {
+                // `N|text`; only the row number is evidence.
+                if let Some((number, _)) = line.split_once('|')
+                    && let Ok(number) = number.parse::<usize>()
+                {
+                    lines.insert(number);
+                }
+            }
+        }
+        "search_files" => {
+            for line in output.lines() {
+                let Some((requested, number)) = split_search_hit(line) else {
+                    continue;
+                };
+                let Ok(path) = security.validate_path(requested) else {
+                    continue;
+                };
+                evidence.entry(path).or_default().insert(number);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `path:line: text` as a content search prints it. The path may carry a colon
+/// (a Windows drive), so the first `:<digits>: ` run splits it.
+fn split_search_hit(line: &str) -> Option<(&str, usize)> {
+    let bytes = line.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes[index] != b':' {
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > start && line[end..].starts_with(": ") {
+            return Some((&line[..index], line[start..end].parse().ok()?));
+        }
+    }
+    None
+}
+
+/// Mark every citation whose path or line this turn did not observe. The text is
+/// left intact otherwise: no line number is ever rewritten or invented.
+fn sanitize_citations(answer: &str, evidence: &Evidence, security: &WorkspaceSecurity) -> String {
+    let bytes = answer.as_bytes();
+    let mut out = String::with_capacity(answer.len());
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b':' {
+            index += 1;
+            continue;
+        }
+        let low_start = index + 1;
+        let mut low_end = low_start;
+        while low_end < bytes.len() && bytes[low_end].is_ascii_digit() {
+            low_end += 1;
+        }
+        if low_end == low_start {
+            index += 1;
+            continue;
+        }
+        let Ok(low) = answer[low_start..low_end].parse::<usize>() else {
+            index += 1;
+            continue;
+        };
+        // `path:3-9` cites a range; every line in it must have been read.
+        let mut high = low;
+        let mut after = low_end;
+        if bytes.get(low_end) == Some(&b'-') {
+            let mut range_end = low_end + 1;
+            while range_end < bytes.len() && bytes[range_end].is_ascii_digit() {
+                range_end += 1;
+            }
+            if let Ok(parsed) = answer[low_end + 1..range_end].parse::<usize>() {
+                high = parsed;
+                after = range_end;
+            }
+        }
+        // The path token runs back to the nearest separator.
+        let mut start = index;
+        while start > 0 {
+            let previous = bytes[start - 1];
+            if previous.is_ascii_whitespace()
+                || matches!(
+                    previous,
+                    b'`' | b'(' | b'[' | b'"' | b'\'' | b',' | b'*' | b'<' | b'|'
+                )
+            {
+                break;
+            }
+            start -= 1;
+        }
+        if start == index {
+            index = after;
+            continue;
+        }
+        let path = &answer[start..index];
+        // A clock time, a ratio or a URL port also reads as `x:123`. Only a
+        // file-shaped token is a citation; everything else is left alone.
+        if !path_like(path) {
+            index = after;
+            continue;
+        }
+        let verified = citation_is_verified(path, low, high, evidence, security);
+        out.push_str(&answer[copied..after]);
+        if !verified {
+            out.push_str(" (unverified)");
+        }
+        copied = after;
+        index = after;
+    }
+    out.push_str(&answer[copied..]);
+    out
+}
+
+/// A citation token names a file: it carries a separator or an extension, and it
+/// is not a URL. Without this, `10:30` and `http://host:8080` would be tagged.
+fn path_like(token: &str) -> bool {
+    !token.contains("://") && (token.contains('/') || token.contains('.'))
+}
+
+/// A citation is verified only when its path resolves inside the workspace, is
+/// not protected, and every cited line came back from this turn's tools.
+fn citation_is_verified(
+    path: &str,
+    low: usize,
+    high: usize,
+    evidence: &Evidence,
+    security: &WorkspaceSecurity,
+) -> bool {
+    if low == 0 || high < low {
+        return false;
+    }
+    let Ok(canonical) = security.validate_path(path) else {
+        return false;
+    };
+    let Some(lines) = evidence.get(&canonical) else {
+        return false;
+    };
+    (low..=high).all(|line| lines.contains(&line))
 }
 
 /// Confidence percentage declared in a synthesized skill's frontmatter.
@@ -1530,6 +2058,39 @@ mod mode_policy_tests {
     fn build_mode_leaves_the_prompt_unchanged() {
         let prompt = "base prompt".to_string();
         assert_eq!(with_mode_policy(prompt.clone(), AgentMode::Build), prompt);
+    }
+
+    #[test]
+    fn review_mode_appends_the_review_policy() {
+        let prompt = with_mode_policy("base prompt".to_string(), AgentMode::Review);
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("# REVIEW MODE ACTIVE"), "{prompt}");
+        for part in ["severity", "confirmed", "hypothesis", "remediation"] {
+            assert!(prompt.contains(part), "{part} must be named: {prompt}");
+        }
+        assert!(
+            prompt.to_lowercase().contains("never claim"),
+            "a review must not claim a test it did not run: {prompt}"
+        );
+        assert!(!prompt.contains("# PLAN MODE ACTIVE"), "{prompt}");
+    }
+
+    #[test]
+    fn ask_mode_appends_the_ask_policy() {
+        let prompt = with_mode_policy("base prompt".to_string(), AgentMode::Ask);
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("# ASK MODE ACTIVE"), "{prompt}");
+        for part in ["Verified", "Inference", "Unknown"] {
+            assert!(prompt.contains(part), "{part} must be named: {prompt}");
+        }
+        assert!(
+            prompt.contains("path:line"),
+            "citations carry a path and a line: {prompt}"
+        );
+        assert!(
+            !prompt.contains("# PLAN MODE ACTIVE"),
+            "Ask is not Plan: {prompt}"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, ModalSelection};
+use crate::tui::event::Action;
 
 /// Wrap-around previous index; no-op-safe when the list is empty.
 pub(super) fn prev_index(sel: usize, len: usize) -> usize {
@@ -17,19 +18,23 @@ pub(super) fn next_index(sel: usize, len: usize) -> usize {
 }
 
 impl App<'_> {
-    /// Open the cached-model picker. Returns `false` when the cache is empty.
+    /// Open the cached-model picker. Returns `false` when the cache is empty and
+    /// a fetch is needed: the modal is open and empty, so the caller starts the
+    /// same refresh `ctrl+r` runs.
     pub fn open_model_picker(&mut self) -> bool {
         let models = cached_models(self);
         if models.is_empty() {
-            self.set_text("No cached models found. Run `seavx model` once to populate cache.");
-            self.scroll = 0;
-            self.auto_scroll = true;
+            self.modal = Some(ModalSelection::Model {
+                models,
+                query: String::new(),
+                selected: 0,
+            });
             return false;
         }
 
         let current_idx = models
             .iter()
-            .position(|m| *m == self.config.model)
+            .position(|m| Some(m.as_str()) == self.config.model.as_deref())
             .unwrap_or(0);
         self.modal = Some(ModalSelection::Model {
             models,
@@ -41,6 +46,91 @@ impl App<'_> {
 
     /// Move the open model picker's cursor by one row, wrapping. Arrows and the
     /// wheel both land here, so the cursor never leaves the filtered rows.
+    /// List every preset with its first lines, so the picker can preview one
+    /// before it is applied. Reading happens once, here.
+    pub fn open_preset_picker(&mut self) -> bool {
+        let found = crate::agent::presets::list(&self.root);
+        if found.is_empty() {
+            self.push_notice(
+                "No presets yet. Add .seavx/prompts/<name>.md (project) or ~/.seavx/prompts/<name>.md (everywhere)."
+                    .to_string(),
+            );
+            return false;
+        }
+        let mut names = Vec::with_capacity(found.len());
+        let mut previews = Vec::with_capacity(found.len());
+        for (name, _path) in found {
+            let preview = match crate::agent::presets::load(&self.root, &name) {
+                Ok(text) => preset_preview(&text),
+                // A preset that cannot be read is still listed: the reason is
+                // what the user needs to fix, and hiding the row loses it.
+                Err(error) => error,
+            };
+            names.push(name);
+            previews.push(preview);
+        }
+        self.modal = Some(ModalSelection::Preset {
+            names,
+            previews,
+            query: String::new(),
+            selected: 0,
+        });
+        true
+    }
+
+    /// Put one preset in the next prompt. Shared by `/preset <name>` and the
+    /// picker, so both say the same thing and neither touches the policy.
+    pub fn apply_preset(&mut self, name: &str) {
+        match crate::agent::presets::load(&self.root, name) {
+            Ok(text) => {
+                let preview: Vec<&str> = text.lines().take(3).collect();
+                self.set_input(&text);
+                self.push_notice(format!(
+                    "Preset '{name}' loaded into the prompt:\n{}",
+                    preview.join("\n")
+                ));
+            }
+            Err(error) => self.push_notice(error),
+        }
+    }
+
+    /// Copy one Markdown file into the project presets, so `/preset <name>`
+    /// can use it. Nothing is applied: the user decides when.
+    pub fn add_preset(&mut self, path: &str) {
+        match crate::agent::presets::add(&self.root, path) {
+            Ok((name, target)) => self.push_notice(format!(
+                "Added preset '{name}' at {}.\n/preset {name} puts it in the next prompt.",
+                target.display()
+            )),
+            Err(error) => self.push_notice(error),
+        }
+    }
+
+    /// Move inside the preset picker, wrapping over the visible rows.
+    pub fn step_preset_picker(&mut self, down: bool) {
+        let Some(ModalSelection::Preset {
+            names,
+            previews,
+            query,
+            selected,
+        }) = self.modal.take()
+        else {
+            return;
+        };
+        let len = visible_presets(&names, &query).len();
+        let selected = if down {
+            next_index(selected, len)
+        } else {
+            prev_index(selected, len)
+        };
+        self.modal = Some(ModalSelection::Preset {
+            names,
+            previews,
+            query,
+            selected,
+        });
+    }
+
     pub fn step_model_picker(&mut self, down: bool) {
         let Some(ModalSelection::Model {
             models,
@@ -63,6 +153,28 @@ impl App<'_> {
         });
     }
 
+    /// Fetch the endpoint's model list off the UI thread. `ctrl+r` and a cold
+    /// picker both come through here; nothing awaits the request.
+    pub fn spawn_model_refresh(&mut self, tx: &tokio::sync::mpsc::UnboundedSender<Action>) {
+        let Some(base_url) = self.config.base_url.clone() else {
+            if let Some(ModalSelection::Model { .. }) = self.modal {
+                self.modal = None;
+            }
+            self.push_notice("no endpoint configured: run `seavx setup`");
+            return;
+        };
+        self.refreshing_models = true;
+        let api_key = self.config.api_key.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let model_mgr = crate::agent::models::ModelManager::new(std::path::Path::new("."));
+            let outcome = model_mgr
+                .refresh_remote_models(&base_url, api_key.as_deref())
+                .await;
+            let _ = tx.send(Action::ModelsRefreshed(outcome));
+        });
+    }
+
     /// Land a finished `/models` refresh: the spinner stops and the picker shows
     /// the new list. A picker closed while the fetch ran stays closed, and only
     /// the toast reports the outcome.
@@ -81,7 +193,7 @@ impl App<'_> {
                 if let Some(query) = query {
                     let selected = visible_models(&models, &query)
                         .iter()
-                        .position(|model| **model == self.config.model)
+                        .position(|model| Some(model.as_str()) == self.config.model.as_deref())
                         .unwrap_or(0);
                     self.modal = Some(ModalSelection::Model {
                         models,
@@ -95,31 +207,39 @@ impl App<'_> {
                 ));
             }
             Err(error) => {
-                self.toast = Some((
-                    format!("✗ Refresh failed: {error}"),
-                    std::time::Instant::now(),
-                ));
+                // A picker opened with nothing cached was waiting for this list:
+                // it has nothing to show, so it closes and the host is named.
+                let empty_picker = matches!(
+                    &self.modal,
+                    Some(ModalSelection::Model { models, .. }) if models.is_empty()
+                );
+                if empty_picker {
+                    self.modal = None;
+                    let host = self
+                        .config
+                        .base_url
+                        .as_deref()
+                        .map(crate::agent::models::ModelManager::domain_slug)
+                        .unwrap_or_else(|| "no endpoint".to_string());
+                    self.push_notice(format!("{host}: {error}"));
+                } else {
+                    self.toast = Some((
+                        format!("✗ Refresh failed: {error}"),
+                        std::time::Instant::now(),
+                    ));
+                }
             }
         }
     }
 
-    /// Open the session picker from this store's listing for the current
-    /// workspace. Returns `false` when there is nothing to pick, so the caller
-    /// can say so instead of opening an empty modal.
-    pub fn open_session_picker(&mut self, store: &crate::session::SessionStore) -> bool {
-        let rows = match crate::cli::sessions::session_rows(store, &crate::session::workspace_key())
-        {
-            Ok(rows) if rows.is_empty() => {
-                self.push_notice("No sessions yet. Start one by sending a prompt.");
-                return false;
-            }
-            Ok(rows) => rows,
-            Err(error) => {
-                self.push_notice(format!("Sessions unavailable: {error}"));
-                return false;
-            }
-        };
-
+    /// Open the session picker on rows already read off the event loop.
+    /// Returns `false` when there is nothing to pick, so the caller can say so
+    /// instead of opening an empty modal.
+    pub fn show_session_picker(&mut self, rows: Vec<String>) -> bool {
+        if rows.is_empty() {
+            self.push_notice("No sessions yet. Start one by sending a prompt.");
+            return false;
+        }
         self.modal = Some(ModalSelection::Session { rows, selected: 0 });
         true
     }
@@ -134,6 +254,25 @@ impl App<'_> {
                 return;
             }
         };
+        // A literal name is only writable when the cached list holds it; with no
+        // list at all, the picker is the way to fetch one.
+        if target.parse::<usize>().is_err()
+            && (models.is_empty()
+                || crate::agent::models::check_model(&models, &resolved_model)
+                    == crate::agent::models::ModelCheck::NotListed)
+        {
+            let host = self
+                .config
+                .base_url
+                .as_deref()
+                .map(crate::agent::models::ModelManager::domain_slug)
+                .unwrap_or_else(|| "no endpoint".to_string());
+            self.push_notice(format!(
+                "'{resolved_model}' is not in the {} models {host} lists; run /model to pick one",
+                models.len()
+            ));
+            return;
+        }
 
         let config_path = crate::cli::config::workspace_config_path(std::path::Path::new("."));
         // One write: the model and the effort change together or not at all.
@@ -148,7 +287,7 @@ impl App<'_> {
 
         let mut message = format!(
             "Switched model to: {}\nEffort: {}\nSaved to .seavx/config.toml",
-            self.config.model,
+            self.config.model.as_deref().unwrap_or("not set"),
             self.config.reasoning_effort.as_deref().unwrap_or("none")
         );
         for error in errors {
@@ -175,6 +314,32 @@ pub fn visible_models<'a>(models: &'a [String], query: &str) -> Vec<&'a String> 
         .collect()
 }
 
+/// Preset rows a query keeps, in list order. The search box filters the names
+/// the same way every site that draws or selects reads them.
+pub fn visible_presets(names: &[String], query: &str) -> Vec<usize> {
+    let wanted = query.trim().to_ascii_lowercase();
+    names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| wanted.is_empty() || name.to_ascii_lowercase().contains(&wanted))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The lines a picker shows for one preset: enough to recognise it, never the
+/// whole file, and one line per row.
+fn preset_preview(text: &str) -> String {
+    const LINES: usize = 12;
+    let mut preview: Vec<&str> = text.lines().take(LINES).collect();
+    let more = text.lines().count() > LINES;
+    let mut out = preview.join("\n");
+    preview.clear();
+    if more {
+        out.push_str("\n...");
+    }
+    out
+}
+
 /// The picker's search box: a printable key appends, Backspace deletes one
 /// character. `None` means the key is not text, so the caller keeps it.
 pub(super) fn edit_query(query: &str, key: &KeyEvent) -> Option<String> {
@@ -196,11 +361,11 @@ pub(super) fn edit_query(query: &str, key: &KeyEvent) -> Option<String> {
 /// A cache past its TTL still answers: an old list beats an empty picker, and
 /// `seavx model` is what refreshes it.
 fn cached_models(app: &App) -> Vec<String> {
-    let base_url = app
-        .config
-        .base_url
-        .as_deref()
-        .unwrap_or(crate::agent::engine::DEFAULT_BASE_URL);
+    // No endpoint configured is no cache to read: the picker says so instead of
+    // listing whatever a default host would have.
+    let Some(base_url) = app.config.base_url.as_deref() else {
+        return Vec::new();
+    };
     let model_mgr = crate::agent::models::ModelManager::new(std::path::Path::new("."));
     model_mgr
         .get_cached_models_allow_stale(&crate::agent::models::ModelManager::domain_slug(base_url))

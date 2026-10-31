@@ -79,6 +79,18 @@ impl TurnStatus {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed | Self::Failed)
     }
+
+    /// The ledger spelling. `Running` and `Cancelling` only exist mid-turn, so
+    /// they are named for completeness rather than because a row carries them.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Cancelling => "cancelling",
+            Self::Cancelled => "cancelled",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// What the OS said about a killed process tree. Only the reported value is

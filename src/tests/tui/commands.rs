@@ -26,6 +26,16 @@ fn parses_existing_commands_and_arguments() {
 }
 
 #[test]
+fn test_takes_no_arguments() {
+    assert_eq!(parse("/test"), Some(SlashCommand::Test));
+    assert_eq!(
+        parse("/test extra"),
+        Some(SlashCommand::Unknown("/test extra".into())),
+        "an argument is a usage error, not a run of the default command"
+    );
+}
+
+#[test]
 fn busy_app_rejects_clear_but_allows_help_and_exit() {
     let mut app = crate::tui::app::test_app();
     app.status = AgentState::Streaming;
@@ -77,6 +87,25 @@ fn every_registry_entry_parses_to_a_handled_command() {
                 mode: AgentMode::Plan,
             },
         ),
+        (
+            "/ask",
+            SlashCommand::Ask {
+                question: String::new(),
+            },
+        ),
+        (
+            "/review",
+            SlashCommand::Review {
+                target: crate::agent::git_review::ReviewTarget::WorkingTree,
+            },
+        ),
+        (
+            "/goal",
+            SlashCommand::Goal {
+                action: GoalAction::Show(None),
+            },
+        ),
+        ("/tasks", SlashCommand::Tasks),
         ("/clear", SlashCommand::Clear),
         ("/new", SlashCommand::Clear),
         ("/help", SlashCommand::Help),
@@ -94,9 +123,24 @@ fn every_registry_entry_parses_to_a_handled_command() {
                 action: SkillsAction::List,
             },
         ),
+        ("/preset", SlashCommand::Preset { name: None }),
+        ("/test", SlashCommand::Test),
+        (
+            "/steer",
+            SlashCommand::Steer {
+                text: String::new(),
+            },
+        ),
+        (
+            "/queue",
+            SlashCommand::Queue {
+                prompt: String::new(),
+            },
+        ),
         ("/undo", SlashCommand::Undo),
         ("/sessions", SlashCommand::Sessions { index: None }),
         ("/resume", SlashCommand::Sessions { index: None }),
+        ("/status", SlashCommand::Status),
         ("/exit", SlashCommand::Exit),
     ];
 
@@ -133,6 +177,10 @@ fn every_handled_command_appears_in_the_registry() {
         "/compact",
         "/config",
         "/plan",
+        "/ask",
+        "/review",
+        "/goal",
+        "/tasks",
         "/clear",
         "/new",
         "/help",
@@ -143,6 +191,7 @@ fn every_handled_command_appears_in_the_registry() {
         "/undo",
         "/sessions",
         "/resume",
+        "/status",
         "/exit",
     ];
     for name in handled {
@@ -174,6 +223,12 @@ fn every_handled_command_appears_in_the_registry() {
         },
         SlashCommand::Plan {
             mode: AgentMode::Build,
+        },
+        SlashCommand::Ask {
+            question: String::new(),
+        },
+        SlashCommand::Review {
+            target: crate::agent::git_review::ReviewTarget::WorkingTree,
         },
         SlashCommand::Clear,
         SlashCommand::Help,
@@ -213,6 +268,12 @@ fn the_palette_is_the_table() {
             "/compact",
             "/config",
             "/plan",
+            "/ask",
+            "/review",
+            "/preset",
+            "/test",
+            "/steer",
+            "/queue",
             "/clear",
             "/new",
             "/help",
@@ -223,6 +284,9 @@ fn the_palette_is_the_table() {
             "/undo",
             "/sessions",
             "/resume",
+            "/goal",
+            "/tasks",
+            "/status",
             "/exit"
         ]
     );
@@ -561,7 +625,7 @@ fn fixture_store() -> (tempfile::TempDir, crate::session::SessionStore, String) 
     let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
     let workspace = "test-workspace".to_string();
     for prompt in ["first prompt", "second prompt"] {
-        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt).unwrap();
+        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt, &[]).unwrap();
     }
     (temp, store, workspace)
 }
@@ -628,6 +692,71 @@ fn sessions_opens_the_picker_and_resumes_a_number() {
 }
 
 #[test]
+fn the_session_verbs_parse_into_one_op_command() {
+    let fork = |id: &str, at: Option<i64>| SlashCommand::SessionsOp {
+        op: SessionsOp::Fork {
+            id: id.to_string(),
+            at,
+        },
+    };
+    let archive = |id: &str, archived: bool| SlashCommand::SessionsOp {
+        op: SessionsOp::Archive {
+            id: id.to_string(),
+            archived,
+        },
+    };
+
+    assert_eq!(parse("/sessions fork 3"), Some(fork("3", None)));
+    assert_eq!(parse("/sessions fork 3 --at 2"), Some(fork("3", Some(2))));
+    assert_eq!(parse("/sessions archive 3"), Some(archive("3", true)));
+    assert_eq!(parse("/sessions unarchive 3"), Some(archive("3", false)));
+    // The query is every remaining word, with `--all` read off its tail.
+    assert_eq!(
+        parse("/sessions find a b --all"),
+        Some(SlashCommand::SessionsOp {
+            op: SessionsOp::Search {
+                query: "a b".to_string(),
+                all: true,
+            },
+        })
+    );
+    assert_eq!(
+        parse("/sessions find a b"),
+        Some(SlashCommand::SessionsOp {
+            op: SessionsOp::Search {
+                query: "a b".to_string(),
+                all: false,
+            },
+        })
+    );
+
+    // A fork names its source and a real sequence: both forms are refused.
+    assert!(matches!(
+        parse("/sessions fork"),
+        Some(SlashCommand::Unknown(_))
+    ));
+    assert!(matches!(
+        parse("/sessions fork 3 --at 0"),
+        Some(SlashCommand::Unknown(_))
+    ));
+    assert!(matches!(
+        parse("/sessions find"),
+        Some(SlashCommand::Unknown(_))
+    ));
+
+    let mut app = crate::tui::app::test_app();
+    assert_eq!(
+        execute(&mut app, fork("3", Some(2))),
+        CommandEffect::RunSessionsOp {
+            op: SessionsOp::Fork {
+                id: "3".to_string(),
+                at: Some(2),
+            },
+        }
+    );
+}
+
+#[test]
 fn resuming_a_read_only_session_is_refused_with_the_reason() {
     let (_temp, store, workspace) = fixture_store();
     store
@@ -665,5 +794,655 @@ fn the_readme_command_table_matches_the_registry() {
     assert_eq!(
         names, registered,
         "the README command table and the registry drifted; the palette is generated from the registry"
+    );
+}
+
+#[test]
+fn parses_status_without_arguments() {
+    assert_eq!(parse("/status"), Some(SlashCommand::Status));
+    assert_eq!(
+        parse("/status now"),
+        Some(SlashCommand::Unknown("/status now".into()))
+    );
+}
+
+#[test]
+fn status_reports_the_running_tool_and_the_session_without_history() {
+    let mut app = crate::tui::app::test_app();
+    app.status = AgentState::ExecutingTool("read_file(path=\"note.txt\")".into());
+    app.session_id = Some(7);
+    app.session_title = Some("Fix the parser".into());
+
+    let text = status_text(&app);
+    assert!(text.contains("read_file"), "{text}");
+    assert!(text.contains('7'), "{text}");
+    assert!(text.contains("Fix the parser"), "{text}");
+    // Compact state only: no event rows, no payloads, no transcript.
+    assert!(!text.contains("Tool:"), "{text}");
+    assert!(!text.contains("queued"), "{text}");
+    assert!(!text.contains("completed"), "{text}");
+}
+
+#[test]
+fn status_reports_a_pending_permission() {
+    let mut app = crate::tui::app::test_app();
+    let (reply, _answer) = tokio::sync::oneshot::channel();
+    app.pending_permission = Some(crate::tui::app::PendingPermission {
+        request: crate::agent::permissions::PermissionRequest::new(
+            crate::agent::permissions::ActionKind::Execute,
+            "run_command",
+            "cargo test",
+        ),
+        reply,
+    });
+
+    let text = status_text(&app);
+    assert!(text.contains("waiting for permission"), "{text}");
+    assert!(text.contains("run cargo test"), "{text}");
+    assert!(text.contains("(execute)"), "{text}");
+}
+
+#[test]
+fn status_reports_a_pending_question_on_one_bounded_line() {
+    let mut app = crate::tui::app::test_app();
+    app.pending_question = Some(crate::tui::app::PendingQuestion {
+        id: 4,
+        question: "Which file should I patch?\nand a second line".to_string(),
+        kind: crate::session::QuestionKind::Text,
+        options: Vec::new(),
+        selected: 0,
+        chosen: std::collections::BTreeSet::new(),
+        text: String::new(),
+        reply: None,
+    });
+
+    let text = status_text(&app);
+    assert!(text.contains("waiting for an answer"), "{text}");
+    assert!(text.contains("Which file should I patch?"), "{text}");
+    assert!(
+        !text.contains("second line"),
+        "a status row stays one line: {text}"
+    );
+}
+
+#[test]
+fn a_long_pending_question_is_capped_in_the_status_line() {
+    let mut app = crate::tui::app::test_app();
+    app.pending_question = Some(crate::tui::app::PendingQuestion {
+        id: 5,
+        question: "x".repeat(400),
+        kind: crate::session::QuestionKind::Single,
+        options: vec!["a".to_string()],
+        selected: 0,
+        chosen: std::collections::BTreeSet::new(),
+        text: String::new(),
+        reply: None,
+    });
+
+    let text = status_text(&app);
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("waiting for an answer"))
+        .expect("the question row is reported");
+    assert!(row.ends_with("(single)"), "{row}");
+    assert!(row.chars().count() < 120, "the row is bounded: {row}");
+}
+
+#[test]
+fn status_shows_persistence_only_when_degraded() {
+    let mut app = crate::tui::app::test_app();
+    app.session_id = Some(3);
+    let healthy = status_text(&app);
+    assert!(!healthy.contains("persistence"), "{healthy}");
+
+    app.persistence_error = Some("Session history disabled: busy".into());
+    let degraded = status_text(&app);
+    assert!(degraded.contains("persistence"), "{degraded}");
+    assert!(degraded.contains("busy"), "{degraded}");
+}
+
+#[test]
+fn status_never_reports_an_idle_app_as_busy_and_works_mid_turn() {
+    let mut app = crate::tui::app::test_app();
+    assert!(
+        execute(&mut app, SlashCommand::Status) == CommandEffect::Handled,
+        "an idle app answers /status"
+    );
+
+    // Busy is exactly when the user needs it: the busy gate must not swallow it.
+    app.status = AgentState::Thinking;
+    assert_eq!(
+        execute(&mut app, SlashCommand::Status),
+        CommandEffect::Handled
+    );
+    let last = app.segments.last().expect("a notice was pushed");
+    let text = format!("{last:?}");
+    assert!(text.contains("thinking"), "{text}");
+}
+
+#[test]
+fn ask_parses_a_question_and_rejects_an_empty_one() {
+    assert_eq!(
+        parse("/ask where is the loop"),
+        Some(SlashCommand::Ask {
+            question: "where is the loop".to_string()
+        })
+    );
+    assert_eq!(
+        parse("/ask   multiple   spaces  "),
+        Some(SlashCommand::Ask {
+            question: "multiple spaces".to_string()
+        })
+    );
+    // A bare `/ask` still parses, so the registry guard holds; it answers with
+    // its usage instead of reading as a typo.
+    assert_eq!(
+        parse("/ask"),
+        Some(SlashCommand::Ask {
+            question: String::new()
+        })
+    );
+
+    let mut app = crate::tui::app::test_app();
+    assert_eq!(
+        execute(
+            &mut app,
+            SlashCommand::Ask {
+                question: String::new()
+            }
+        ),
+        CommandEffect::Handled
+    );
+    assert!(
+        app.segments
+            .iter()
+            .any(|segment| format!("{segment:?}").contains("/ask <question>")),
+        "the bare command explains itself: {:?}",
+        app.segments
+    );
+}
+
+#[test]
+fn ask_submits_one_turn_without_changing_the_standing_mode() {
+    let mut app = crate::tui::app::test_app();
+    app.mode = crate::agent::engine::AgentMode::Plan;
+
+    let effect = execute(
+        &mut app,
+        SlashCommand::Ask {
+            question: "why is it like this".to_string(),
+        },
+    );
+    assert_eq!(
+        effect,
+        CommandEffect::RunAsk {
+            question: "why is it like this".to_string()
+        }
+    );
+    assert_eq!(
+        app.mode,
+        crate::agent::engine::AgentMode::Plan,
+        "the standing mode survives an ask turn"
+    );
+    // The turn itself is submitted by the effect handler in the event loop, so
+    // here only the effect and the untouched mode are observable.
+    assert_eq!(app.turn_id, 0);
+}
+
+#[test]
+fn review_parses_its_targets_and_refuses_bad_forms() {
+    use crate::agent::git_review::ReviewTarget;
+
+    assert_eq!(
+        parse("/review"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::WorkingTree
+        })
+    );
+    assert_eq!(
+        parse("/review working-tree"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::WorkingTree
+        })
+    );
+    assert_eq!(
+        parse("/review staged"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::Staged
+        })
+    );
+    assert_eq!(
+        parse("/review commit HEAD~1"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::Commit("HEAD~1".to_string())
+        })
+    );
+    assert_eq!(
+        parse("/review base main"),
+        Some(SlashCommand::Review {
+            target: ReviewTarget::Base("main".to_string())
+        })
+    );
+    for bad in [
+        "/review commit",
+        "/review base",
+        "/review nope",
+        "/review staged now",
+    ] {
+        assert!(
+            matches!(parse(bad), Some(SlashCommand::Unknown(_))),
+            "{bad} must be refused, not run"
+        );
+    }
+}
+
+#[test]
+fn review_asks_for_a_resolution_without_touching_the_standing_mode() {
+    use crate::agent::git_review::ReviewTarget;
+
+    let mut app = crate::tui::app::test_app();
+    app.mode = crate::agent::engine::AgentMode::Build;
+    let effect = execute(
+        &mut app,
+        SlashCommand::Review {
+            target: ReviewTarget::Staged,
+        },
+    );
+    assert_eq!(
+        effect,
+        CommandEffect::RunReview {
+            target: ReviewTarget::Staged
+        }
+    );
+    assert_eq!(app.mode, crate::agent::engine::AgentMode::Build);
+}
+
+#[test]
+fn goal_parses_every_documented_form() {
+    assert_eq!(
+        parse("/goal ship the release"),
+        Some(SlashCommand::Goal {
+            action: GoalAction::New("ship the release".to_string())
+        })
+    );
+    for (input, action) in [
+        ("/goal", GoalAction::Show(None)),
+        ("/goal show", GoalAction::Show(None)),
+        ("/goal show 3", GoalAction::Show(Some(3))),
+        ("/goal edit", GoalAction::Edit(None)),
+        ("/goal approve", GoalAction::Approve),
+        ("/goal pause", GoalAction::Pause(None)),
+        ("/goal resume 2", GoalAction::Resume(Some(2))),
+        ("/goal complete", GoalAction::Complete(None)),
+        ("/goal complete 4", GoalAction::Complete(Some(4))),
+        ("/goal cancel", GoalAction::Cancel(None)),
+    ] {
+        assert_eq!(parse(input), Some(SlashCommand::Goal { action }), "{input}");
+    }
+    for bad in ["/goal show zero", "/goal pause 1 2"] {
+        assert!(
+            matches!(parse(bad), Some(SlashCommand::Unknown(_))),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn goal_and_tasks_dispatch_without_touching_any_state() {
+    let mut app = crate::tui::app::test_app();
+    assert_eq!(
+        execute(&mut app, SlashCommand::Tasks),
+        CommandEffect::RunTasks
+    );
+    assert_eq!(
+        execute(
+            &mut app,
+            SlashCommand::Goal {
+                action: GoalAction::Approve
+            }
+        ),
+        CommandEffect::RunGoal {
+            action: GoalAction::Approve
+        }
+    );
+    assert_eq!(app.mode, crate::agent::engine::AgentMode::Build);
+}
+
+#[test]
+fn status_shows_the_goal_line_only_when_one_is_held() {
+    let mut app = crate::tui::app::test_app();
+    assert!(
+        !status_text(&app).contains("goal:"),
+        "{}",
+        status_text(&app)
+    );
+    app.goal = Some("7 active".to_string());
+    assert!(
+        status_text(&app).contains("goal: 7 active"),
+        "{}",
+        status_text(&app)
+    );
+}
+
+#[test]
+fn goal_editing_parses_and_stays_draft_only() {
+    for (input, action) in [
+        (
+            "/goal edit ship it",
+            GoalAction::Edit(Some("ship it".to_string())),
+        ),
+        (
+            "/goal criteria add tests pass",
+            GoalAction::CriteriaAdd("tests pass".to_string()),
+        ),
+        ("/goal criteria remove 2", GoalAction::CriteriaRemove(1)),
+        (
+            "/goal criteria satisfy 1 cargo test passes",
+            GoalAction::CriteriaSatisfy {
+                index: 0,
+                evidence: "cargo test passes".to_string(),
+            },
+        ),
+        (
+            "/goal criteria waive 2 no CI in this repo",
+            GoalAction::CriteriaWaive {
+                index: 1,
+                reason: "no CI in this repo".to_string(),
+            },
+        ),
+        (
+            "/goal task add write code",
+            GoalAction::TaskAdd("write code".to_string()),
+        ),
+        ("/goal task remove 1", GoalAction::TaskRemove(0)),
+    ] {
+        assert_eq!(parse(input), Some(SlashCommand::Goal { action }), "{input}");
+    }
+    for bad in [
+        "/goal criteria remove zero",
+        "/goal task remove 0",
+        "/goal criteria satisfy 1",
+        "/goal criteria satisfy 0 done",
+        "/goal criteria waive 2",
+        "/goal criteria waive zero why",
+    ] {
+        assert!(
+            matches!(parse(bad), Some(SlashCommand::Unknown(_))),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn steering_and_queuing_parse_their_text_and_refuse_while_idle() {
+    assert_eq!(
+        parse("/steer focus on the parser"),
+        Some(SlashCommand::Steer {
+            text: "focus on the parser".to_string()
+        })
+    );
+    assert_eq!(
+        parse("/queue run the tests"),
+        Some(SlashCommand::Queue {
+            prompt: "run the tests".to_string()
+        })
+    );
+
+    let mut app = crate::tui::app::test_app();
+    // Idle: both are refused with a reason, and neither is stored.
+    assert!(matches!(
+        execute(&mut app, parse("/steer hurry").unwrap()),
+        CommandEffect::Handled
+    ));
+    assert!(!app.steer_waiting());
+    assert!(app.queued_prompt.is_none());
+
+    // Busy: both are accepted, and only one of each.
+    app.status = AgentState::Thinking;
+    execute(&mut app, parse("/steer hurry").unwrap());
+    assert!(app.steer_waiting());
+    execute(&mut app, parse("/steer again").unwrap());
+    assert_eq!(
+        app.steer.lock().unwrap().waiting.as_deref(),
+        Some("hurry"),
+        "a second steer never replaces the first"
+    );
+
+    execute(&mut app, parse("/queue run tests").unwrap());
+    assert_eq!(app.queued_prompt.as_deref(), Some("run tests"));
+    execute(&mut app, parse("/queue and again").unwrap());
+    assert_eq!(
+        app.queued_prompt.as_deref(),
+        Some("run tests"),
+        "a second queued prompt never replaces the first"
+    );
+
+    let status = status_text(&app);
+    assert!(status.contains("steer: waiting (hurry)"), "{status}");
+    assert!(status.contains("queued: run tests"), "{status}");
+
+    // The engine takes it exactly once.
+    assert_eq!(app.steer.lock().unwrap().take().as_deref(), Some("hurry"));
+    assert!(!app.steer_waiting());
+}
+
+#[test]
+fn a_test_is_only_proposed_for_a_change_its_manifest_covers() {
+    let paths = |list: &[&str]| list.iter().map(|path| path.to_string()).collect::<Vec<_>>();
+
+    // No root manifest: no command, no guess, whatever changed.
+    assert_eq!(propose_test(&paths(&["src/main.rs"]), false, false), None);
+
+    // A Rust change in a Cargo workspace runs the suite; a README does not.
+    assert_eq!(
+        propose_test(&paths(&["src/lib.rs"]), true, false).map(|(command, _)| command),
+        Some("cargo test".to_string())
+    );
+    assert_eq!(
+        propose_test(&paths(&["README.md", "assets/logo.png"]), true, false),
+        None,
+        "docs and images do not justify running the suite"
+    );
+    assert_eq!(
+        propose_test(&paths(&["Cargo.toml"]), true, false).map(|(command, _)| command),
+        Some("cargo test".to_string())
+    );
+
+    // The same rule for a package workspace, and the two never swap.
+    assert_eq!(
+        propose_test(&paths(&["web/app.tsx"]), false, true).map(|(command, _)| command),
+        Some("npm test --silent".to_string())
+    );
+    assert_eq!(propose_test(&paths(&["notes.md"]), false, true), None);
+    assert_eq!(
+        propose_test(&paths(&["web/app.tsx", "src/lib.rs"]), true, true)
+            .map(|(command, _)| command),
+        Some("cargo test".to_string()),
+        "Cargo wins when both manifests are in the workspace"
+    );
+}
+
+#[test]
+fn test_counts_come_from_cargos_summary_or_are_unavailable() {
+    let output = "running 12 tests\ntest result: ok. 9 passed; 1 failed; 2 ignored; 0 measured; 3 filtered out\n";
+    assert_eq!(
+        summarize_test_output(output, false),
+        (Some(9), Some(1), Some(2), Some(3))
+    );
+
+    // Truncated or unrecognised output claims no counts at all.
+    assert_eq!(
+        summarize_test_output(output, true),
+        (None, None, None, None)
+    );
+    assert_eq!(
+        summarize_test_output("everything is fine, trust me", false),
+        (None, None, None, None)
+    );
+
+    // The process status decides the verdict, never the text. Assert the
+    // verdict line: the counts line can say "failed" or "passed" either way.
+    let passed = test_report("cargo test", Some(0), output, false);
+    assert!(
+        passed.contains("`cargo test` passed (exit 0)") && passed.contains("passed 9"),
+        "{passed}"
+    );
+    let failed = test_report(
+        "cargo test",
+        Some(101),
+        "test result: ok. 1 passed; 0 failed",
+        false,
+    );
+    assert!(
+        failed.contains("`cargo test` failed (exit 101)"),
+        "a non-zero exit is never a pass: {failed}"
+    );
+    let unknown = test_report("cargo test", Some(0), output, true);
+    assert!(unknown.contains("counts unavailable"), "{unknown}");
+}
+
+#[test]
+fn a_preset_lands_in_the_next_prompt_and_never_in_the_policy() {
+    use crate::agent::presets;
+
+    let root = tempfile::TempDir::new().unwrap();
+    let dir = presets::project_dir(root.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    // HOME is not moved: `load_in` takes the user directory explicitly.
+    std::fs::write(dir.join("triage.md"), "Triage the failing tests first.").unwrap();
+
+    let mut app = crate::tui::app::test_app();
+    app.root = root.path().to_path_buf();
+    let effect = execute(
+        &mut app,
+        SlashCommand::Preset {
+            name: Some("../outside".to_string()),
+        },
+    );
+    assert!(matches!(effect, CommandEffect::Handled));
+    assert!(
+        app.input.lines().join("").trim().is_empty(),
+        "a bad name changes nothing"
+    );
+
+    // A real preset is applied to the input, not to the system prompt.
+    let before = app.config.system_prompt.clone();
+    execute(
+        &mut app,
+        SlashCommand::Preset {
+            name: Some("triage".to_string()),
+        },
+    );
+    assert_eq!(app.input.lines(), vec!["Triage the failing tests first."]);
+    assert_eq!(
+        app.config.system_prompt, before,
+        "the system prompt is untouched"
+    );
+}
+
+#[test]
+fn the_preset_picker_searches_and_previews_before_applying() {
+    use crate::agent::presets;
+
+    let root = tempfile::TempDir::new().unwrap();
+    let dir = presets::project_dir(root.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("triage.md"),
+        "Triage the failing tests first.\nThen fix them.",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("release.md"),
+        "Write the changelog entry.\nBump the version.",
+    )
+    .unwrap();
+
+    let mut app = crate::tui::app::test_app();
+    app.root = root.path().to_path_buf();
+    execute(&mut app, SlashCommand::Preset { name: None });
+
+    let Some(crate::tui::app::ModalSelection::Preset {
+        names,
+        previews,
+        query,
+        selected,
+    }) = app.modal.clone()
+    else {
+        panic!("the picker opened: {:?}", app.modal.is_some());
+    };
+    assert_eq!(names, vec!["release".to_string(), "triage".to_string()]);
+    assert!(
+        previews[1].contains("Triage the failing tests first."),
+        "each row carries its own preview: {previews:?}"
+    );
+    assert!(query.is_empty() && selected == 0);
+
+    // Typing filters the search; the preview follows the selected row.
+    let filtered = crate::tui::app::visible_presets(&names, "tri");
+    assert_eq!(filtered, vec![1], "only the matching preset survives");
+    assert!(crate::tui::app::visible_presets(&names, "zzz").is_empty());
+
+    // An empty directory answers with the hint instead of an empty box.
+    let empty = tempfile::TempDir::new().unwrap();
+    let mut other = crate::tui::app::test_app();
+    other.root = empty.path().to_path_buf();
+    execute(&mut other, SlashCommand::Preset { name: None });
+    assert!(other.modal.is_none(), "no picker without presets");
+    assert!(
+        format!("{:?}", other.segments.last()).contains("No presets yet"),
+        "the hint names where to put one"
+    );
+}
+
+#[test]
+fn preset_add_copies_the_named_file_in() {
+    use crate::agent::presets;
+
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(root.path().join("triage.md"), "Triage first.").unwrap();
+
+    // The `@` picker inserts `[file:…]`: that wrapper is prompt syntax, not
+    // part of the path, and a path with a space in it still arrives whole. A
+    // bare `add` asks for its path instead of looking for a preset named
+    // "add", which is exactly the report the user saw.
+    for (input, path) in [
+        ("/preset add triage.md", "triage.md"),
+        ("/preset add [file:triage.md]", "triage.md"),
+        ("/preset add @[file:triage.md]", "triage.md"),
+        ("/preset add [file:my notes.md]", "my notes.md"),
+        ("/preset add", ""),
+    ] {
+        assert_eq!(
+            parse(input),
+            Some(SlashCommand::PresetAdd {
+                path: path.to_string()
+            }),
+            "{input}"
+        );
+    }
+
+    let mut app = crate::tui::app::test_app();
+    app.root = root.path().to_path_buf();
+    execute(&mut app, parse("/preset add [file:triage.md]").unwrap());
+    assert_eq!(
+        presets::load_in(root.path(), None, "triage").unwrap(),
+        "Triage first."
+    );
+
+    // Adding it twice refuses instead of overwriting the preset.
+    execute(&mut app, parse("/preset add triage.md").unwrap());
+    assert!(
+        format!("{:?}", app.segments.last()).contains("already exists"),
+        "{:?}",
+        app.segments.last()
+    );
+
+    // A bare `add` reports its usage, never "no preset named 'add'".
+    execute(&mut app, parse("/preset add").unwrap());
+    assert!(
+        format!("{:?}", app.segments.last()).contains("Usage: /preset add <file.md>"),
+        "{:?}",
+        app.segments.last()
     );
 }

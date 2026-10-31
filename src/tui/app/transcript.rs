@@ -62,19 +62,21 @@ impl App<'_> {
             Some(Segment::Notice(buf)) => buf.push_str(&framed),
             _ => self.segments.push(Segment::Notice(framed)),
         }
-        self.scroll = self.line_count();
+        self.scroll = self.max_scroll();
         self.auto_scroll = true;
     }
 
-    /// Rendered line count for scroll math (each reasoning block adds a header line).
-    pub fn line_count(&self) -> u16 {
-        self.segments
-            .iter()
-            .map(|segment| match segment {
-                Segment::Text(text) => text.lines().count(),
-                Segment::Notice(text) => text.lines().count(),
-                Segment::Thinking(text) => text.lines().count() + 1,
-            })
-            .sum::<usize>() as u16
+    /// Highest scroll offset: rows the transcript runs past the viewport.
+    pub fn max_scroll(&self) -> u16 {
+        self.painted_rows
+            .get()
+            .saturating_sub(self.painted_height.get())
+    }
+
+    /// Record the transcript geometry the frame just painted. Scrolling is in
+    /// wrapped rows, and only the frame knows how many there are.
+    pub(crate) fn set_painted(&self, rows: u16, height: u16) {
+        self.painted_rows.set(rows);
+        self.painted_height.set(height);
     }
 }

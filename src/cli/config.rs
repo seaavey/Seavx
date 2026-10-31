@@ -5,10 +5,30 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agent::engine::{
-    AgentConfig, ConfigOrigin, ConfigReport, DEFAULT_BASE_URL, DEFAULT_MODEL, normalize_base_url,
-    parse_reasoning_effort,
-};
+use crate::agent::engine::{AgentConfig, ConfigOrigin, ConfigReport, parse_reasoning_effort};
+
+/// What every surface prints for a config that names no model.
+pub const MODEL_NOT_SET: &str = "not set (run seavx setup)";
+
+/// What every surface prints for a config that names no endpoint.
+pub const ENDPOINT_NOT_SET: &str = "not set (run seavx setup)";
+
+/// The endpoint row's value: the configured URL, or the reason there is none.
+pub fn endpoint_label(config: &AgentConfig) -> String {
+    config
+        .base_url
+        .as_deref()
+        .map(redact_url)
+        .unwrap_or_else(|| ENDPOINT_NOT_SET.to_string())
+}
+
+/// The model row's value: the configured id, or the reason there is none.
+pub fn model_label(config: &AgentConfig) -> String {
+    config
+        .model
+        .clone()
+        .unwrap_or_else(|| MODEL_NOT_SET.to_string())
+}
 
 /// Keys `/config set` and `/config unset` accept.
 pub const WRITABLE_KEYS: [&str; 5] = [
@@ -169,7 +189,7 @@ pub fn render_report(config: &AgentConfig, report: &ConfigReport) -> String {
         .reasoning_effort
         .clone()
         .unwrap_or_else(|| "default".to_string());
-    let base_url = redact_url(config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL));
+    let base_url = endpoint_label(config);
     let api_key = mask_key(config.api_key.as_deref().unwrap_or(""));
     let system_prompt = config
         .system_prompt
@@ -177,7 +197,7 @@ pub fn render_report(config: &AgentConfig, report: &ConfigReport) -> String {
         .unwrap_or_else(|| "default".to_string());
 
     let rows = [
-        ("model", config.model.clone(), ConfigKey::Model),
+        ("model", model_label(config), ConfigKey::Model),
         ("reasoning_effort", effort, ConfigKey::ReasoningEffort),
         ("stream", config.stream.to_string(), ConfigKey::Stream),
         ("base_url", base_url, ConfigKey::BaseUrl),
@@ -246,8 +266,8 @@ pub fn render_paths(report: &ConfigReport) -> String {
 /// One effective value plus its source, for `/config get`.
 pub fn render_value(config: &AgentConfig, report: &ConfigReport, key: ConfigKey) -> String {
     let value = match key {
-        ConfigKey::Model => config.model.clone(),
-        ConfigKey::BaseUrl => redact_url(config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL)),
+        ConfigKey::Model => model_label(config),
+        ConfigKey::BaseUrl => endpoint_label(config),
         ConfigKey::ApiKey => mask_key(config.api_key.as_deref().unwrap_or("")),
         ConfigKey::ReasoningEffort => config
             .reasoning_effort
@@ -338,14 +358,9 @@ fn canonical_value(key: ConfigKey, raw: &str) -> Result<String, String> {
                 Ok(value.to_string())
             }
         }
-        ConfigKey::BaseUrl => {
-            let (normalized, _) = normalize_base_url(raw);
-            match reqwest::Url::parse(&normalized) {
-                Ok(url) if url.host().is_some() => Ok(normalized),
-                // Never repeat the input: it may carry userinfo or a token.
-                _ => Err("invalid base_url: expected a URL with a host".to_string()),
-            }
-        }
+        // http/https only: the message names the scheme, never the input, which
+        // may carry userinfo or a token.
+        ConfigKey::BaseUrl => crate::agent::engine::validate_base_url(raw),
         ConfigKey::ReasoningEffort => {
             let effort = parse_reasoning_effort(raw)
                 .ok_or_else(|| format!("invalid reasoning_effort: {raw}"))?;
@@ -510,7 +525,7 @@ pub fn write_agent_config_repairing(
 }
 
 fn write_fields(document: &mut toml_edit::DocumentMut, config: &AgentConfig) {
-    document["model"] = toml_edit::value(config.model.clone());
+    set_or_remove(document, "model", config.model.as_deref());
     document["max_turns"] = toml_edit::value(config.max_turns as i64);
     set_or_remove(document, "base_url", config.base_url.as_deref());
     set_or_remove(
@@ -615,11 +630,10 @@ fn load_document_with(
     }
 }
 
-/// `model` and `max_turns` are required by `AgentConfig`, and a file replaces
-/// the built-in defaults wholesale; seeding them keeps the result loadable.
+/// A file replaces the built-in defaults wholesale, so a repaired one still
+/// seeds `max_turns`: a model is the user's to name, never this file's.
 fn seed_document() -> toml_edit::DocumentMut {
     let mut document = toml_edit::DocumentMut::new();
-    document["model"] = toml_edit::value(DEFAULT_MODEL);
     document["max_turns"] = toml_edit::value(DEFAULT_MAX_TURNS);
     document
 }
@@ -832,9 +846,7 @@ pub fn init_workspace(workspace_root: &Path) -> Result<(PathBuf, bool), String> 
     }
 
     update_config(&path, |document| {
-        document["model"] = toml_edit::value(DEFAULT_MODEL);
         document["max_turns"] = toml_edit::value(DEFAULT_MAX_TURNS);
-        document["base_url"] = toml_edit::value(DEFAULT_BASE_URL);
         document["api_key"] = toml_edit::value("");
         Ok(())
     })?;

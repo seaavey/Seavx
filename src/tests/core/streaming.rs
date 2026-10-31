@@ -126,10 +126,11 @@ impl ChatBackend for FakeBackend {
 
 fn runtime_with(backend: &FakeBackend, workspace: &std::path::Path, stream: bool) -> AgentRuntime {
     let mut config = AgentConfig::load(workspace);
-    config.model = "fake-model".to_string();
+    config.model = Some("fake-model".to_string());
     config.max_turns = 4;
     config.stream = stream;
     let security = WorkspaceSecurity::new(workspace);
+    config.base_url = Some("https://gateway.test/v1/".to_string());
     AgentRuntime::with_backend(config, security, Box::new(backend.clone()))
 }
 
@@ -151,7 +152,7 @@ async fn a_stream_that_fails_before_the_first_chunk_falls_back_once() {
 
     let answer = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
@@ -174,16 +175,16 @@ async fn a_stream_that_fails_after_one_chunk_is_not_retried() {
     fake.stream_then(vec![token("half an ans"), Err("broken pipe".into())]);
     let runtime = runtime_with(&fake, workspace.path(), true);
 
-    let mut events = Vec::new();
+    let mut events: Vec<crate::agent::events::AgentEvent> = Vec::new();
     let mut reported = Vec::new();
     let error = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
             &crate::agent::cancel::CancelToken::new(),
-            |event| events.push(event.to_string()),
+            |event| events.push(event),
             |message, status| reported.push((message.clone(), status)),
         )
         .await
@@ -194,7 +195,9 @@ async fn a_stream_that_fails_after_one_chunk_is_not_retried() {
     assert_eq!(fake.calls(), vec!["stream"], "no resend after output");
 
     assert!(
-        events.iter().any(|event| event == "TOKEN:half an ans"),
+        events
+            .iter()
+            .any(|event| matches!(event, crate::agent::events::AgentEvent::Token(token) if token == "half an ans")),
         "the delta reaches the sink: {events:?}"
     );
     let (partial, status) = reported.last().expect("a partial row is reported");
@@ -211,15 +214,15 @@ async fn streamed_reasoning_is_not_repeated_by_the_captured_copy() {
     fake.stream_then(vec![thinking("weighing "), thinking("it"), token("hi")]);
     let runtime = runtime_with(&fake, workspace.path(), true);
 
-    let mut events = Vec::new();
+    let mut events: Vec<crate::agent::events::AgentEvent> = Vec::new();
     let answer = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
             &crate::agent::cancel::CancelToken::new(),
-            |event| events.push(event.to_string()),
+            |event| events.push(event),
             |_, _| {},
         )
         .await
@@ -227,13 +230,16 @@ async fn streamed_reasoning_is_not_repeated_by_the_captured_copy() {
         .unwrap();
 
     assert_eq!(answer, "hi");
-    let thinking_events: Vec<&String> = events
+    let thinking_events: Vec<&str> = events
         .iter()
-        .filter(|event| event.starts_with("THINKING:"))
+        .filter_map(|event| match event {
+            crate::agent::events::AgentEvent::Thinking(thoughts) => Some(thoughts.as_str()),
+            _ => None,
+        })
         .collect();
     assert_eq!(
         thinking_events,
-        ["THINKING:weighing ", "THINKING:it"],
+        ["weighing ", "it"],
         "the deltas are the reasoning; the captured copy would draw it twice: {events:?}"
     );
 }
@@ -248,7 +254,7 @@ async fn the_fallback_consumes_the_single_retry() {
 
     let error = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,
@@ -277,7 +283,7 @@ async fn stream_false_skips_the_stream_attempt() {
 
     let answer = runtime
         .execute_task(
-            "do it",
+            genai::chat::ChatMessage::user("do it"),
             AgentMode::Build,
             Vec::new(),
             &DenyingConfirmer,

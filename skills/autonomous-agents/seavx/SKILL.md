@@ -1,71 +1,76 @@
 ---
 name: seavx
-description: Operate Seavx, the Rust terminal coding agent in this repository — its CLI, slash commands, debug mode and data locations, provider config, sessions, checkpoints and permission model. Use when running or configuring Seavx, when a Seavx run puts data in the wrong place, or when changing how the agent behaves. Don't invoke it for unrelated Rust work in the same repository.
+description: Operate Seavx, the Rust terminal coding agent in this repository — CLI, slash commands, debug mode and data locations, provider config, sessions, checkpoints and the permission model. Use when running or configuring Seavx, when a run puts data in the wrong place, or when changing how the agent behaves. Not for building it; that is the seavx-dev skill.
+version: 0.1.0
+author: Muhammad Adriansyah (Seaavey), Hermes Agent
+license: MIT
+platforms: [linux, macos]
+metadata:
+  hermes:
+    tags: [seavx, rust, terminal-agent, sessions, config]
+    related_skills: [seavx-dev]
 ---
 
 # Seavx
 
-Seavx is a single-binary AI coding agent for the terminal: a ratatui TUI over a
-provider layer (`genai`), SQLite sessions and a checkpoint store that `/undo`
-restores from. Everything below is behaviour of the code in this repository.
+A single-binary AI coding agent for the terminal: a ratatui TUI over a provider
+layer (`genai`), SQLite sessions, and a checkpoint store `/undo` restores from.
 
 ## Running it
 
 | Command | What it does |
 | --- | --- |
 | `seavx`, `seavx run [prompt]` | TUI session |
-| `seavx exec <task>` | headless run; never writes a session or a log |
-| `seavx -d` | any of the above with debug mode on |
+| `seavx exec <task>` | headless turn; no session, no `.env`, but its request log and debug log still land in `.seavx/` |
 | `seavx resume [id]` | reopen a stored session, picking from a list when no id |
 | `seavx sessions list\|show <id>\|export <id>\|resume <id>` | the session store from the shell |
-| `seavx model [model] [-e effort]` | set model and effort, refreshing the model cache |
+| `seavx model [model] [-e effort]` | set model and effort; this refreshes the model cache |
 | `seavx doctor [--offline]` | environment and health report |
-| `seavx init` | write `.seavx/config.toml` |
-| `seavx setup providers` | base URL, key, model, effort |
-| `seavx memory` | inspect `MEMORY.md` and `USER.md` |
-| `seavx update`, `seavx uninstall` | self-update, removal |
+| `seavx init`, `seavx setup providers` | write `.seavx/config.toml`; ask for base URL, key, model, effort |
+| `seavx memory`, `seavx skills …` | inspect `MEMORY.md`/`USER.md`; list, install, remove skills |
+| `seavx update [--force]`, `seavx uninstall` | self-update, removal |
 
-`--debug` is a global flag: `seavx -d doctor` is valid.
-
-Effort values: `none`, `minimal`, `medium`, `high`, `highx`, `max`.
+`--debug`/`-d` is global: `seavx -d doctor` is valid. Effort values are `none`,
+`minimal`, `medium`, `high`, `highx`, `max`.
 
 ## Debug mode decides where the data goes
 
-Debug mode is on when `--debug`/`-d` is passed, or when `SEAVX_DEBUG` is `1` or
-`true`. Nothing else counts — a debug build is not a debug run, so `cargo run`
-writes to `~/.seavx` exactly like an installed binary.
+On when `-d` is passed or `SEAVX_DEBUG` is `1`/`true` — nothing else. A debug
+build is not a debug run: `cargo run` writes to `~/.seavx` like an installed
+binary.
 
 | | debug on | debug off |
 | --- | --- | --- |
 | sessions | `./.seavx/sessions.db` | `~/.seavx/sessions.db` |
 | tracing | `./.seavx/debug.log` | stderr |
 
-Every TUI run writes the state it resolved into the workspace `.env` as
-`SEAVX_DEBUG=true` or `SEAVX_DEBUG=false`: the file is created when missing, that
-line is rewritten in place, every other line is left alone, and `seavx exec`
-skips it. So a directory that was never told anything becomes `false` on the
-first run, and `-d` makes the next plain run debug as well until the line says
-otherwise. `seavx doctor` and `seavx update` never write `.env`.
+A TUI run records the state it resolved in the workspace `.env` as
+`SEAVX_DEBUG=true|false`: created when missing, that one line rewritten in place,
+every other line untouched; `exec`, `doctor` and `update` never write it. So a
+plain run after a `-d` run is still debug until the line says otherwise, and a
+fresh directory becomes `false` on first run. `.env` and its variants are on the
+protected list — the agent's tools cannot read or write them, so edit by hand.
 
-Never hand-edit `.env` through the agent's tools: `.env` and its variants are on
-the protected list, so a read or a write is refused before it starts.
+## Slash commands
 
-## Slash commands (TUI)
+`/help` renders the single command table in `src/tui/commands.rs` — read it there
+instead of copying the list into a skill, which is how it goes stale. The
+semantics the table cannot show:
 
-`/model [model] [effort]`, `/compact [focus]`, `/config …`, `/plan [on|off]`,
-`/clear`, `/new` (alias of `/clear`), `/help`, `/init`, `/doctor [--offline]`,
-`/memory [show|project|user|skills|path]`, `/undo`, `/sessions [number]`,
-`/resume`, `/exit`.
-
-`/model` with no argument opens a picker over the cached model list; a number is
-a 1-based index into that list and an index outside it is refused, never saved as
-a model name. In the picker, letters filter the list (case-insensitive, Backspace
-widens it) and `ctrl+r` re-fetches `/models` from the gateway in the background:
-the title shows a spinner until the list lands, and a second `ctrl+r` is ignored
-meanwhile. The picker scrolls with the cursor, so a list longer than the box stays
-reachable. `/plan` is read-only and is refused while a turn is running.
+- `/plan` is read-only and refused while a turn runs; `/ask` and `/review` are
+  read-only single turns.
+- `/steer <text>` reaches the running turn at its next step; `/queue <prompt>`
+  runs after that turn succeeds.
+- `/new` is `/clear`; `/resume` is `/sessions`; `/model` with no argument opens a
+  picker over the cached models — a number is a 1-based index and out of range is
+  refused, never saved as a name. In the picker, letters filter (case-insensitive,
+  Backspace widens), `ctrl+r` refetches `/models` in the background behind a
+  spinner and is ignored while that fetch runs, and the list scrolls with the
+  cursor.
 
 ## Configuration
+
+Nine keys, workspace `.seavx/config.toml` over `~/.seavx/config.toml`:
 
 ```
 model = "provider/model"
@@ -74,60 +79,47 @@ api_key = "…"
 reasoning_effort = "high"
 stream = true
 max_turns = 100
-tool_permissions = "ask" | "allow" | …
-permitted_actions = ["workspace-write"]
 system_prompt = "…"
+tool_permissions = "deny" | "ask" | "allow"
+permitted_actions = ["write", "execute", "network"]
 ```
 
-A workspace `.seavx/config.toml` takes precedence over `~/.seavx/config.toml`.
-`/config` and `seavx model` write it atomically, owner-only (`0600`); the key is
-never printed back.
+`SEAVX_MODEL`, `SEAVX_BASE_URL`, `SEAVX_API_KEY` and `SEAVX_REASONING_EFFORT`
+override the file. `permitted_actions` lifts kinds from `ask` to `allow`; it
+cannot lift global writes or destructive actions, which always ask. `/config` and
+`seavx model` write atomically, owner-only (`0600`), and never print the key back.
 
 ## Permissions and safety
 
-- Writes inside the workspace are ungated only when `tool_permissions` allows
-  them; the default `ask` stops and waits. `seavx exec` has no human and denies.
+- `tool_permissions = "ask"` (the default) stops and waits on a write or a shell
+  command; `allow` lets workspace actions through; `deny` refuses. `seavx exec`
+  has no human, so it denies.
 - The workspace jail refuses paths outside the root, symlink swaps, and in-place
   edits between validation and open.
-- Protected and never readable or writable: `.git`, `.ssh`, `.gnupg`, `.aws`,
-  `.env*`, `id_rsa*`, `id_ed25519*`, `id_ecdsa*`, `.netrc*`, `*.pem`, `*.key`,
-  `credentials*`, `secrets.*`, and `config.toml` / `SOUL.md` inside `.seavx`.
+- Never readable or writable: `.git`, `.ssh`, `.gnupg`, `.aws`, `.env*`, `id_rsa*`,
+  `id_ed25519*`, `id_ecdsa*`, `.netrc*`, `*.pem`, `*.key`, `credentials*`,
+  `secrets.*`, and `config.toml`/`SOUL.md` inside `.seavx`.
 
 ## Sessions and undo
 
-Sessions are named `svx-` plus eight hex digits; a bare number from an older
-database still resolves. Resume replays the newest turns up to 80 000 bytes and
-collapses the rest into one `System: N older messages omitted` line — no
-summarisation, no network call on start. `/undo` restores the files the last
-agent call changed and refuses to overwrite a file edited afterwards.
+Ids are `svx-` plus eight hex digits; a bare number from an older database still
+resolves. Resume replays the newest turns up to 80 000 bytes and folds the rest
+into one `System: N older messages omitted` line — no summarisation, no network
+call on start. `/undo` restores the files the last agent call changed and refuses
+to overwrite a file edited afterwards.
 
 ## Working on the code
 
-Feature work runs in debug mode, without exception: `seavx -d`, or
-`SEAVX_DEBUG=true`. A coding session without it writes to `~/.seavx`, which is
-the real store, and leaves no log in the workspace. Check before you start:
-
-```
-seavx doctor --offline | grep session     # must say .seavx/sessions.db
-```
-
-```
-cargo test                 # 380+ tests, no network
-cargo clippy --all-targets
-cargo fmt
-```
-
 Module map: `src/tui/` (app, event loop, render, commands), `src/agent/` (engine,
 backend seam, tools, security, checkpoint, budget), `src/cli/` (doctor, config,
-model, sessions, update), `src/session.rs` (SQLite), `src/util.rs` (debug mode,
-paths). Tests live in `src/tests/` and are wired with
-`#[cfg(test)] #[path = "../tests/…"] mod tests;` in the module they cover.
+model, sessions, skills, update), `src/session/` (SQLite), `src/util.rs` (debug
+mode, paths). Tests live in `src/tests/`, wired per module with
+`#[cfg(test)] #[path = "../tests/…"] mod tests;`.
 
-Every feature ships with a skill entry: a new
-`skills/autonomous-agents/<name>/SKILL.md` when it deserves its own playbook, a
-section here when it belongs to Seavx itself. The full workflow — debug rule,
-checklist, traps — is in `skills/autonomous-agents/seavx-dev/SKILL.md`.
+Feature work runs in debug mode without exception — see the table above. The
+checklist (debug, tests, changelog, README, skill entry) and the traps are in
+`skills/autonomous-agents/seavx-dev/SKILL.md`.
 
-A skill in `skills/` is loaded on the next run: it is the second of four roots
-(`.seavx/skills`, `skills/`, `~/.seavx/skills`, `~/.agents/skills`), so it wins
-over a user skill of the same name and needs no copy or symlink.
+A skill under `skills/` is live on the next run: the four roots are
+`.seavx/skills`, `skills/`, `~/.seavx/skills`, `~/.agents/skills`, first wins, so
+a repo skill shadows a user skill of the same name and needs no copy or symlink.

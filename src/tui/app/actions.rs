@@ -1,29 +1,61 @@
 use tokio::sync::mpsc;
 
 use super::store::lock_store;
-use super::{App, ModalSelection, PendingPermission};
+use super::{App, ModalSelection, PendingPermission, PendingQuestion};
+use crate::agent::events::ToolStatus;
+use crate::session::TaskState;
 use crate::tui::event::{Action, AgentState};
+
+/// The matrix answer for the command `/test` proposes: the same `decide` the
+/// agent loop uses, so `tool_permissions` governs both. Kept out of the spawn so
+/// the policy is testable without a terminal.
+pub(super) fn test_verdict(
+    config: &crate::agent::engine::AgentConfig,
+    mode: crate::agent::engine::AgentMode,
+    kind: crate::agent::permissions::ActionKind,
+) -> crate::agent::permissions::Verdict {
+    use crate::agent::permissions::{PermissionMode, decide, parse_mode, parse_permitted};
+    let configured = parse_mode(&config.tool_permissions).unwrap_or(PermissionMode::Ask);
+    let permitted = parse_permitted(&config.permitted_actions).unwrap_or_default();
+    // The standing mode widens the configured policy exactly as it does for the
+    // agent loop, so `/test` never asks in a mode that stopped asking.
+    let (mode, permitted) = crate::agent::engine::mode_permissions(mode, configured, permitted);
+    decide(mode, &permitted, kind)
+}
+
+/// What a finished turn means for the goal tasks it ran. `None` for a turn that
+/// has not reached a terminal state, so nothing is written from a mid-flight
+/// status.
+fn task_state_after_turn(status: crate::agent::cancel::TurnStatus) -> Option<TaskState> {
+    use crate::agent::cancel::TurnStatus;
+    match status {
+        TurnStatus::Completed => Some(TaskState::Completed),
+        TurnStatus::Failed => Some(TaskState::Blocked),
+        TurnStatus::Cancelled => Some(TaskState::Cancelled),
+        TurnStatus::Running | TurnStatus::Cancelling => None,
+    }
+}
 
 /// Apply one result the loop did not route to a key or mouse handler.
 pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Action>) {
     match action {
-        // Routed by `run`: the loop needs the terminal for these three.
-        Action::Tick => {}
+        // Routed by `run`: the loop needs the terminal for these two, and the
+        // paste text for the third.
         Action::Key(_) => {}
         Action::Mouse(_) => {}
+        Action::Paste(_) => {}
         Action::AgentToken(token) => {
             app.status = AgentState::Streaming;
             app.push_text(&token);
             if app.auto_scroll {
-                let lines = app.line_count();
-                // Keep pinned to latest lines
-                app.scroll = lines;
+                // Keep pinned to the newest rows
+                app.scroll = app.max_scroll();
             }
         }
         Action::AgentThinking(thoughts) => {
             app.push_thinking(&thoughts);
             if app.auto_scroll {
-                app.scroll = app.line_count();
+                app.scroll = app.max_scroll();
             }
         }
         Action::AgentTitle { title, session } => {
@@ -65,29 +97,208 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             app.persistence_error = Some(message.clone());
             app.push_notice(message);
         }
-        Action::AgentToolStart(tool) => {
-            app.status = AgentState::ExecutingTool(tool.clone());
-            // Clean compact Hermes-style tool call indicator without brackets
-            app.push_text(&format!("\n⚡ {tool}\n\n"));
+        Action::GoalDone {
+            result,
+            goal,
+            start,
+        } => {
+            // Free the slot the goal operation held before a prompt is
+            // submitted, or the busy check would refuse the goal's own turn.
+            if app.status == AgentState::Checking {
+                app.status = AgentState::Idle;
+            }
+            app.goal = goal;
+            match result {
+                Ok(text) => app.push_notice(text),
+                Err(error) => app.push_notice(error),
+            }
+            if let Some(task) = start
+                && let Some(request) = app.submit_turn(&task)
+            {
+                let is_first_turn = app.session_title.is_none();
+                let context = app.session_context.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    crate::tui::app::worker::run_agent_worker(
+                        request,
+                        tx,
+                        is_first_turn,
+                        crate::agent::engine::AgentMode::Build,
+                        context,
+                    )
+                    .await;
+                });
+            }
+        }
+        Action::ReviewResolved(result) => {
+            app.status = AgentState::Idle;
+            match result {
+                Ok(input) => {
+                    if input.withheld_paths > 0 {
+                        app.push_notice(format!(
+                            "{} path(s) withheld from this review for security.",
+                            input.withheld_paths
+                        ));
+                    }
+                    let task = crate::agent::git_review::task_text(&input);
+                    if let Some(request) = app.submit_turn(&task) {
+                        let is_first_turn = app.session_title.is_none();
+                        let context = app.session_context.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            crate::tui::app::worker::run_agent_worker(
+                                request,
+                                tx,
+                                is_first_turn,
+                                crate::agent::engine::AgentMode::Review,
+                                context,
+                            )
+                            .await;
+                        });
+                    }
+                }
+                Err(error) => app.push_notice(format!("Review could not start: {error}")),
+            }
+        }
+        Action::AgentTool(tool) => {
+            // The verb and the one thing it touches, never the raw argument
+            // list the model wrote.
+            let label = crate::agent::tools::call_label(&tool.name, &tool.summary);
+            match tool.status {
+                ToolStatus::Queued => {
+                    app.status = AgentState::ExecutingTool(label.clone());
+                    app.push_text(&format!(
+                        "\n⚡ {}\n\n",
+                        crate::agent::events::bounded(&label, 96)
+                    ));
+                }
+                ToolStatus::Running => app.status = AgentState::ExecutingTool(label),
+                // The outcome line: the status word is the ledger's, so a denied
+                // or cancelled call can never read as completed here.
+                ToolStatus::Completed | ToolStatus::Failed | ToolStatus::Cancelled => {
+                    let elapsed = tool
+                        .elapsed
+                        .map(|elapsed| format!(" {:.1}s", elapsed.as_secs_f32()))
+                        .unwrap_or_default();
+                    let failure = tool
+                        .failure
+                        .map(|failure| format!(" · {}", failure.as_str()))
+                        .unwrap_or_default();
+                    app.push_text(&format!("  └ {}{elapsed}{failure}\n", tool.status.as_str()));
+                }
+            }
             if app.auto_scroll {
-                let lines = app.line_count();
-                app.scroll = lines;
+                app.scroll = app.max_scroll();
             }
         }
         Action::TurnFinished {
             status,
             cleanup,
             pid,
-        } => app.finish_turn(status, cleanup, pid),
+        } => {
+            app.finish_turn(status, cleanup, pid);
+            // A queued prompt runs only after a turn that succeeded. A cancel or
+            // a failure drops it: replaying it would repeat work the user just
+            // stopped, and the queue lives in memory only.
+            if matches!(status, crate::agent::cancel::TurnStatus::Completed)
+                && let Some(prompt) = app.queued_prompt.take()
+                && let Some(request) = app.submit_turn(&prompt)
+            {
+                let is_first_turn = app.session_title.is_none();
+                let context = app.session_context.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    crate::tui::app::worker::run_agent_worker(
+                        request,
+                        tx,
+                        is_first_turn,
+                        crate::agent::engine::AgentMode::Build,
+                        context,
+                    )
+                    .await;
+                });
+            } else if !matches!(status, crate::agent::cancel::TurnStatus::Completed)
+                && app.queued_prompt.take().is_some()
+            {
+                app.push_notice("Queued prompt dropped: the turn did not succeed.");
+            }
+            // A goal turn is done when its turn is: the tasks it ran move to the
+            // state the turn actually reached. A failure leaves them blocked and
+            // a cancel cancels them, so `/tasks` never reports work the turn did
+            // not finish.
+            if let Some(goal) = app
+                .goal
+                .as_deref()
+                .and_then(|line| line.split_whitespace().next())
+                && let Ok(id) = goal.parse::<i64>()
+                && let Some(next) = task_state_after_turn(status)
+            {
+                let session = app.session_id;
+                let evidence = format!(
+                    "turn {}; session {}",
+                    status.as_str(),
+                    session
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                let store = app.store.clone();
+                let tx = tx.clone();
+                if let Some(store) = store {
+                    tokio::task::spawn_blocking(move || {
+                        let workspace = crate::session::workspace_key();
+                        let guard = lock_store(&store);
+                        let Ok(goal) = guard.goal(&workspace, id) else {
+                            return;
+                        };
+                        for task in goal.tasks {
+                            if task.state == crate::session::TaskState::Running
+                                && let Err(error) = guard.set_task_state(
+                                    &workspace,
+                                    id,
+                                    task.position,
+                                    next,
+                                    &evidence,
+                                )
+                            {
+                                let _ = tx.send(Action::SessionFailed(format!(
+                                    "Task state not recorded: {error}"
+                                )));
+                            }
+                        }
+                    });
+                }
+            }
+        }
         Action::AgentDone => {
             app.status = AgentState::Idle;
         }
         Action::PermissionAsk { request, reply } => {
+            // The category is named because `a` records exactly that one.
             app.push_notice(format!(
-                "Permission required: {} wants to {}.\n  y = once  ·  a = this category  ·  u = unrestricted  ·  n = deny",
-                request.tool, request.effect
+                "Permission required ({}): {}.\n  y = once  ·  a = this category  ·  u = unrestricted  ·  n = deny",
+                request.kind.name(),
+                request.effect
             ));
             app.pending_permission = Some(PendingPermission { request, reply });
+        }
+        Action::QuestionAsked {
+            id,
+            question,
+            kind,
+            options,
+            reply,
+        } => {
+            app.pending_question = Some(PendingQuestion {
+                id,
+                question,
+                kind,
+                options,
+                selected: 0,
+                chosen: std::collections::BTreeSet::new(),
+                text: String::new(),
+                reply: Some(reply),
+            });
+            app.revision += 1;
         }
         Action::ModelsRefreshed(result) => app.models_refreshed(result),
         Action::DoctorDone(report) => {
@@ -100,6 +311,97 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                 Ok(session) => app.load_session(session),
                 Err(error) => app.push_notice(error),
             }
+        }
+        Action::SessionPickerOpened(result) => {
+            app.status = AgentState::Idle;
+            match result {
+                Ok(rows) => {
+                    app.show_session_picker(rows);
+                }
+                Err(error) => app.push_notice(format!("Sessions unavailable: {error}")),
+            }
+        }
+        Action::TestProposed {
+            command,
+            evidence,
+            changed,
+        } => {
+            // The app stays busy: the command still has to run, and a second
+            // turn must not start beside it. `TestDone` frees the slot.
+            app.push_notice(format!(
+                "Proposed: {command}\n{evidence} ({changed} changed file(s))."
+            ));
+            let tx = tx.clone();
+            // Copied before the spawn: the standing mode is what the matrix this
+            // command runs against is widened by.
+            let mode = app.mode;
+            tokio::spawn(async move {
+                use crate::agent::permissions::Verdict;
+
+                let security = crate::agent::security::WorkspaceSecurity::new(".");
+                // The command is classified as what it is, and the matrix — not
+                // this handler — decides whether it may run at all.
+                let kind = crate::agent::shell::classify(&command, &security).kind;
+                let config = crate::agent::engine::AgentConfig::load(security.root());
+                match test_verdict(&config, mode, kind) {
+                    Verdict::Deny => {
+                        let _ = tx.send(Action::TestDone(format!(
+                            "`{command}` not run: tool_permissions denies {}.",
+                            kind.name()
+                        )));
+                        return;
+                    }
+                    Verdict::Allow => {}
+                    Verdict::Ask => {
+                        let path = crate::cli::config::workspace_config_path(security.root());
+                        let confirm = crate::tui::app::TuiConfirmer::new(tx.clone());
+                        if let Err(denied) = crate::agent::permissions::approve(
+                            &confirm,
+                            kind,
+                            "run_command",
+                            &command,
+                            &path,
+                        )
+                        .await
+                        {
+                            let _ =
+                                tx.send(Action::TestDone(format!("`{command}` not run: {denied}")));
+                            return;
+                        }
+                    }
+                }
+
+                let cancel = crate::agent::cancel::CancelToken::new();
+                use crate::agent::tools::AgentTool;
+                let run = crate::agent::tools::RunCommandTool
+                    .execute(
+                        serde_json::json!({ "command": command }),
+                        &security,
+                        &cancel,
+                    )
+                    .await;
+                let text = match run {
+                    Ok(text) => {
+                        let status = text
+                            .lines()
+                            .next()
+                            .and_then(|line| line.strip_prefix("exit: "))
+                            .and_then(|value| value.trim().parse::<i32>().ok());
+                        let truncated = text.contains(" chars omitted]");
+                        crate::tui::commands::test_report(&command, status, &text, truncated)
+                    }
+                    Err(error) => format!("`{command}` not run: {error}"),
+                };
+                let _ = tx.send(Action::TestDone(text));
+            });
+        }
+        Action::TestDone(report) => {
+            app.status = AgentState::Idle;
+            app.push_notice(report);
+        }
+        Action::SessionsOpDone(report) => {
+            app.status = AgentState::Idle;
+            app.push_notice(report);
         }
         Action::UndoDone(result) => {
             app.status = AgentState::Idle;

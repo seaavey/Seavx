@@ -241,3 +241,32 @@ async fn a_failing_summarizer_returns_the_reason() {
         .unwrap_err();
     assert!(error.contains("provider unavailable"), "{error}");
 }
+
+#[test]
+fn an_image_costs_a_fixed_token_estimate() {
+    use crate::agent::budget::{IMAGE_TOKENS, estimate_tokens};
+    use genai::chat::{ChatMessage, ChatRequest};
+
+    let base = ChatRequest::default().append_message(ChatMessage::system("sys"));
+    let plain = estimate_tokens(&base);
+
+    // A 2 MiB payload counted as text would be ~500k tokens and compact the
+    // history on every image turn.
+    let heavy = crate::session::Attachment::new(
+        "image-001.png".to_string(),
+        "image/png".to_string(),
+        2,
+        2,
+        vec![0u8; 2 * 1024 * 1024],
+        crate::session::PasteSource::Clipboard,
+    );
+    let with_image =
+        estimate_tokens(&base.append_message(crate::session::user_message("look", &[heavy])));
+
+    let delta = with_image - plain;
+    assert!(
+        delta < IMAGE_TOKENS + 400,
+        "one image costs {delta} tokens, not its base64"
+    );
+    assert!(delta >= IMAGE_TOKENS, "the image is not free");
+}

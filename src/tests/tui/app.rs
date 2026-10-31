@@ -345,17 +345,20 @@ fn mode_change_is_rejected_while_busy_and_says_so() {
 }
 
 #[test]
-fn switching_modes_stays_silent() {
+fn ctrl_tab_walks_the_four_standing_modes_and_stays_silent() {
     // The header and footer already show the active mode; a switch must not add
     // a transcript row of its own.
     let mut app = test_app();
-    app.toggle_mode();
-    assert_eq!(app.mode, AgentMode::Plan);
-    assert!(transcript(&app).is_empty(), "{}", transcript(&app));
-
-    app.toggle_mode();
-    assert_eq!(app.mode, AgentMode::Build);
-    assert!(transcript(&app).is_empty(), "{}", transcript(&app));
+    for expected in [
+        AgentMode::Plan,
+        AgentMode::AcceptEdits,
+        AgentMode::Auto,
+        AgentMode::Build,
+    ] {
+        app.cycle_mode();
+        assert_eq!(app.mode, expected);
+        assert!(transcript(&app).is_empty(), "{}", transcript(&app));
+    }
 
     let mut plan = test_app();
     plan.mode = AgentMode::Plan;
@@ -447,6 +450,7 @@ fn loaded(messages: Vec<crate::session::StoredMessage>) -> crate::session::Loade
         messages,
         total_tokens: 42,
         prompt_tokens: 21,
+        pending_calls: Vec::new(),
     }
 }
 
@@ -624,7 +628,7 @@ fn selected_of(app: &App) -> usize {
 #[test]
 fn a_refresh_keeps_the_filter_and_the_cursor_stays_inside_it() {
     let mut app = test_app();
-    app.config.model = "beta".to_string();
+    app.config.model = Some("beta".to_string());
     app.modal = Some(ModalSelection::Model {
         models: vec!["alpha".to_string()],
         query: "et".to_string(),
@@ -687,9 +691,15 @@ fn a_pending_turn_is_prefilled_shown_once_and_replayed_never() {
         .submit_turn(&app.input_text())
         .expect("one request for the submitted prompt");
     assert_eq!(request.prompt, "left hanging");
-    let (new_id, history) =
-        crate::session::prepare_turn(&store, &workspace, "fake-model", Some(id), &request.prompt)
-            .unwrap();
+    let (new_id, history) = crate::session::prepare_turn(
+        &store,
+        &workspace,
+        "fake-model",
+        Some(id),
+        &request.prompt,
+        &[],
+    )
+    .unwrap();
     assert_eq!(new_id, id);
     assert!(history.is_empty(), "the unanswered rows are never replayed");
 
@@ -727,6 +737,7 @@ fn clear_starts_a_new_session_and_keeps_the_old_one_loadable() {
         "fake-model",
         None,
         &first.prompt,
+        &[],
     )
     .unwrap();
     app.session_id = Some(first_id);
@@ -744,6 +755,7 @@ fn clear_starts_a_new_session_and_keeps_the_old_one_loadable() {
         "fake-model",
         app.session_id,
         &second.prompt,
+        &[],
     )
     .unwrap();
     assert_ne!(first_id, second_id);
@@ -780,6 +792,7 @@ fn resending_a_pending_prompt_creates_one_row_and_one_request() {
         "fake-model",
         app.session_id,
         &request.prompt,
+        &[],
     )
     .unwrap();
     assert_eq!(same_id, id);
@@ -822,7 +835,7 @@ fn resending_a_pending_prompt_creates_one_row_and_one_request() {
 }
 
 #[test]
-fn esc_cancels_while_busy_and_quits_only_when_idle() {
+fn esc_cancels_while_busy_and_never_quits() {
     let mut busy = test_app();
     busy.status = AgentState::Streaming;
     busy.escape();
@@ -834,9 +847,10 @@ fn esc_cancels_while_busy_and_quits_only_when_idle() {
         "the worker owns the status"
     );
 
+    // Idle, Esc is not a way out any more.
     let mut idle = test_app();
     idle.escape();
-    assert!(idle.should_quit, "Esc quits when nothing is running");
+    assert!(!idle.should_quit, "Ctrl+C is the only exit");
 
     // With a popup on screen, Esc closes it and touches neither.
     let mut popup = test_app();
@@ -945,17 +959,20 @@ fn the_resume_picker_lists_this_workspaces_sessions_newest_first() {
     let workspace = crate::session::workspace_key();
     let mut app = test_app();
 
+    // The rows the effect reads off the event loop, then hands to the app.
+    let rows = crate::cli::sessions::session_rows(&store, &workspace).unwrap();
     assert!(
-        !app.open_session_picker(&store),
+        !app.show_session_picker(rows),
         "an empty store opens no modal"
     );
     assert!(app.modal.is_none());
 
     for prompt in ["first prompt", "second prompt"] {
-        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt).unwrap();
+        crate::session::prepare_turn(&store, &workspace, "fake-model", None, prompt, &[]).unwrap();
     }
 
-    assert!(app.open_session_picker(&store));
+    let rows = crate::cli::sessions::session_rows(&store, &workspace).unwrap();
+    assert!(app.show_session_picker(rows));
     let Some(ModalSelection::Session { rows, selected }) = app.modal.clone() else {
         panic!("expected the session picker, got {:?}", app.modal);
     };
@@ -964,6 +981,173 @@ fn the_resume_picker_lists_this_workspaces_sessions_newest_first() {
     assert!(rows[0].starts_with("1  svx-"), "{}", rows[0]);
     assert!(rows[0].contains("second prompt"), "{}", rows[0]);
     assert!(rows[1].contains("first prompt"), "{}", rows[1]);
+}
+
+#[test]
+fn the_session_verbs_run_off_thread_against_the_store() {
+    use crate::tui::app::effects::run_sessions_op;
+    use crate::tui::commands::SessionsOp;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let workspace = "ws";
+    let source = store.create(workspace, None, Some("parser work")).unwrap();
+    for message in [
+        genai::chat::ChatMessage::user("first"),
+        genai::chat::ChatMessage::assistant(genai::chat::MessageContent::from_text("one")),
+        genai::chat::ChatMessage::user("second"),
+        genai::chat::ChatMessage::assistant(genai::chat::MessageContent::from_text("two")),
+    ] {
+        store
+            .record_message(source, &message, crate::session::MessageStatus::Complete)
+            .unwrap();
+    }
+    let other = store.create(workspace, None, Some("unrelated")).unwrap();
+    store
+        .record_message(
+            other,
+            &genai::chat::ChatMessage::user("nothing here"),
+            crate::session::MessageStatus::Complete,
+        )
+        .unwrap();
+    // A session in another workspace, so the scope is proven, not assumed.
+    let elsewhere = store
+        .create("/other", None, Some("elsewhere notes"))
+        .unwrap();
+    store
+        .record_message(
+            elsewhere,
+            &genai::chat::ChatMessage::user("elsewhere body"),
+            crate::session::MessageStatus::Complete,
+        )
+        .unwrap();
+    let before: Vec<i64> = store
+        .list_with_archived(workspace, true)
+        .unwrap()
+        .iter()
+        .map(|summary| summary.id)
+        .collect();
+
+    // Fork the source at an explicit completed boundary.
+    let report = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Fork {
+            id: source.to_string(),
+            at: Some(4),
+        },
+    )
+    .expect("forks");
+    assert!(report.starts_with("Forked session"), "{report}");
+    let forked = store
+        .list_with_archived(workspace, true)
+        .unwrap()
+        .into_iter()
+        .find(|summary| !before.contains(&summary.id))
+        .expect("the fork is a new session of this workspace");
+    assert_eq!(
+        store.load(forked.id).unwrap().messages.len(),
+        4,
+        "the prefix"
+    );
+    assert_eq!(
+        store.load(source).unwrap().messages.len(),
+        4,
+        "the source keeps every message"
+    );
+
+    // Archive hides a row from the default list and search, never deletes it.
+    let report = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Archive {
+            id: other.to_string(),
+            archived: true,
+        },
+    )
+    .expect("archives");
+    assert!(report.contains("hidden, not deleted"), "{report}");
+    let listed = crate::cli::sessions::list_text(&store, workspace, false).unwrap();
+    assert!(!listed.contains("unrelated"), "{listed}");
+    assert!(
+        crate::cli::sessions::list_text(&store, workspace, true)
+            .unwrap()
+            .contains("unrelated")
+    );
+    assert_eq!(store.load(other).unwrap().messages.len(), 1, "no data loss");
+
+    // Search is literal, workspace-scoped and archived-aware.
+    let found = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Search {
+            query: "parser work".to_string(),
+            all: false,
+        },
+    )
+    .expect("searches");
+    assert!(found.contains("parser work"), "{found}");
+    let archived_hit = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Search {
+            query: "nothing here".to_string(),
+            all: false,
+        },
+    )
+    .expect("searches");
+    assert!(
+        archived_hit.contains("No session matches"),
+        "{archived_hit}"
+    );
+    let with_archived = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Search {
+            query: "nothing here".to_string(),
+            all: true,
+        },
+    )
+    .expect("searches");
+    assert!(with_archived.contains("unrelated"), "{with_archived}");
+    assert!(
+        run_sessions_op(
+            &store,
+            workspace,
+            SessionsOp::Search {
+                query: "elsewhere".to_string(),
+                all: true,
+            },
+        )
+        .expect("searches")
+        .contains("No session matches"),
+        "another workspace's session is never a hit"
+    );
+    assert!(
+        run_sessions_op(
+            &store,
+            "/other",
+            SessionsOp::Search {
+                query: "elsewhere".to_string(),
+                all: true,
+            },
+        )
+        .expect("searches")
+        .contains("elsewhere notes"),
+        "its own workspace still finds it"
+    );
+
+    // A key that is not in the store is refused with what to do next.
+    let unknown = run_sessions_op(
+        &store,
+        workspace,
+        SessionsOp::Archive {
+            id: "svx-missing".to_string(),
+            archived: true,
+        },
+    )
+    .unwrap_err();
+    assert!(unknown.contains("/sessions"), "{unknown}");
 }
 
 #[test]
@@ -981,16 +1165,16 @@ fn quitting_is_never_blocked_by_a_pending_permission() {
 
     let ctrl = |code: KeyCode| KeyEvent::new(code, KeyModifiers::CONTROL);
     assert!(
-        quit_shortcut(&mut app, &ctrl(KeyCode::Char('d'))),
-        "Ctrl+D quits while a question is on screen"
+        !quit_shortcut(&mut app, &ctrl(KeyCode::Char('d'))),
+        "Ctrl+D is not an exit"
     );
-    assert!(app.should_quit);
+    assert!(!app.should_quit);
     // The question was not answered: the dropped reply is the denial.
     assert!(app.pending_permission.is_some());
 
     let mut app = test_app();
-    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('q'))));
-    assert!(app.should_quit);
+    assert!(!quit_shortcut(&mut app, &ctrl(KeyCode::Char('q'))));
+    assert!(!app.should_quit, "Ctrl+Q is not an exit either");
 }
 
 #[test]
@@ -1048,7 +1232,7 @@ fn picker(models: &[&str], selected: usize) -> Option<ModalSelection> {
 #[test]
 fn a_finished_refresh_replaces_the_open_picker_and_stops_the_spinner() {
     let mut app = test_app();
-    app.config.model = "beta".to_string();
+    app.config.model = Some("beta".to_string());
     app.modal = picker(&["alpha"], 0);
     app.refreshing_models = true;
 
@@ -1141,9 +1325,42 @@ async fn escape_closes_the_ghost_then_the_popup_then_cancels_the_turn() {
     let mut idle = test_app();
     super::keys::handle(&mut idle, esc(), &tx).await;
     assert!(
-        idle.should_quit,
-        "Esc with nothing open and nothing running quits"
+        !idle.should_quit,
+        "Esc with nothing open and nothing running does not quit"
     );
+}
+
+#[tokio::test]
+async fn a_second_esc_clears_the_line() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let mut app = test_app();
+    app.set_input("half typed");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert_eq!(app.input_text(), "half typed", "one press only arms");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert_eq!(app.input_text(), "", "the second press clears");
+}
+
+#[tokio::test]
+async fn typing_between_two_esc_presses_keeps_the_line() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let mut app = test_app();
+    app.set_input("first");
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    super::keys::handle(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        &tx,
+    )
+    .await;
+    super::keys::handle(&mut app, esc(), &tx).await;
+
+    assert_eq!(app.input_text(), "firstx", "a key between them disarms");
 }
 
 #[tokio::test]
@@ -1232,4 +1449,908 @@ async fn escape_closes_the_skill_picker_without_installing() {
     assert!(app.modal.is_none(), "Esc closes the picker");
     assert!(app.pending_skills.is_none(), "and drops the checkout");
     assert!(rx.try_recv().is_err(), "Esc installs nothing");
+}
+
+#[test]
+fn submit_turn_assigns_monotonic_turn_ids() {
+    let mut app = test_app();
+
+    let first = app
+        .submit_turn("first prompt")
+        .expect("an idle app accepts");
+    assert_eq!(first.turn_id, 1);
+
+    // Busy: the refusal happens before a number is taken.
+    let refused = app.submit_turn("while busy");
+    assert!(refused.is_none());
+    assert_eq!(app.turn_id, 1, "a refused turn takes no number");
+
+    app.status = AgentState::Idle;
+    let second = app.submit_turn("second prompt").expect("idle again");
+    assert_eq!(second.turn_id, 2);
+}
+
+#[test]
+fn a_tool_event_renders_its_outcome_and_never_completes_a_cancelled_call() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    let tool = |status, elapsed, failure| crate::agent::events::ToolEvent {
+        call_id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        summary: "note.txt".to_string(),
+        status,
+        failure,
+        started_at: 1,
+        elapsed,
+    };
+
+    super::actions::apply(
+        &mut app,
+        Action::AgentTool(tool(crate::agent::events::ToolStatus::Queued, None, None)),
+        &tx,
+    );
+    let queued = crate::tui::compact::transcript_from_segments(&app.segments);
+    assert!(queued.contains("⚡ read  note.txt"), "{queued}");
+
+    super::actions::apply(
+        &mut app,
+        Action::AgentTool(tool(
+            crate::agent::events::ToolStatus::Completed,
+            Some(std::time::Duration::from_millis(430)),
+            None,
+        )),
+        &tx,
+    );
+    let done = crate::tui::compact::transcript_from_segments(&app.segments);
+    assert!(done.contains("completed"), "{done}");
+    assert!(done.contains("0.4s"), "{done}");
+
+    super::actions::apply(
+        &mut app,
+        Action::AgentTool(tool(
+            crate::agent::events::ToolStatus::Cancelled,
+            Some(std::time::Duration::from_millis(2100)),
+            None,
+        )),
+        &tx,
+    );
+    let cancelled = crate::tui::compact::transcript_from_segments(&app.segments);
+    assert!(cancelled.contains("cancelled"), "{cancelled}");
+    assert_eq!(
+        cancelled.matches("completed").count(),
+        1,
+        "the cancelled call adds no second completion: {cancelled}"
+    );
+}
+
+#[test]
+fn a_failed_tool_event_names_its_failure() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    super::actions::apply(
+        &mut app,
+        Action::AgentTool(crate::agent::events::ToolEvent {
+            call_id: "call-2".to_string(),
+            name: "write_file".to_string(),
+            summary: "path=\"made.txt\"".to_string(),
+            status: crate::agent::events::ToolStatus::Failed,
+            failure: Some(crate::agent::events::FailureKind::PermissionDenied),
+            started_at: 1,
+            elapsed: Some(std::time::Duration::from_millis(4)),
+        }),
+        &tx,
+    );
+    let text = crate::tui::compact::transcript_from_segments(&app.segments);
+    assert!(text.contains("failed"), "{text}");
+    assert!(text.contains("permission_denied"), "{text}");
+}
+
+fn clone_question(source: &crate::tui::app::PendingQuestion) -> crate::tui::app::PendingQuestion {
+    crate::tui::app::PendingQuestion {
+        id: source.id,
+        question: source.question.clone(),
+        kind: source.kind,
+        options: source.options.clone(),
+        selected: source.selected,
+        chosen: source.chosen.clone(),
+        text: source.text.clone(),
+        reply: None,
+    }
+}
+
+#[test]
+fn a_question_view_maps_each_kind_to_one_outcome() {
+    use crate::session::{QuestionKind, QuestionState};
+    use crate::tui::app::PendingQuestion;
+
+    let text = PendingQuestion {
+        id: 1,
+        question: "name?".to_string(),
+        kind: QuestionKind::Text,
+        options: Vec::new(),
+        selected: 0,
+        chosen: Default::default(),
+        text: "widget".to_string(),
+        reply: None,
+    };
+    assert_eq!(
+        text.outcome(),
+        (QuestionState::Answered, "widget".to_string())
+    );
+
+    let single = PendingQuestion {
+        selected: 1,
+        kind: QuestionKind::Single,
+        options: vec!["a".to_string(), "b".to_string()],
+        text: String::new(),
+        ..clone_question(&text)
+    };
+    assert_eq!(single.outcome(), (QuestionState::Answered, "b".to_string()));
+
+    let multi = PendingQuestion {
+        kind: QuestionKind::Multi,
+        chosen: [0, 2].into_iter().collect(),
+        options: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        ..clone_question(&text)
+    };
+    assert_eq!(
+        multi.outcome(),
+        (QuestionState::Answered, "a, c".to_string())
+    );
+
+    // Nothing picked is a skip, never an empty answer.
+    let empty = PendingQuestion {
+        kind: QuestionKind::Multi,
+        chosen: Default::default(),
+        ..clone_question(&text)
+    };
+    assert_eq!(empty.outcome(), (QuestionState::Skipped, String::new()));
+}
+
+#[test]
+fn typing_into_a_text_question_keeps_the_prompt_on_screen_until_enter() {
+    use crate::tui::app::PendingQuestion;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app();
+    let (reply, mut answered) = tokio::sync::oneshot::channel();
+    app.pending_question = Some(PendingQuestion {
+        id: 4,
+        question: "which file?".to_string(),
+        kind: crate::session::QuestionKind::Text,
+        options: Vec::new(),
+        selected: 0,
+        chosen: Default::default(),
+        text: String::new(),
+        reply: Some(reply),
+    });
+
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert!(app.answer_question(&key(KeyCode::Char('a'))).is_none());
+    assert!(app.answer_question(&key(KeyCode::Char('b'))).is_none());
+    assert_eq!(app.pending_question.as_ref().unwrap().text, "ab");
+    assert!(answered.try_recv().is_err(), "nothing sent before Enter");
+
+    let notice = app.answer_question(&key(KeyCode::Enter)).unwrap();
+    assert_eq!(notice, "Answered: ab");
+    assert!(app.pending_question.is_none());
+    assert_eq!(
+        answered.try_recv().unwrap(),
+        (crate::session::QuestionState::Answered, "ab".to_string())
+    );
+}
+
+#[test]
+fn escaping_a_question_cancels_it_instead_of_answering() {
+    use crate::tui::app::PendingQuestion;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app();
+    let (reply, mut answered) = tokio::sync::oneshot::channel();
+    app.pending_question = Some(PendingQuestion {
+        id: 5,
+        question: "which file?".to_string(),
+        kind: crate::session::QuestionKind::Single,
+        options: vec!["a.rs".to_string()],
+        selected: 0,
+        chosen: Default::default(),
+        text: String::new(),
+        reply: Some(reply),
+    });
+
+    app.answer_question(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        answered.try_recv().unwrap(),
+        (crate::session::QuestionState::Cancelled, String::new()),
+        "cancel carries no answer"
+    );
+}
+
+#[test]
+fn answering_a_restored_question_appends_exactly_one_result() {
+    use crate::session::{
+        LoadedSession, MessageStatus, PAYLOAD_FORMAT, QuestionKind, SessionStore, StoredMessage,
+        workspace_key,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(
+        SessionStore::open_at(&dir.path().join("sessions.db")).unwrap(),
+    ));
+    let session = {
+        let guard = store.lock().unwrap();
+        let session = guard
+            .create(&workspace_key(), None, Some("asking"))
+            .unwrap();
+        let call = genai::chat::ChatMessage::assistant(
+            genai::chat::MessageContent::from_tool_calls(vec![
+                serde_json::from_value(serde_json::json!({
+                    "call_id": "call_ask",
+                    "fn_name": "ask_user",
+                    "fn_arguments": { "question": "Which file?" },
+                }))
+                .unwrap(),
+            ]),
+        );
+        guard
+            .record_message(session, &call, MessageStatus::Complete)
+            .unwrap();
+        guard
+            .ask_question(
+                &workspace_key(),
+                Some(session),
+                1,
+                "call_ask",
+                "Which file?",
+                QuestionKind::Text,
+                &[],
+            )
+            .unwrap();
+        session
+    };
+
+    let mut app = test_app();
+    app.store = Some(store.clone());
+    let loaded = LoadedSession {
+        id: session,
+        slug: format!("svx-{session:08}"),
+        workspace: workspace_key(),
+        title: None,
+        model: None,
+        payload_format: PAYLOAD_FORMAT.to_string(),
+        read_only: None,
+        messages: Vec::<StoredMessage>::new(),
+        total_tokens: 0,
+        prompt_tokens: 0,
+        pending_calls: vec!["call_ask".to_string()],
+    };
+    app.load_session(loaded);
+    assert!(
+        app.pending_question.is_some(),
+        "the open question comes back with the session"
+    );
+
+    for c in "main.rs".chars() {
+        app.answer_question(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let notice = app
+        .answer_question(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(notice, "Answered: main.rs");
+    assert!(app.pending_question.is_none());
+
+    let guard = store.lock().unwrap();
+    let question = guard.question(&workspace_key(), 1).unwrap();
+    assert_eq!(question.state, crate::session::QuestionState::Answered);
+    assert_eq!(question.answer, "main.rs");
+    let loaded = guard.load(session).unwrap();
+    assert!(
+        loaded.pending_calls.is_empty(),
+        "the question is no longer open"
+    );
+    let results: Vec<String> = crate::session::replay(&loaded)
+        .history
+        .iter()
+        .flat_map(|message| message.content.tool_responses())
+        .map(|response| response.call_id.clone())
+        .collect();
+    assert_eq!(results, vec!["call_ask".to_string()], "exactly one result");
+}
+
+#[tokio::test]
+async fn a_running_test_keeps_the_turn_slot_busy_until_it_finishes() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    // `/test` marks the app busy before the command is proposed.
+    app.status = AgentState::Checking;
+    super::actions::apply(
+        &mut app,
+        Action::TestProposed {
+            command: "cargo test".to_string(),
+            evidence: "Cargo.toml".to_string(),
+            changed: 1,
+        },
+        &tx,
+    );
+    assert_eq!(
+        app.status,
+        AgentState::Checking,
+        "proposing the test must not free the turn slot"
+    );
+    assert!(
+        app.submit_turn("start another task").is_none(),
+        "a second turn must wait for the test"
+    );
+
+    super::actions::apply(&mut app, Action::TestDone("exit: 0".to_string()), &tx);
+    assert_eq!(app.status, AgentState::Idle);
+    assert!(
+        app.submit_turn("start another task").is_some(),
+        "the slot frees when the test is done"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_operation_keeps_the_slot_busy_and_its_prompt_still_starts() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    // `CommandEffect::RunGoal` marks the app busy while the store work runs.
+    app.status = AgentState::Checking;
+    assert!(
+        app.submit_turn("while the goal runs").is_none(),
+        "a prompt cannot start while a goal operation holds the slot"
+    );
+
+    super::actions::apply(
+        &mut app,
+        Action::GoalDone {
+            result: Ok("Goal 1 approved.".to_string()),
+            goal: Some("1 active".to_string()),
+            start: Some("write the parser".to_string()),
+        },
+        &tx,
+    );
+    assert_eq!(
+        app.status,
+        AgentState::Thinking,
+        "the goal prompt is submitted, not refused as busy"
+    );
+    assert!(transcript(&app).contains("User: write the parser"));
+}
+
+#[tokio::test]
+async fn a_goal_operation_without_a_prompt_returns_to_idle() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.status = AgentState::Checking;
+    super::actions::apply(
+        &mut app,
+        Action::GoalDone {
+            result: Ok("Goal 1 paused.".to_string()),
+            goal: Some("1 paused".to_string()),
+            start: None,
+        },
+        &tx,
+    );
+    assert_eq!(app.status, AgentState::Idle);
+}
+
+#[test]
+fn a_queued_prompt_is_dropped_when_the_turn_does_not_succeed() {
+    use crate::agent::cancel::TurnStatus;
+
+    let mut app = test_app();
+    app.status = AgentState::Thinking;
+    app.queued_prompt = Some("run the tests".to_string());
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    super::actions::apply(
+        &mut app,
+        crate::tui::event::Action::TurnFinished {
+            status: TurnStatus::Cancelled,
+            cleanup: None,
+            pid: None,
+        },
+        &tx,
+    );
+
+    assert!(
+        app.queued_prompt.is_none(),
+        "a cancelled turn must not run the queue"
+    );
+    assert_eq!(app.status, AgentState::Idle);
+    let text = transcript(&app);
+    assert!(text.contains("Queued prompt dropped"), "{text}");
+}
+
+#[test]
+fn criteria_can_be_satisfied_or_waived_so_a_goal_reaches_completed() {
+    use crate::session::{CriterionState, GoalState};
+    use crate::tui::app::effects::run_goal;
+    use crate::tui::commands::GoalAction;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let workspace = "ws";
+    let id = store.create_goal(workspace, None, "ship 0.1.3").unwrap();
+    store
+        .set_goal_plan(
+            workspace,
+            id,
+            &["tests pass".to_string(), "docs updated".to_string()],
+            &["write the code".to_string()],
+        )
+        .unwrap();
+    store
+        .set_goal_state(workspace, id, GoalState::Active)
+        .unwrap();
+    let mut start = None;
+
+    let report = run_goal(
+        &store,
+        workspace,
+        GoalAction::CriteriaSatisfy {
+            index: 0,
+            evidence: "cargo test: 535 passed".to_string(),
+        },
+        &mut start,
+    )
+    .expect("a criterion can be satisfied");
+    assert!(report.contains("criterion 1"), "{report}");
+
+    // One criterion is still pending, so completion is still refused.
+    assert!(
+        store
+            .set_goal_state(workspace, id, GoalState::Completed)
+            .is_err(),
+        "a pending criterion must still block completion"
+    );
+
+    let report = run_goal(
+        &store,
+        workspace,
+        GoalAction::CriteriaWaive {
+            index: 1,
+            reason: "docs land with 0.1.4".to_string(),
+        },
+        &mut start,
+    )
+    .expect("a criterion can be waived with a reason");
+    assert!(report.contains("criterion 2"), "{report}");
+
+    // A refusal names the index that does not exist instead of doing nothing.
+    let refused = run_goal(
+        &store,
+        workspace,
+        GoalAction::CriteriaWaive {
+            index: 7,
+            reason: "nope".to_string(),
+        },
+        &mut start,
+    )
+    .expect_err("there is no criterion 8");
+    assert!(refused.contains('8'), "{refused}");
+
+    // Completion goes through the command the user has, and the store still
+    // enforces the criteria gate underneath it.
+    let report = run_goal(&store, workspace, GoalAction::Complete(None), &mut start)
+        .expect("every criterion is satisfied or waived");
+    assert!(report.contains("completed"), "{report}");
+    let goal = store.goal(workspace, id).unwrap();
+    assert_eq!(goal.state, GoalState::Completed);
+
+    // A finished goal is neither live nor draft, and must still be readable.
+    let shown = run_goal(&store, workspace, GoalAction::Show(None), &mut start)
+        .expect("a completed goal is still inspectable");
+    assert!(shown.contains("completed"), "{shown}");
+    assert!(shown.contains("satisfied"), "{shown}");
+    // And the completion cannot be claimed a second time.
+    assert!(
+        run_goal(&store, workspace, GoalAction::Complete(None), &mut start).is_err(),
+        "a completed goal never completes again"
+    );
+    let states: Vec<CriterionState> = goal.criteria.iter().map(|row| row.state).collect();
+    assert_eq!(
+        states,
+        vec![CriterionState::Satisfied, CriterionState::Waived]
+    );
+}
+
+#[test]
+fn the_test_command_is_vetted_by_the_permission_matrix() {
+    use crate::agent::engine::AgentConfig;
+    use crate::agent::permissions::{ActionKind, Verdict};
+
+    let mut config = AgentConfig {
+        tool_permissions: "deny".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::actions::test_verdict(&config, AgentMode::Build, ActionKind::Execute),
+        Verdict::Deny,
+        "tool_permissions = deny must refuse the command /test proposes"
+    );
+
+    config.tool_permissions = "ask".to_string();
+    assert_eq!(
+        super::actions::test_verdict(&config, AgentMode::Build, ActionKind::Execute),
+        Verdict::Ask
+    );
+
+    config.permitted_actions = vec!["execute".to_string()];
+    assert_eq!(
+        super::actions::test_verdict(&config, AgentMode::Build, ActionKind::Execute),
+        Verdict::Allow,
+        "an already-permitted category is not asked again"
+    );
+
+    // The command is classified as what it is. Labelling it a write is what
+    // let a `deny` policy through before.
+    let temp = tempfile::tempdir().unwrap();
+    let security = crate::agent::security::WorkspaceSecurity::new(temp.path());
+    assert_eq!(
+        crate::agent::shell::classify("cargo test", &security).kind,
+        ActionKind::Execute
+    );
+}
+
+async fn wait_for_task(
+    store: &std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>,
+    workspace: &str,
+    id: i64,
+) -> crate::session::TaskState {
+    for _ in 0..200 {
+        {
+            let guard = store.lock().unwrap();
+            let goal = guard.goal(workspace, id).unwrap();
+            if goal.tasks[0].state != crate::session::TaskState::Running {
+                return goal.tasks[0].state;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("the task state never left Running");
+}
+
+#[tokio::test]
+async fn a_failed_turn_leaves_the_goal_task_blocked_not_completed() {
+    use crate::agent::cancel::TurnStatus;
+    use crate::session::{GoalState, TaskState};
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap(),
+    ));
+    let workspace = crate::session::workspace_key();
+    let (id, session) = {
+        let guard = store.lock().unwrap();
+        let session = guard.create(&workspace, None, Some("goal turn")).unwrap();
+        let id = guard
+            .create_goal(&workspace, Some(session), "ship it")
+            .unwrap();
+        guard
+            .set_goal_plan(
+                &workspace,
+                id,
+                &["tests pass".to_string()],
+                &["write the code".to_string()],
+            )
+            .unwrap();
+        guard
+            .set_goal_state(&workspace, id, GoalState::Active)
+            .unwrap();
+        guard
+            .set_task_state(&workspace, id, 0, TaskState::Running, "")
+            .unwrap();
+        (id, session)
+    };
+
+    let mut app = test_app();
+    app.store = Some(store.clone());
+    app.session_id = Some(session);
+    app.goal = Some(format!("{id} active"));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    super::actions::apply(
+        &mut app,
+        crate::tui::event::Action::TurnFinished {
+            status: TurnStatus::Failed,
+            cleanup: None,
+            pid: None,
+        },
+        &tx,
+    );
+
+    assert_eq!(
+        wait_for_task(&store, &workspace, id).await,
+        TaskState::Blocked,
+        "a failed turn must not record the task as completed"
+    );
+
+    // The evidence names the turn that left it blocked, so `/tasks` is honest.
+    let guard = store.lock().unwrap();
+    let goal = guard.goal(&workspace, id).unwrap();
+    assert!(
+        goal.tasks[0].evidence.contains("failed"),
+        "{}",
+        goal.tasks[0].evidence
+    );
+}
+
+#[test]
+fn a_draft_goal_can_be_planned_then_approved_through_the_commands() {
+    use crate::tui::app::effects::run_goal;
+    use crate::tui::commands::GoalAction;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let workspace = "ws";
+    let mut start = None;
+
+    run_goal(
+        &store,
+        workspace,
+        GoalAction::New("ship the release".to_string()),
+        &mut start,
+    )
+    .expect("a goal is drafted");
+    let id = store.goals(workspace).unwrap()[0].id;
+
+    // The editing verbs only accept a draft, so resolving to the live goal alone
+    // made them unreachable: nothing could plan the goal the user had just made.
+    run_goal(
+        &store,
+        workspace,
+        GoalAction::CriteriaAdd("tests pass".to_string()),
+        &mut start,
+    )
+    .expect("criteria add finds the draft");
+    run_goal(
+        &store,
+        workspace,
+        GoalAction::TaskAdd("write the code".to_string()),
+        &mut start,
+    )
+    .expect("task add finds the draft");
+
+    let goal = store.goal(workspace, id).unwrap();
+    assert_eq!(goal.criteria.len(), 1, "the criterion was stored");
+    assert_eq!(goal.tasks.len(), 1, "the task was stored");
+
+    run_goal(&store, workspace, GoalAction::Approve, &mut start).expect("the draft is approved");
+    assert_eq!(
+        store.goal(workspace, id).unwrap().state,
+        crate::session::GoalState::Active
+    );
+    assert!(start.is_some(), "approval hands back the turn text to run");
+}
+
+#[test]
+fn test_tui_redraw_interval_tracks_live_animation_work() {
+    let mut app = test_app();
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_secs(1)
+    );
+
+    app.status = AgentState::Thinking;
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_millis(16)
+    );
+
+    app.status = AgentState::Idle;
+    app.refreshing_models = true;
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_millis(16)
+    );
+
+    app.refreshing_models = false;
+    app.modal = Some(ModalSelection::Effort {
+        model: "test".to_string(),
+        options: crate::agent::engine::EFFORT_LEVELS.to_vec(),
+        selected: crate::agent::engine::EFFORT_LEVELS
+            .iter()
+            .position(|level| *level == "max")
+            .unwrap(),
+    });
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_millis(16)
+    );
+
+    if let Some(ModalSelection::Effort { selected, .. }) = app.modal.as_mut() {
+        *selected = 0;
+    }
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_secs(1)
+    );
+}
+
+#[test]
+fn expired_toast_returns_to_the_idle_redraw_interval() {
+    let mut app = test_app();
+    app.toast = Some((
+        "expired".to_string(),
+        std::time::Instant::now() - std::time::Duration::from_secs(4),
+    ));
+    assert_eq!(
+        run::redraw_interval(&app),
+        std::time::Duration::from_secs(1)
+    );
+}
+
+#[test]
+fn a_cold_cache_opens_a_fetching_picker() {
+    let mut app = test_app();
+    app.config.base_url = Some("https://phase3-cold-cache.invalid/v1/".to_string());
+
+    assert!(
+        !app.open_model_picker(),
+        "an empty cache asks the caller to start the fetch"
+    );
+    match &app.modal {
+        Some(ModalSelection::Model { models, .. }) => {
+            assert!(models.is_empty(), "nothing cached is nothing to list")
+        }
+        _ => panic!("the picker opens while its list arrives"),
+    }
+
+    app.models_refreshed(Ok(vec!["model-one".to_string(), "model-two".to_string()]));
+
+    match &app.modal {
+        Some(ModalSelection::Model { models, .. }) => assert_eq!(models.len(), 2),
+        _ => panic!("the fetched list fills the open picker"),
+    }
+}
+
+#[test]
+fn an_unreachable_endpoint_reports_the_host() {
+    let mut app = test_app();
+    app.config.base_url = Some("https://phase3-unreachable.invalid/v1/".to_string());
+    assert!(!app.open_model_picker());
+
+    app.models_refreshed(Err("connection refused".to_string()));
+
+    assert!(
+        app.modal.is_none(),
+        "an empty picker has nothing left to show"
+    );
+    let named = app.segments.iter().any(|segment| match segment {
+        Segment::Notice(text) => text.contains("phase3-unreachable.invalid"),
+        _ => false,
+    });
+    assert!(named, "the failure names the host, not a generic message");
+}
+
+#[test]
+fn picker_without_an_endpoint_fetches_nothing() {
+    let mut app = test_app();
+    app.config.base_url = None;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.spawn_model_refresh(&tx);
+
+    assert!(
+        !app.refreshing_models,
+        "no endpoint means no spinner and no fetch"
+    );
+    let named = app.segments.iter().any(|segment| match segment {
+        Segment::Notice(text) => text.contains("no endpoint configured"),
+        _ => false,
+    });
+    assert!(named, "the refusal says what to run");
+}
+
+/// A picker owns the keyboard while it is open: typing edits its filter and
+/// never reaches the prompt behind it.
+#[tokio::test]
+async fn typing_with_the_picker_open_stays_in_the_filter() {
+    let mut app = test_app();
+    app.modal = Some(ModalSelection::Model {
+        models: vec!["model-a".to_string()],
+        query: String::new(),
+        selected: 0,
+    });
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    for character in "/exit".chars() {
+        super::keys::handle(&mut app, KeyEvent::from(KeyCode::Char(character)), &tx).await;
+    }
+
+    assert_eq!(
+        typed(&app),
+        "",
+        "the prompt behind the picker must stay empty"
+    );
+    match &app.modal {
+        Some(ModalSelection::Model { query, .. }) => assert_eq!(query, "/exit"),
+        _ => panic!("the picker stays open while its filter is edited"),
+    }
+}
+
+fn sample_image() -> crate::session::Attachment {
+    let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 9, 9, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encode");
+    crate::session::Attachment::new(
+        "image-001.png".to_string(),
+        "image/png".to_string(),
+        2,
+        2,
+        bytes.into_inner(),
+        crate::session::PasteSource::Clipboard,
+    )
+}
+
+#[test]
+fn an_image_alone_is_a_turn() {
+    let mut app = test_app();
+    app.pending_attachments.push(sample_image());
+
+    assert!(
+        matches!(app.enter_action(""), EnterAction::Turn(_)),
+        "an empty line with an image is still a turn"
+    );
+    let request = app.submit_turn("").expect("an image alone is a turn");
+
+    assert_eq!(request.prompt, "");
+    assert_eq!(request.attachments.len(), 1);
+    assert!(
+        app.pending_attachments.is_empty(),
+        "the accepted turn took the image"
+    );
+    let text = transcript(&app);
+    assert!(
+        text.contains("[image #1 2\u{00d7}2 png"),
+        "the transcript labels the image: {text}"
+    );
+}
+
+#[test]
+fn a_typed_prompt_and_an_image_are_one_turn() {
+    let mut app = test_app();
+    app.pending_attachments.push(sample_image());
+
+    let request = app.submit_turn("what is this").expect("one turn");
+
+    assert_eq!(request.prompt, "what is this");
+    assert_eq!(
+        request.attachments.len(),
+        1,
+        "the image rides the same turn"
+    );
+}
+
+#[test]
+fn a_refused_turn_keeps_its_attachments() {
+    let mut app = test_app();
+    app.pending_attachments.push(sample_image());
+    app.status = AgentState::Thinking;
+
+    assert!(app.submit_turn("hello").is_none(), "a busy turn refuses");
+
+    assert_eq!(
+        app.pending_attachments.len(),
+        1,
+        "a refusal must not eat the image"
+    );
+}
+
+#[test]
+fn the_same_bytes_attach_once() {
+    let mut app = test_app();
+
+    paste::attach(&mut app, sample_image());
+    paste::attach(&mut app, sample_image());
+
+    assert_eq!(app.pending_attachments.len(), 1, "one chip per image");
+    assert!(
+        transcript(&app).contains("already attached as #1"),
+        "the second paste says where it went"
+    );
 }

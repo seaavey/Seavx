@@ -7,13 +7,46 @@
 //! token cost. It can still under-count CJK or code-dense text by up to ~2x,
 //! which is why overflow is handled by one retry rather than promised away.
 
-use genai::chat::{ChatMessage, ChatRequest, ChatRole};
+use genai::chat::{ChatMessage, ChatRequest, ChatRole, ContentPart, MessageContent};
+
+/// What one image costs whatever its size: a vision model reads a fixed number
+/// of patches, not the base64 behind them.
+pub const IMAGE_TOKENS: usize = 1600;
 
 /// `ceil(chars/4)` of the serialized request; a serialization failure falls
 /// back to the `Debug` form so this never returns zero for a real request.
 pub fn estimate_tokens(request: &ChatRequest) -> usize {
-    let serialized = serde_json::to_string(request).unwrap_or_else(|_| format!("{request:?}"));
-    serialized.chars().count().div_ceil(4)
+    let mut stripped = request.clone();
+    let mut images = 0;
+    for message in &mut stripped.messages {
+        images += strip_images(message);
+    }
+    let serialized = serde_json::to_string(&stripped).unwrap_or_else(|_| format!("{stripped:?}"));
+    serialized.chars().count().div_ceil(4) + images * IMAGE_TOKENS
+}
+
+/// Blanks every image payload and reports how many there were, so the estimate
+/// charges one image a fixed price instead of six figures for its base64 — which
+/// would otherwise compact the history on every image turn.
+fn strip_images(message: &mut ChatMessage) -> usize {
+    let mut images = 0;
+    let parts: Vec<ContentPart> = message
+        .content
+        .parts()
+        .iter()
+        .filter(|part| match part {
+            ContentPart::Binary(_) => {
+                images += 1;
+                false
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    if images > 0 {
+        message.content = MessageContent::from_parts(parts);
+    }
+    images
 }
 
 /// 80 % of the model's window: the point where a request is compacted.
@@ -59,8 +92,10 @@ pub fn window_start(messages: &[ChatMessage], budget: usize) -> usize {
 }
 
 fn estimate_message(message: &ChatMessage) -> usize {
-    let serialized = serde_json::to_string(message).unwrap_or_else(|_| format!("{message:?}"));
-    serialized.chars().count().div_ceil(4)
+    let mut stripped = message.clone();
+    let images = strip_images(&mut stripped);
+    let serialized = serde_json::to_string(&stripped).unwrap_or_else(|_| format!("{stripped:?}"));
+    serialized.chars().count().div_ceil(4) + images * IMAGE_TOKENS
 }
 
 /// The four headings a summary must carry.

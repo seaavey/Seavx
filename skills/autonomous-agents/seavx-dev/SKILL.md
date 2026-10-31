@@ -1,66 +1,61 @@
 ---
 name: seavx-dev
 description: Workflow for building Seavx features in this repository — debug mode is mandatory, data must land in the repo .seavx/, and every feature ships with a skill entry. Use when implementing, fixing or reviewing code in the Seavx repository. Don't use it for operating the released agent; that is the seavx skill.
+version: 0.1.0
+author: Muhammad Adriansyah (Seaavey), Hermes Agent
+license: MIT
+platforms: [linux, macos]
+metadata:
+  hermes:
+    tags: [seavx, rust, development-workflow, testing]
+    related_skills: [seavx]
 ---
 
 # Seavx development
 
-## The one rule: debug on
+## Debug on, always
 
-Any coding session on this repository runs in debug mode. Start it with
-`seavx -d`, or `cargo run -- -d` when the binary is not installed, or
-`SEAVX_DEBUG=true` when the run already started.
-
-Debug mode is the only thing that moves `sessions.db` and `debug.log` into the
-repo `.seavx/`. Without it a development run writes to `~/.seavx` — the store
-the real sessions live in — and leaves nothing in the workspace to read after a
-failed turn.
+Every coding session on this repository runs in debug mode: `seavx -d`,
+`cargo run -- -d` when the binary is not installed, or `SEAVX_DEBUG=true` for a
+run already started. Without it `sessions.db` and `debug.log` land in
+`~/.seavx` — the real store — and the workspace keeps nothing to read after a
+failed turn. The full table is in `../seavx/SKILL.md`.
 
 Verify, never assume:
 
 ```
-seavx doctor --offline | grep session     # .seavx/sessions.db, not /home/…/.seavx
+seavx doctor --offline | rg session     # .seavx/sessions.db, not /home/…/.seavx
 ```
-
-A debug build is not a debug run: `cargo run` without `-d` takes the release
-path. Debug is sticky, too — a `-d` run writes `SEAVX_DEBUG=true` into `.env`,
-so the next plain run is debug as well until that line says `false`.
 
 ## Feature checklist
 
 1. **Debug on**, confirmed with `doctor`.
-2. **Read before writing.** The module you touch owns its own test file:
-   `#[cfg(test)] #[path = "../tests/<area>/<name>.rs"] mod tests;` at the bottom
-   of the module, tests in `src/tests/`. A behaviour change without a test is
-   unfinished.
-3. **Prove it.**
-   ```
-   cargo test
-   cargo clippy --all-targets
-   cargo fmt
-   ```
-   Then run the thing: `seavx -d doctor --offline`, or the TUI, or
-   `seavx exec` for a scripted turn. A green test suite is not a green feature.
-4. **Changelog.** One entry under `## Unreleased` in `CHANGELOG.md`, in the
-   right category (`feature`, `fix`, `refactor`, `docs`), describing behaviour
-   that is actually in the code.
-5. **README** when a command, config key, path or default changes. The README is
-   a contract: it states limits instead of implying them.
-6. **Skill.** Every feature adds or updates a skill. A new playbook becomes
-   `skills/autonomous-agents/<name>/SKILL.md`; something about Seavx itself goes
-   into a section of `skills/autonomous-agents/seavx/SKILL.md`. A feature
-   without a skill entry is not finished.
+2. **Read before writing.** The module you touch owns its test file:
+   `#[cfg(test)] #[path = "../tests/<area>/<name>.rs"] mod tests;` at its bottom,
+   tests in `src/tests/`. A behaviour change without a test is unfinished.
+3. **Prove it** — `cargo test`, `cargo clippy --all-targets`, `cargo fmt`, then
+   run the thing (`seavx -d doctor --offline`, the TUI, or `seavx exec` for a
+   scripted turn). A green suite is not a green feature.
+4. **Changelog.** One entry under `## Unreleased` in `CHANGELOG.md`, under the
+   heading the block already uses (`feat`, `fix`, `breaking`) — copy the existing
+   style instead of inventing a category — describing behaviour that is in the
+   code.
+5. **README** when a command, config key, path or default changes. It is a
+   contract: state limits instead of implying them.
+6. **Skill.** Every feature adds or updates one: a new playbook becomes
+   `skills/autonomous-agents/<name>/SKILL.md`, something about Seavx itself joins
+   a section of `skills/autonomous-agents/seavx/SKILL.md`. Without it the feature
+   is not finished.
 
 ## Traps
 
-- **Never develop against `~/.seavx`.** A bug that only reproduces in the repo
-  store, or only in the home store, hides for as long as you only run one of them.
-- **Do not edit `.env` through agent tools.** `.env` and its variants are on the
-  protected list; the read or write is refused before it starts. Edit it by hand.
-- **Do not run the TUI without a TTY.** It fails at raw mode; use `seavx exec`
+- **Never develop against `~/.seavx`.** A bug that only reproduces in one of the
+  two stores hides for as long as you run only that one.
+- **Do not edit `.env` through agent tools.** It is protected; the read or write
+  is refused. Edit it by hand.
+- **Do not run the TUI without a TTY** — it fails at raw mode. Use `seavx exec`
   or `doctor` for scripted checks.
-- **`seavx exec` writes nothing** — no session, no log, no `.env`. If you need
-  those, you are not testing `exec`.
-- **A skill under `skills/` is live on the next run.** The four roots are
-  `.seavx/skills`, `skills/`, `~/.seavx/skills`, `~/.agents/skills`; a repo
-  skill shadows a user skill of the same name, and no copy is needed.
+- **`seavx exec` writes no session and no `.env`**, but the engine still appends
+  every request payload to `.seavx/request.log` and tracing writes
+  `.seavx/debug.log`, even without `-d`. Expect those two files afterwards; the
+  absence of a session is the only thing that proves `exec`.
