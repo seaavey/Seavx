@@ -151,6 +151,45 @@ mod test_cases {
     }
 
     #[test]
+    fn a_base_url_must_be_http_or_https_with_a_host() {
+        // The wiring convenience: a bare host is read as https.
+        assert_eq!(
+            crate::agent::engine::validate_base_url("seavx.ai.id").unwrap(),
+            "https://seavx.ai.id/v1/"
+        );
+        assert_eq!(
+            crate::agent::engine::validate_base_url("http://127.0.0.1:8080/v1/").unwrap(),
+            "http://127.0.0.1:8080/v1/"
+        );
+        assert_eq!(
+            crate::agent::engine::validate_base_url("HTTPS://gateway.example/v1").unwrap(),
+            "HTTPS://gateway.example/v1/"
+        );
+
+        for refused in [
+            "",
+            "   ",
+            "ftp://host/v1/",
+            "file:///etc/passwd",
+            "ws://host/v1/",
+            "https://",
+            "http://host with a space/v1/",
+            "/v1/",
+        ] {
+            assert!(
+                crate::agent::engine::validate_base_url(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+
+        // The refusal names the scheme, never the rest of the input.
+        let error = crate::agent::engine::validate_base_url("ftp://user:token@host/v1/")
+            .expect_err("a non-web scheme is refused");
+        assert!(error.contains("'ftp://'"), "{error}");
+        assert!(!error.contains("token"), "{error}");
+    }
+
+    #[test]
     fn test_scan_workspace_entries() {
         let entries = crate::tui::app::scan_workspace_entries("@Cargo");
         assert!(!entries.is_empty());

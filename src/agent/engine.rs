@@ -261,9 +261,13 @@ pub fn parse_reasoning_effort(effort: &str) -> Option<ReasoningEffort> {
     }
 }
 
+/// Infer adapters from the host and make sure the URL is usable.
 pub fn normalize_base_url(url: &str) -> (String, Vec<AdapterKind>) {
     let mut trimmed = url.trim().to_string();
-    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+    // Scheme detection is case-insensitive: `HTTPS://host` is already a URL, and
+    // prefixing it would make `HTTPS` the host.
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
         trimmed = format!("https://{trimmed}");
     }
 
@@ -294,6 +298,49 @@ pub fn normalize_base_url(url: &str) -> (String, Vec<AdapterKind>) {
     }
 
     (trimmed, protocols)
+}
+
+/// A base URL the client can use: `http` or `https` only, with a host.
+///
+/// A scheme-less value is read as a host — the wizard accepts `host:port` — and
+/// gets `https://`. Returns the normalized URL, so a caller stores exactly what
+/// it validated.
+pub fn validate_base_url(input: &str) -> Result<String, String> {
+    const NO_HOST: &str = "base_url has no host, e.g. https://gateway.example/v1/";
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("base_url is empty".to_string());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("base_url contains whitespace".to_string());
+    }
+    let rest = match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            let scheme = scheme.to_ascii_lowercase();
+            if scheme != "http" && scheme != "https" {
+                // The scheme only: the rest may carry a token.
+                return Err(format!(
+                    "'{scheme}://' is not a web scheme; use http:// or https://"
+                ));
+            }
+            rest
+        }
+        // No scheme at all: the whole value is host[:port][/path].
+        None => trimmed,
+    };
+    // `/v1/` and `:8080` are paths and ports, not hosts.
+    if rest.split('/').next().unwrap_or_default().is_empty() || rest.starts_with(':') {
+        return Err(NO_HOST.to_string());
+    }
+
+    let (normalized, _) = normalize_base_url(trimmed);
+    match reqwest::Url::parse(&normalized) {
+        Ok(url) if url.host().is_some() && matches!(url.scheme(), "http" | "https") => {
+            Ok(normalized)
+        }
+        _ => Err(NO_HOST.to_string()),
+    }
 }
 
 impl AgentConfig {

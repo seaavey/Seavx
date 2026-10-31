@@ -93,6 +93,26 @@ fn config_set_base_url_prints_no_userinfo_or_query() {
 }
 
 #[test]
+fn a_non_web_base_url_is_refused_and_nothing_is_written() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    for refused in [
+        "ftp://host/v1/",
+        "file:///etc/passwd",
+        "https://",
+        "not a url",
+    ] {
+        let error = set_value(&path, ConfigKey::BaseUrl, refused).unwrap_err();
+        assert!(!error.contains("token"), "{error}");
+    }
+    assert!(!path.exists(), "a refused value must not create the file");
+
+    // A bare host is accepted and stored normalized.
+    let stored = set_value(&path, ConfigKey::BaseUrl, "gateway.example").unwrap();
+    assert_eq!(stored, "https://gateway.example/v1/");
+}
+
+#[test]
 fn rejects_invalid_values() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("config.toml");

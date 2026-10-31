@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::engine::{
-    AgentConfig, ConfigOrigin, ConfigReport, DEFAULT_BASE_URL, DEFAULT_MODEL, normalize_base_url,
+    AgentConfig, ConfigOrigin, ConfigReport, DEFAULT_BASE_URL, DEFAULT_MODEL,
     parse_reasoning_effort,
 };
 
@@ -338,14 +338,9 @@ fn canonical_value(key: ConfigKey, raw: &str) -> Result<String, String> {
                 Ok(value.to_string())
             }
         }
-        ConfigKey::BaseUrl => {
-            let (normalized, _) = normalize_base_url(raw);
-            match reqwest::Url::parse(&normalized) {
-                Ok(url) if url.host().is_some() => Ok(normalized),
-                // Never repeat the input: it may carry userinfo or a token.
-                _ => Err("invalid base_url: expected a URL with a host".to_string()),
-            }
-        }
+        // http/https only: the message names the scheme, never the input, which
+        // may carry userinfo or a token.
+        ConfigKey::BaseUrl => crate::agent::engine::validate_base_url(raw),
         ConfigKey::ReasoningEffort => {
             let effort = parse_reasoning_effort(raw)
                 .ok_or_else(|| format!("invalid reasoning_effort: {raw}"))?;
