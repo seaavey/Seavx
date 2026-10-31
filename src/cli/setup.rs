@@ -88,7 +88,7 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
     let mut key_default = config.api_key.clone().unwrap_or_default();
 
     // Ask the endpoint for its model list, so a wrong URL or key fails here instead of in the TUI.
-    let (base_url, api_key) = loop {
+    let (base_url, api_key) = 'endpoint: loop {
         screen(&config_path, ENDPOINT_STEP, &[]);
         println!(
             "Accepts an OpenAI- or Anthropic-compatible endpoint; /v1/ is added when missing.\n"
@@ -105,38 +105,49 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
             }
         };
 
-        screen(
-            &config_path,
-            ENDPOINT_STEP,
-            &[("base_url", normalized.clone())],
-        );
-        let key = prompt::secret("API key (optional)", &key_default)?;
+        // The key is re-asked on its own until the gateway accepts it: a 401/403
+        // refuses the credential, and "save anyway" there is how a keyless
+        // provider gets written.
+        loop {
+            screen(
+                &config_path,
+                ENDPOINT_STEP,
+                &[("base_url", normalized.clone())],
+            );
+            let key = prompt::secret("API key (optional)", &key_default)?;
 
-        screen(
-            &config_path,
-            ENDPOINT_STEP,
-            &[("base_url", normalized.clone()), ("api key", mask(&key))],
-        );
-        print!("checking /models ... ");
-        io::stdout().flush()?;
-        match model_mgr
-            .refresh_remote_models(&normalized, Some(key.as_str()))
-            .await
-        {
-            Ok(models) => {
-                println!("ok, {} models returned", models.len());
-                available_models = models;
-                break (normalized, key);
-            }
-            Err(e) => {
-                println!("failed: {e}");
-                let keep = prompt::line("Save this endpoint anyway? [y/N]", "")?;
-                if keep.eq_ignore_ascii_case("y") {
-                    break (normalized, key);
+            screen(
+                &config_path,
+                ENDPOINT_STEP,
+                &[("base_url", normalized.clone()), ("api key", mask(&key))],
+            );
+            print!("checking /models ... ");
+            io::stdout().flush()?;
+            match model_mgr
+                .refresh_remote_models(&normalized, Some(key.as_str()))
+                .await
+            {
+                Ok(models) => {
+                    println!("ok, {} models returned", models.len());
+                    available_models = models;
+                    break 'endpoint (normalized, key);
                 }
-                // A rejected attempt is forgotten, so the retry starts from blank fields.
-                url_default.clear();
-                key_default.clear();
+                Err(e) => {
+                    println!("failed: {e}");
+                    if crate::agent::models::key_rejected(&e) {
+                        println!("the endpoint needs a key it accepts; enter it again\n");
+                        key_default.clear();
+                        continue;
+                    }
+                    let keep = prompt::line("Save this endpoint anyway? [y/N]", "")?;
+                    if keep.eq_ignore_ascii_case("y") {
+                        break 'endpoint (normalized, key);
+                    }
+                    // A rejected attempt is forgotten, so the retry starts from blank fields.
+                    url_default.clear();
+                    key_default.clear();
+                    continue 'endpoint;
+                }
             }
         }
     };
