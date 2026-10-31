@@ -1944,3 +1944,51 @@ async fn a_failed_turn_leaves_the_goal_task_blocked_not_completed() {
         goal.tasks[0].evidence
     );
 }
+
+#[test]
+fn a_draft_goal_can_be_planned_then_approved_through_the_commands() {
+    use crate::tui::app::effects::run_goal;
+    use crate::tui::commands::GoalAction;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap();
+    let workspace = "ws";
+    let mut start = None;
+
+    run_goal(
+        &store,
+        workspace,
+        GoalAction::New("ship the release".to_string()),
+        &mut start,
+    )
+    .expect("a goal is drafted");
+    let id = store.goals(workspace).unwrap()[0].id;
+
+    // The editing verbs only accept a draft, so resolving to the live goal alone
+    // made them unreachable: nothing could plan the goal the user had just made.
+    run_goal(
+        &store,
+        workspace,
+        GoalAction::CriteriaAdd("tests pass".to_string()),
+        &mut start,
+    )
+    .expect("criteria add finds the draft");
+    run_goal(
+        &store,
+        workspace,
+        GoalAction::TaskAdd("write the code".to_string()),
+        &mut start,
+    )
+    .expect("task add finds the draft");
+
+    let goal = store.goal(workspace, id).unwrap();
+    assert_eq!(goal.criteria.len(), 1, "the criterion was stored");
+    assert_eq!(goal.tasks.len(), 1, "the task was stored");
+
+    run_goal(&store, workspace, GoalAction::Approve, &mut start).expect("the draft is approved");
+    assert_eq!(
+        store.goal(workspace, id).unwrap().state,
+        crate::session::GoalState::Active
+    );
+    assert!(start.is_some(), "approval hands back the turn text to run");
+}

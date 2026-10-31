@@ -36,18 +36,21 @@ pub(super) fn run_goal(
 ) -> Result<String, String> {
     use crate::tui::commands::GoalAction;
 
-    // `id` defaults to the one goal that holds the turn, then to the newest.
+    // `id` defaults to the goal that holds the turn, else the newest draft: the
+    // editing verbs only accept a draft, and a draft is the only thing
+    // `/goal approve` can promote.
     let resolve = |id: Option<i64>| -> Result<i64, String> {
         if let Some(id) = id {
             return Ok(id);
         }
-        store
-            .goals(workspace)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|goal| matches!(goal.state.as_str(), "active" | "blocked" | "paused"))
+        let goals = store.goals(workspace).map_err(|error| error.to_string())?;
+        let live = goals
+            .iter()
+            .find(|goal| matches!(goal.state.as_str(), "active" | "blocked" | "paused"));
+        let draft = || goals.iter().find(|goal| goal.state.as_str() == "draft");
+        live.or_else(draft)
             .map(|goal| goal.id)
-            .ok_or_else(|| "no active goal; start one with /goal <objective>".to_string())
+            .ok_or_else(|| "no goal yet; start one with /goal <objective>".to_string())
     };
 
     match action {
