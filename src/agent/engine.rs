@@ -1796,6 +1796,12 @@ fn sanitize_citations(answer: &str, evidence: &Evidence, security: &WorkspaceSec
             continue;
         }
         let path = &answer[start..index];
+        // A clock time, a ratio or a URL port also reads as `x:123`. Only a
+        // file-shaped token is a citation; everything else is left alone.
+        if !path_like(path) {
+            index = after;
+            continue;
+        }
         let verified = citation_is_verified(path, low, high, evidence, security);
         out.push_str(&answer[copied..after]);
         if !verified {
@@ -1806,6 +1812,12 @@ fn sanitize_citations(answer: &str, evidence: &Evidence, security: &WorkspaceSec
     }
     out.push_str(&answer[copied..]);
     out
+}
+
+/// A citation token names a file: it carries a separator or an extension, and it
+/// is not a URL. Without this, `10:30` and `http://host:8080` would be tagged.
+fn path_like(token: &str) -> bool {
+    !token.contains("://") && (token.contains('/') || token.contains('.'))
 }
 
 /// A citation is verified only when its path resolves inside the workspace, is

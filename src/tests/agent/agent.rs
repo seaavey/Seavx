@@ -1060,6 +1060,31 @@ mod engine_seam {
     }
 
     #[tokio::test]
+    async fn only_file_shaped_tokens_are_treated_as_citations() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "one\ntwo\n").unwrap();
+        let fake = FakeBackend::default();
+        fake.push(response(MessageContent::from_tool_calls(vec![
+            tool_call_with("call-1", "read_file", json!({ "path": "note.txt" })),
+        ])));
+        fake.push(response(MessageContent::from_text(
+            "At 10:30 the run finished; the handler is http://localhost:8080/x and it is read at `note.txt:1`.",
+        )));
+        let runtime = runtime_with(&fake, temp.path());
+        let (answer, _, _) = run_ask(&runtime, "where is the handler").await;
+
+        // A clock time and a URL port are not citations, and the answer keeps
+        // them intact instead of being annotated into nonsense.
+        assert!(answer.contains("10:30"), "{answer}");
+        assert!(!answer.contains("10:30 (unverified"), "{answer}");
+        assert!(answer.contains("http://localhost:8080/x"), "{answer}");
+        assert!(!answer.contains("8080 (unverified"), "{answer}");
+        // The one real citation was read this turn, so it carries no marker.
+        assert!(answer.contains("note.txt:1`"), "{answer}");
+        assert!(!answer.contains("note.txt:1 (unverified"), "{answer}");
+    }
+
+    #[tokio::test]
     async fn a_conceptual_answer_needs_no_evidence() {
         let temp = tempfile::tempdir().unwrap();
         let fake = FakeBackend::default();
