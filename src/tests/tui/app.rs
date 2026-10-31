@@ -1859,3 +1859,85 @@ fn the_test_command_is_vetted_by_the_permission_matrix() {
         ActionKind::Execute
     );
 }
+
+async fn wait_for_task(
+    store: &std::sync::Arc<std::sync::Mutex<crate::session::SessionStore>>,
+    workspace: &str,
+    id: i64,
+) -> crate::session::TaskState {
+    for _ in 0..200 {
+        {
+            let guard = store.lock().unwrap();
+            let goal = guard.goal(workspace, id).unwrap();
+            if goal.tasks[0].state != crate::session::TaskState::Running {
+                return goal.tasks[0].state;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("the task state never left Running");
+}
+
+#[tokio::test]
+async fn a_failed_turn_leaves_the_goal_task_blocked_not_completed() {
+    use crate::agent::cancel::TurnStatus;
+    use crate::session::{GoalState, TaskState};
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::session::SessionStore::open_at(&temp.path().join("sessions.db")).unwrap(),
+    ));
+    let workspace = crate::session::workspace_key();
+    let (id, session) = {
+        let guard = store.lock().unwrap();
+        let session = guard.create(&workspace, None, Some("goal turn")).unwrap();
+        let id = guard
+            .create_goal(&workspace, Some(session), "ship it")
+            .unwrap();
+        guard
+            .set_goal_plan(
+                &workspace,
+                id,
+                &["tests pass".to_string()],
+                &["write the code".to_string()],
+            )
+            .unwrap();
+        guard
+            .set_goal_state(&workspace, id, GoalState::Active)
+            .unwrap();
+        guard
+            .set_task_state(&workspace, id, 0, TaskState::Running, "")
+            .unwrap();
+        (id, session)
+    };
+
+    let mut app = test_app();
+    app.store = Some(store.clone());
+    app.session_id = Some(session);
+    app.goal = Some(format!("{id} active"));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    super::actions::apply(
+        &mut app,
+        crate::tui::event::Action::TurnFinished {
+            status: TurnStatus::Failed,
+            cleanup: None,
+            pid: None,
+        },
+        &tx,
+    );
+
+    assert_eq!(
+        wait_for_task(&store, &workspace, id).await,
+        TaskState::Blocked,
+        "a failed turn must not record the task as completed"
+    );
+
+    // The evidence names the turn that left it blocked, so `/tasks` is honest.
+    let guard = store.lock().unwrap();
+    let goal = guard.goal(&workspace, id).unwrap();
+    assert!(
+        goal.tasks[0].evidence.contains("failed"),
+        "{}",
+        goal.tasks[0].evidence
+    );
+}

@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 use super::store::lock_store;
 use super::{App, ModalSelection, PendingPermission, PendingQuestion};
 use crate::agent::events::ToolStatus;
+use crate::session::TaskState;
 use crate::tui::event::{Action, AgentState};
 
 /// The matrix answer for the command `/test` proposes: the same `decide` the
@@ -16,6 +17,19 @@ pub(super) fn test_verdict(
     let mode = parse_mode(&config.tool_permissions).unwrap_or(PermissionMode::Ask);
     let permitted = parse_permitted(&config.permitted_actions).unwrap_or_default();
     decide(mode, &permitted, kind)
+}
+
+/// What a finished turn means for the goal tasks it ran. `None` for a turn that
+/// has not reached a terminal state, so nothing is written from a mid-flight
+/// status.
+fn task_state_after_turn(status: crate::agent::cancel::TurnStatus) -> Option<TaskState> {
+    use crate::agent::cancel::TurnStatus;
+    match status {
+        TurnStatus::Completed => Some(TaskState::Completed),
+        TurnStatus::Failed => Some(TaskState::Blocked),
+        TurnStatus::Cancelled => Some(TaskState::Cancelled),
+        TurnStatus::Running | TurnStatus::Cancelling => None,
+    }
 }
 
 /// Apply one result the loop did not route to a key or mouse handler.
@@ -196,14 +210,16 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             {
                 app.push_notice("Queued prompt dropped: the turn did not succeed.");
             }
-            // A goal turn is done when its turn is: the tasks it ran are
-            // recorded as completed with what actually happened, never with a
-            // claim the turn did not make.
+            // A goal turn is done when its turn is: the tasks it ran move to the
+            // state the turn actually reached. A failure leaves them blocked and
+            // a cancel cancels them, so `/tasks` never reports work the turn did
+            // not finish.
             if let Some(goal) = app
                 .goal
                 .as_deref()
                 .and_then(|line| line.split_whitespace().next())
                 && let Ok(id) = goal.parse::<i64>()
+                && let Some(next) = task_state_after_turn(status)
             {
                 let session = app.session_id;
                 let evidence = format!(
@@ -214,21 +230,27 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                         .unwrap_or_else(|| "none".to_string())
                 );
                 let store = app.store.clone();
+                let tx = tx.clone();
                 if let Some(store) = store {
                     tokio::task::spawn_blocking(move || {
+                        let workspace = crate::session::workspace_key();
                         let guard = lock_store(&store);
-                        let Ok(goal) = guard.goal(&crate::session::workspace_key(), id) else {
+                        let Ok(goal) = guard.goal(&workspace, id) else {
                             return;
                         };
                         for task in goal.tasks {
-                            if task.state == crate::session::TaskState::Running {
-                                let _ = guard.set_task_state(
-                                    &crate::session::workspace_key(),
+                            if task.state == crate::session::TaskState::Running
+                                && let Err(error) = guard.set_task_state(
+                                    &workspace,
                                     id,
                                     task.position,
-                                    crate::session::TaskState::Completed,
+                                    next,
                                     &evidence,
-                                );
+                                )
+                            {
+                                let _ = tx.send(Action::SessionFailed(format!(
+                                    "Task state not recorded: {error}"
+                                )));
                             }
                         }
                     });
