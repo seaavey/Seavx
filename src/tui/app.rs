@@ -92,6 +92,8 @@ pub struct TranscriptCache {
     pub revision: u64,
     pub width: u16,
     pub lines: Vec<ratatui::text::Line<'static>>,
+    /// Rows those lines take once the widget wraps them: what scrolling counts.
+    pub rows: u16,
 }
 
 pub struct App<'a> {
@@ -117,8 +119,13 @@ pub struct App<'a> {
     ghost_typed: Option<usize>,
     /// Terminal width, refreshed each frame; fits ghost suggestions inside the box.
     pub terminal_width: u16,
+    /// Scroll offset in wrapped rows, the unit the widget paints in.
     pub scroll: u16,
     pub auto_scroll: bool,
+    /// Rows and viewport height of the last painted transcript. The scroll math
+    /// needs both, and only the frame knows them, so it leaves them here.
+    painted_rows: std::cell::Cell<u16>,
+    painted_height: std::cell::Cell<u16>,
     pub total_tokens: i32,
     pub prompt_tokens: i32,
     pub status: AgentState,
@@ -441,6 +448,8 @@ impl<'a> App<'a> {
             terminal_width: 80,
             scroll: 0,
             auto_scroll: true,
+            painted_rows: std::cell::Cell::new(0),
+            painted_height: std::cell::Cell::new(0),
             total_tokens: 0,
             prompt_tokens: 0,
             status: AgentState::Idle,
@@ -513,7 +522,7 @@ impl<'a> App<'a> {
 
     fn push_mode_notice(&mut self, text: &str) {
         self.push_text(&format!("\nSystem: {text}\n"));
-        self.scroll = self.line_count();
+        self.scroll = self.max_scroll();
         self.auto_scroll = true;
     }
 

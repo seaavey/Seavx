@@ -18,6 +18,19 @@ fn screen(input: &str) -> String {
         .collect()
 }
 
+/// The transcript painted at `width` x `height`, as flat text.
+fn transcript_screen(app: &App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| render(app, frame)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
 #[test]
 fn slash_menu_lists_every_match_inside_its_border() {
     let filtered = screen("/m");
@@ -122,6 +135,21 @@ fn transcript_renders_markdown_instead_of_raw_syntax() {
     );
     assert!(!screen.contains("##"), "heading hashes leaked: {screen}");
     assert!(!screen.contains("```"), "fence leaked: {screen}");
+}
+
+/// A markdown paragraph is one logical line but many wrapped rows, so a scroll
+/// offset counted in lines stops short and cuts the tail off the screen.
+#[test]
+fn auto_scroll_pins_the_last_wrapped_row() {
+    let mut app = test_app();
+    app.push_text(&format!(
+        "{}\n\nLAST-ROW\n",
+        "lorem ipsum dolor ".repeat(40)
+    ));
+    app.auto_scroll = true;
+
+    let text = transcript_screen(&app, 40, 20);
+    assert!(text.contains("LAST-ROW"), "tail is off screen: {text}");
 }
 
 #[test]
@@ -828,4 +856,31 @@ fn the_preset_picker_draws_the_names_and_the_selected_preview() {
         "the selected row has a background: {:?}",
         rows[y]
     );
+}
+
+#[test]
+fn scroll_counts_wrapped_rows_not_source_lines() {
+    let mut app = test_app();
+    // One source line, many painted rows: a line-based bound cannot scroll it.
+    app.push_text(&format!("FIRST-ROW {}THE-END", "word ".repeat(200)));
+    let painted = transcript_screen(&app, 40, 10);
+
+    let bottom = app.max_scroll();
+    assert!(bottom > 0, "a wrapped line runs past the viewport");
+    assert!(painted.contains("THE-END"), "the tail is reachable at rest");
+
+    app.scroll_up(1);
+    assert!(!app.auto_scroll);
+    assert_eq!(app.scroll, bottom - 1, "one row up, not one line");
+
+    app.scroll_up(u16::MAX);
+    assert_eq!(app.scroll, 0, "the top of the transcript is reachable");
+    let top = transcript_screen(&app, 40, 10);
+    assert!(top.contains("FIRST-ROW"), "first row is off screen: {top}");
+
+    app.scroll_down(u16::MAX);
+    assert!(app.auto_scroll, "scrolling past the bottom re-pins to it");
+    assert_eq!(app.scroll, bottom);
+    let back = transcript_screen(&app, 40, 10);
+    assert!(back.contains("THE-END"), "last row is off screen: {back}");
 }

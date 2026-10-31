@@ -47,15 +47,14 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
             app.status = AgentState::Streaming;
             app.push_text(&token);
             if app.auto_scroll {
-                let lines = app.line_count();
-                // Keep pinned to latest lines
-                app.scroll = lines;
+                // Keep pinned to the newest rows
+                app.scroll = app.max_scroll();
             }
         }
         Action::AgentThinking(thoughts) => {
             app.push_thinking(&thoughts);
             if app.auto_scroll {
-                app.scroll = app.line_count();
+                app.scroll = app.max_scroll();
             }
         }
         Action::AgentTitle { title, session } => {
@@ -183,8 +182,7 @@ pub(super) fn apply(app: &mut App, action: Action, tx: &mpsc::UnboundedSender<Ac
                 }
             }
             if app.auto_scroll {
-                let lines = app.line_count();
-                app.scroll = lines;
+                app.scroll = app.max_scroll();
             }
         }
         Action::TurnFinished {

@@ -46,22 +46,25 @@ impl App<'_> {
         (self.input.lines().len() as u16).clamp(1, 6) + 2
     }
 
-    /// Scroll the transcript up `n` lines, turning off auto-scroll.
+    /// Scroll the transcript up `n` rows, turning off auto-scroll.
     pub fn scroll_up(&mut self, n: u16) {
-        let lines = self.line_count();
         if self.auto_scroll {
-            self.scroll = lines;
+            self.scroll = self.max_scroll();
         }
         self.auto_scroll = false;
         self.scroll = self.scroll.saturating_sub(n);
     }
 
-    /// Scroll the transcript down `n` lines, re-enabling auto-scroll at the bottom.
+    /// Scroll the transcript down `n` rows, re-enabling auto-scroll at the bottom.
     pub fn scroll_down(&mut self, n: u16) {
-        let lines = self.line_count();
+        // Already pinned to the newest rows: nothing below them to reach.
+        if self.auto_scroll {
+            return;
+        }
+        let bottom = self.max_scroll();
         let next = self.scroll.saturating_add(n);
-        if next >= lines {
-            self.scroll = lines;
+        if next >= bottom {
+            self.scroll = bottom;
             self.auto_scroll = true;
         } else {
             self.scroll = next;

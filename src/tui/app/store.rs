@@ -61,7 +61,7 @@ impl App<'_> {
             // A draft from the session that was open would otherwise ride along.
             self.input = new_input();
         }
-        self.scroll = self.line_count();
+        self.scroll = self.max_scroll();
         self.auto_scroll = true;
 
         // An open question comes back with the session. It is not an
@@ -137,7 +137,7 @@ impl App<'_> {
             self.push_text("\n\n");
         }
         self.push_text(&format!("User: {prompt}\n\n"));
-        self.scroll = self.line_count();
+        self.scroll = self.max_scroll();
         self.auto_scroll = true;
         self.status = AgentState::Thinking;
         self.input = new_input();
