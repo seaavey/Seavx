@@ -30,7 +30,9 @@ impl Tui {
     fn start(workspace: &Path, home: &Path) -> Tui {
         let mut master: RawFd = -1;
         let mut slave: RawFd = -1;
-        let size = libc::winsize {
+        // `termp` and `winp` are `*mut` on Apple and `*const` on Linux; a
+        // `*mut` coerces to either, so the call stays one shape per platform.
+        let mut size = libc::winsize {
             ws_row: 30,
             ws_col: 120,
             ws_xpixel: 0,
@@ -43,8 +45,8 @@ impl Tui {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
             )
         };
         assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
