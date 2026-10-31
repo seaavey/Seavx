@@ -86,35 +86,74 @@ pub fn load_in(root: &Path, user: Option<&Path>, name: &str) -> Result<String, S
         }
     }
 
+    // A missing candidate falls through to the next directory; anything that is
+    // there is answered with its reason, never with a partial read.
     for path in candidates {
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "{} is a symlink; presets must be plain files",
-                path.display()
-            ));
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return read_plain(&path);
         }
-        if !metadata.is_file() {
-            return Err(format!("{} is not a regular file", path.display()));
-        }
-        if metadata.len() > PRESET_LIMIT {
-            return Err(format!(
-                "{} is {} bytes; the limit is {PRESET_LIMIT}",
-                path.display(),
-                metadata.len()
-            ));
-        }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        return Ok(text);
     }
 
     Err(format!(
         "no preset named '{name}'; try /preset to list what is there"
     ))
+}
+
+/// Copy one Markdown file into the project presets as `<stem>.md`, so
+/// `/preset <stem>` can use it. An existing preset is never overwritten.
+pub fn add(root: &Path, raw: &str) -> Result<(String, PathBuf), String> {
+    let source = root.join(raw);
+    let name = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    if source.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        return Err(format!("{raw} is not a .md file; a preset is Markdown"));
+    }
+    if !valid_name(name) {
+        return Err(format!(
+            "'{name}' is not a preset name; rename the file to letters, digits, '-' or '_'"
+        ));
+    }
+    let text = read_plain(&source)?;
+
+    let target = project_dir(root).join(format!("{name}.md"));
+    if std::fs::symlink_metadata(&target).is_ok() {
+        return Err(format!(
+            "preset '{name}' already exists at {}",
+            target.display()
+        ));
+    }
+    crate::atomic_file::write_atomic(
+        &target,
+        text.as_bytes(),
+        crate::atomic_file::ModePolicy::Preserve,
+    )
+    .map_err(|error| format!("{}: {error}", target.display()))?;
+    Ok((name.to_string(), target))
+}
+
+/// Every refusal a preset file has to pass, shared by `load` and `add`.
+fn read_plain(path: &Path) -> Result<String, String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symlink; presets must be plain files",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > PRESET_LIMIT {
+        return Err(format!(
+            "{} is {} bytes; the limit is {PRESET_LIMIT}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 #[cfg(test)]

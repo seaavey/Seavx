@@ -89,6 +89,18 @@ impl App<'_> {
         }
     }
 
+    /// Copy one Markdown file into the project presets, so `/preset <name>`
+    /// can use it. Nothing is applied: the user decides when.
+    pub fn add_preset(&mut self, path: &str) {
+        match crate::agent::presets::add(&self.root, path) {
+            Ok((name, target)) => self.push_notice(format!(
+                "Added preset '{name}' at {}.\n/preset {name} puts it in the next prompt.",
+                target.display()
+            )),
+            Err(error) => self.push_notice(error),
+        }
+    }
+
     /// Move inside the preset picker, wrapping over the visible rows.
     pub fn step_preset_picker(&mut self, down: bool) {
         let Some(ModalSelection::Preset {

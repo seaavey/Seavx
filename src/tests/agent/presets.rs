@@ -98,3 +98,41 @@ fn a_symlink_an_oversize_file_and_a_missing_name_are_refused_clearly() {
     .unwrap_err();
     assert!(error.contains("no preset named 'absent'"), "{error}");
 }
+
+#[test]
+fn add_copies_a_markdown_file_into_the_project_presets() {
+    let root = workspace();
+    std::fs::write(root.path().join("notes.md"), "Review the diff first.").unwrap();
+
+    let (name, target) = presets::add(root.path(), "notes.md").unwrap();
+    assert_eq!(name, "notes");
+    assert_eq!(target, presets::project_dir(root.path()).join("notes.md"));
+    assert_eq!(
+        presets::load_in(root.path(), None, "notes").unwrap(),
+        "Review the diff first."
+    );
+    assert!(root.path().join("notes.md").exists(), "the source stays");
+
+    // A second add refuses instead of overwriting what is there.
+    let error = presets::add(root.path(), "notes.md").unwrap_err();
+    assert!(error.contains("already exists"), "{error}");
+
+    // Everything the loader would refuse is refused here too.
+    std::fs::write(root.path().join("notes.txt"), "x").unwrap();
+    let error = presets::add(root.path(), "notes.txt").unwrap_err();
+    assert!(error.contains("not a .md file"), "{error}");
+
+    std::fs::create_dir(root.path().join("dir.md")).unwrap();
+    let error = presets::add(root.path(), "dir.md").unwrap_err();
+    assert!(error.contains("not a regular file"), "{error}");
+
+    std::fs::write(root.path().join("my notes.md"), "x").unwrap();
+    let error = presets::add(root.path(), "my notes.md").unwrap_err();
+    assert!(error.contains("not a preset name"), "{error}");
+
+    assert_eq!(
+        presets::list_in(root.path(), None).len(),
+        1,
+        "only the copied preset exists"
+    );
+}

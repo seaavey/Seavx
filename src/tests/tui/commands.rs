@@ -1383,3 +1383,55 @@ fn the_preset_picker_searches_and_previews_before_applying() {
         "the hint names where to put one"
     );
 }
+
+#[test]
+fn preset_add_copies_the_named_file_in() {
+    use crate::agent::presets;
+
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(root.path().join("triage.md"), "Triage first.").unwrap();
+
+    // The `@` picker inserts `[file:…]`: that wrapper is prompt syntax, not
+    // part of the path, and a path with a space in it still arrives whole. A
+    // bare `add` asks for its path instead of looking for a preset named
+    // "add", which is exactly the report the user saw.
+    for (input, path) in [
+        ("/preset add triage.md", "triage.md"),
+        ("/preset add [file:triage.md]", "triage.md"),
+        ("/preset add @[file:triage.md]", "triage.md"),
+        ("/preset add [file:my notes.md]", "my notes.md"),
+        ("/preset add", ""),
+    ] {
+        assert_eq!(
+            parse(input),
+            Some(SlashCommand::PresetAdd {
+                path: path.to_string()
+            }),
+            "{input}"
+        );
+    }
+
+    let mut app = crate::tui::app::test_app();
+    app.root = root.path().to_path_buf();
+    execute(&mut app, parse("/preset add [file:triage.md]").unwrap());
+    assert_eq!(
+        presets::load_in(root.path(), None, "triage").unwrap(),
+        "Triage first."
+    );
+
+    // Adding it twice refuses instead of overwriting the preset.
+    execute(&mut app, parse("/preset add triage.md").unwrap());
+    assert!(
+        format!("{:?}", app.segments.last()).contains("already exists"),
+        "{:?}",
+        app.segments.last()
+    );
+
+    // A bare `add` reports its usage, never "no preset named 'add'".
+    execute(&mut app, parse("/preset add").unwrap());
+    assert!(
+        format!("{:?}", app.segments.last()).contains("Usage: /preset add <file.md>"),
+        "{:?}",
+        app.segments.last()
+    );
+}

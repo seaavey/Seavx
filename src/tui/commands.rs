@@ -127,8 +127,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/preset",
-        usage: "/preset [name]",
-        summary: "List prompt presets, or put one in the next prompt",
+        usage: "/preset [name | add <file.md>]",
+        summary: "Apply a prompt preset, or copy one in from a .md file",
         id: CommandId::Preset,
     },
     CommandSpec {
@@ -253,6 +253,10 @@ pub enum SlashCommand {
     /// List presets, or preview and apply one to the next prompt.
     Preset {
         name: Option<String>,
+    },
+    /// Copy one Markdown file into the project presets.
+    PresetAdd {
+        path: String,
     },
     /// Propose and, once permitted, run the workspace's test command.
     Test,
@@ -514,6 +518,12 @@ pub fn parse(input: &str) -> Option<SlashCommand> {
         },
         CommandId::Preset => match args.as_slice() {
             [] => SlashCommand::Preset { name: None },
+            // `add` owns the rest of the line, so a tagged path with spaces in
+            // it survives. A bare `add` is a usage error, not the preset named
+            // "add": the subcommand takes that word.
+            ["add", rest @ ..] => SlashCommand::PresetAdd {
+                path: preset_add_path(&rest.join(" ")).unwrap_or_default(),
+            },
             [name] => SlashCommand::Preset {
                 name: Some((*name).to_string()),
             },
@@ -633,6 +643,19 @@ fn no_args(args: &[&str], raw: &str, command: SlashCommand) -> SlashCommand {
     } else {
         SlashCommand::Unknown(raw.to_string())
     }
+}
+
+/// The path `/preset add` was given. The `@` picker inserts a `[file:…]` tag,
+/// so the wrapper is prompt syntax and not part of the path.
+fn preset_add_path(raw: &str) -> Option<String> {
+    let raw = raw.trim().trim_start_matches('@');
+    let path = raw
+        .strip_prefix("[file:")
+        .or_else(|| raw.strip_prefix("[folder:"))
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(raw)
+        .trim();
+    (!path.is_empty()).then(|| path.to_string())
 }
 
 /// `/config` has its own grammar: only `set`/`unset` accept `--global`, and
@@ -995,6 +1018,14 @@ pub fn execute(app: &mut App, command: SlashCommand) -> CommandEffect {
                     app.open_preset_picker();
                 }
                 Some(name) => app.apply_preset(&name),
+            }
+            CommandEffect::Handled
+        }
+        SlashCommand::PresetAdd { path } => {
+            if path.is_empty() {
+                app.push_notice("Usage: /preset add <file.md>".to_string());
+            } else {
+                app.add_preset(&path);
             }
             CommandEffect::Handled
         }
