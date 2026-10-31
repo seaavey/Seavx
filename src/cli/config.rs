@@ -115,11 +115,11 @@ pub enum ConfigAction {
 }
 
 pub fn workspace_config_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".seavx/config.toml")
+    workspace_root.join(".seavx").join("config.toml")
 }
 
 pub fn global_config_path() -> Option<PathBuf> {
-    crate::home::dir().map(|home| home.join(".seavx/config.toml"))
+    crate::home::dir().map(|home| home.join(".seavx").join("config.toml"))
 }
 
 /// Where a write belongs when the user named no file: the config the loader

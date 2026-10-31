@@ -3,6 +3,23 @@ use crate::agent::engine::AgentConfig;
 use std::fs;
 use tempfile::tempdir;
 
+/// Windows CMD is where a literal `.seavx/config.toml` shows as
+/// `C:\\Users\\user\\.seavx/config.toml`; the components have to be joined so the
+/// platform separator is used. This assertion only bites on that platform, which
+/// is why CI runs it there.
+#[test]
+fn the_config_path_uses_the_platform_separator() {
+    let workspace = std::path::Path::new("/repo");
+    let shown = workspace_config_path(workspace)
+        .to_string_lossy()
+        .to_string();
+    let sep = std::path::MAIN_SEPARATOR;
+    assert!(
+        shown.ends_with(&format!("{sep}.seavx{sep}config.toml")),
+        "{shown}"
+    );
+}
+
 #[test]
 fn set_preserves_comments_and_unknown_keys() {
     let temp = tempdir().unwrap();

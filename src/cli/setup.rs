@@ -2,17 +2,19 @@
 
 use super::prompt;
 
-/// Redraw the wizard as a form between steps; piped output stays linear.
-fn screen(config_path: &std::path::Path, rows: &[(&str, String)]) {
-    use std::io::{self, IsTerminal, Write};
-    if io::stdout().is_terminal() {
-        let _ = crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-            crossterm::cursor::MoveTo(0, 0)
-        );
-    }
-    println!("seavx setup providers");
+/// Steps as the user counts them: the endpoint question includes the key, so the
+/// wizard is three steps, not four.
+const ENDPOINT_STEP: &str = "endpoint (1/3)";
+const MODEL_STEP: &str = "model (2/3)";
+const EFFORT_STEP: &str = "effort (3/3)";
+
+/// Print one step of the wizard. Never clears: `ClearType::All` fills the whole
+/// console buffer on Windows, scrollback included, so a screen-clearing repaint
+/// erased the steps the user had just answered. The step is named instead, and
+/// `setup` is a one-time command whose output is worth keeping.
+fn screen(config_path: &std::path::Path, step: &str, rows: &[(&str, String)]) {
+    use std::io::{self, Write};
+    println!("seavx setup providers · {step}");
     println!("config: {}\n", config_path.display());
     for (label, value) in rows {
         println!("{:<10} {}", format!("{label}:"), value);
@@ -48,7 +50,7 @@ pub fn target_path(
     if workspace {
         return Ok(crate::cli::config::workspace_config_path(workspace_root));
     }
-    home.map(|home| home.join(".seavx/config.toml"))
+    home.map(|home| home.join(".seavx").join("config.toml"))
         .ok_or_else(|| "home directory is not set, cannot locate config".to_string())
 }
 
@@ -87,7 +89,7 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
 
     // Ask the endpoint for its model list, so a wrong URL or key fails here instead of in the TUI.
     let (base_url, api_key) = loop {
-        screen(&config_path, &[]);
+        screen(&config_path, ENDPOINT_STEP, &[]);
         println!(
             "Accepts an OpenAI- or Anthropic-compatible endpoint; /v1/ is added when missing.\n"
         );
@@ -103,11 +105,16 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
             }
         };
 
-        screen(&config_path, &[("base_url", normalized.clone())]);
+        screen(
+            &config_path,
+            ENDPOINT_STEP,
+            &[("base_url", normalized.clone())],
+        );
         let key = prompt::secret("API key (optional)", &key_default)?;
 
         screen(
             &config_path,
+            ENDPOINT_STEP,
             &[("base_url", normalized.clone()), ("api key", mask(&key))],
         );
         print!("checking /models ... ");
@@ -151,7 +158,7 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
     if available_models.is_empty() {
         rows.remove(2);
     }
-    screen(&config_path, &rows);
+    screen(&config_path, MODEL_STEP, &rows);
     let efforts = crate::agent::engine::EFFORT_LEVELS.join("|");
     let model = if available_models.is_empty() || !io::stdin().is_terminal() {
         let typed = prompt::line("Model", config.model.as_deref().unwrap_or_default())?;
@@ -181,7 +188,7 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
     };
 
     rows.push(("model", model.clone()));
-    screen(&config_path, &rows);
+    screen(&config_path, EFFORT_STEP, &rows);
     let effort = if io::stdin().is_terminal() {
         let levels: Vec<String> = crate::agent::engine::EFFORT_LEVELS
             .iter()
@@ -225,6 +232,7 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
 
     screen(
         &config_path,
+        "saved",
         &[
             ("saved", "yes".to_string()),
             (
@@ -246,7 +254,11 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
             ),
         ],
     );
-    if !workspace && std::path::PathBuf::from(".seavx/config.toml").exists() {
+    if !workspace
+        && std::path::PathBuf::from(".seavx")
+            .join("config.toml")
+            .exists()
+    {
         println!("note: ./.seavx/config.toml overrides this file in the current workspace.");
     }
 
