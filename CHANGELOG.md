@@ -48,7 +48,10 @@ per landed change; no entry describes behaviour that is not in the code.
 - `/preset [name]` applies static prompt text from `.seavx/prompts/<name>.md`,
   falling back to `~/.seavx/prompts/<name>.md`. Project presets shadow user
   presets; traversal names, symlinks, non-regular and oversized files are
-  refused. A preset only fills the next prompt.
+  refused. A preset only fills the next prompt. `/preset add <file.md>` copies
+  a Markdown file into the project presets under its stem, accepting the `@`
+  picker's `[file:…]` tag as the path and refusing an existing name instead of
+  overwriting it.
 
 ### fix
 
@@ -133,6 +136,18 @@ per landed change; no entry describes behaviour that is not in the code.
   shows `matched/total`. Letters are text now, so `j`/`k` no longer navigate and
   the `/models` refresh moved to `ctrl+r`. The wheel moves the picker's cursor
   instead of scrolling the transcript behind it.
+- `seavx setup` and a bare `seavx model` ask with a list instead of a typed
+  name: the endpoint's own models first (arrows move, typing filters
+  case-insensitively, ten rows at a time with `↑/↓ N more`, the configured model
+  preselected), then the reasoning-effort levels as a short arrow list that needs
+  no search box. Esc exits non-zero and writes nothing. A piped run keeps the
+  typed prompts, so scripted setup is unchanged. The live form also shows the
+  protocols inferred for the endpoint and the model as soon as it is chosen.
+- A base URL is accepted only when it is a web endpoint: `http` or `https` with
+  a host. A bare `host:port` is read as `https`; `ftp://`, `file://`, a path such
+  as `/v1/`, or a value containing whitespace is refused with the scheme named —
+  never the rest of the input, which may carry a token — before any request is
+  made. `HTTPS://host` is no longer prefixed into a broken URL.
 
 ### refactor
 
