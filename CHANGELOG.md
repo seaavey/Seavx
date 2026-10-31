@@ -71,6 +71,13 @@ per landed change; no entry describes behaviour that is not in the code.
   `ANTHROPIC_API_KEY` bind their own adapter; `SEAVX_API_KEY` alone, or a key
   read from a file, refuses the first turn with
   `no provider configured: run `seavx setup``.
+- The setup wizard stops clearing the console between steps. `ClearType::All`
+  fills the whole buffer on Windows CMD, scrollback included, so each repaint
+  erased the steps just answered — it read as "setup jumps straight to the model
+  step". The wizard now prints linearly, names the step it is on
+  (`seavx setup providers · endpoint (1/3)`, `model (2/3)`, `effort (3/3)`,
+  `saved`), and prints the config path from platform components, so Windows shows
+  `.seavx` and `config.toml` separated by a backslash.
 
 ### breaking
 

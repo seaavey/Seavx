@@ -440,8 +440,8 @@ impl AgentConfig {
         home: Option<&Path>,
         env: impl Fn(&str) -> Option<String>,
     ) -> (Self, ConfigReport) {
-        let workspace_path = workspace_root.join(".seavx/config.toml");
-        let global_path = home.map(|home| home.join(".seavx/config.toml"));
+        let workspace_path = workspace_root.join(".seavx").join("config.toml");
+        let global_path = home.map(|home| home.join(".seavx").join("config.toml"));
 
         // A replace interrupted by a crash is resolved before the file is read.
         for path in [Some(&workspace_path), global_path.as_ref()]
