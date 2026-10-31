@@ -2,6 +2,7 @@
 
 use super::prompt;
 use crate::agent::engine::{AgentConfig, EFFORT_LEVELS};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 /// Write the flags as one targeted update: model and effort change together or
@@ -61,49 +62,70 @@ pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Resul
         return Ok(());
     }
 
-    println!("\nAvailable Models:");
-    for (idx, m) in available_models.iter().enumerate() {
-        let mark = if *m == config.model { " [active]" } else { "" };
-        println!("  [{}] {}{}", idx + 1, m, mark);
-    }
+    let interactive = IsTerminal::is_terminal(&std::io::stdin());
 
-    println!();
-    let input = prompt::line(
-        &format!(
-            "Select model number (or press Enter to keep '{}')",
-            config.model
-        ),
-        "",
-    )?;
+    if interactive {
+        // The fetched list is the choice; a typed name is the piped fallback.
+        let Some(chosen) = prompt::pick("Model", &available_models, Some(&config.model)) else {
+            anyhow::bail!("cancelled; nothing written");
+        };
+        config.model = chosen;
+    } else {
+        println!("\nAvailable Models:");
+        for (idx, m) in available_models.iter().enumerate() {
+            let mark = if *m == config.model { " [active]" } else { "" };
+            println!("  [{}] {}{}", idx + 1, m, mark);
+        }
 
-    if let Ok(num) = input.parse::<usize>()
-        && num > 0
-        && num <= available_models.len()
-    {
-        config.model = available_models[num - 1].clone();
-    }
+        println!();
+        let input = prompt::line(
+            &format!(
+                "Select model number (or press Enter to keep '{}')",
+                config.model
+            ),
+            "",
+        )?;
 
-    // Reasoning effort selection from the shared level list
-    println!("\nReasoning Effort options:");
-    for (idx, level) in EFFORT_LEVELS.iter().enumerate() {
-        println!("  [{}] {}", idx + 1, level);
+        if let Ok(num) = input.parse::<usize>()
+            && num > 0
+            && num <= available_models.len()
+        {
+            config.model = available_models[num - 1].clone();
+        }
     }
 
     let current_effort = config.reasoning_effort.as_deref().unwrap_or("none");
-    let eff_input = prompt::line(
-        &format!(
-            "Select effort 1-{} (or press Enter to keep '{current_effort}')",
-            EFFORT_LEVELS.len()
-        ),
-        "",
-    )?;
-
-    if !eff_input.is_empty() {
-        let chosen_effort = match eff_input.parse::<usize>() {
-            Ok(n) if (1..=EFFORT_LEVELS.len()).contains(&n) => EFFORT_LEVELS[n - 1],
-            _ => eff_input.as_str(),
+    if interactive {
+        let levels: Vec<String> = EFFORT_LEVELS
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect();
+        let Some(chosen) = prompt::pick("Reasoning effort", &levels, Some(current_effort)) else {
+            anyhow::bail!("cancelled; nothing written");
         };
-        config.reasoning_effort = Some(chosen_effort.to_string());
+        config.reasoning_effort = Some(chosen);
+    } else {
+        // Reasoning effort selection from the shared level list
+        println!("\nReasoning Effort options:");
+        for (idx, level) in EFFORT_LEVELS.iter().enumerate() {
+            println!("  [{}] {}\n", idx + 1, level);
+        }
+
+        let eff_input = prompt::line(
+            &format!(
+                "Select effort 1-{} (or press Enter to keep '{current_effort}')",
+                EFFORT_LEVELS.len()
+            ),
+            "",
+        )?;
+
+        if !eff_input.is_empty() {
+            let chosen_effort = match eff_input.parse::<usize>() {
+                Ok(n) if (1..=EFFORT_LEVELS.len()).contains(&n) => EFFORT_LEVELS[n - 1],
+                _ => eff_input.as_str(),
+            };
+            config.reasoning_effort = Some(chosen_effort.to_string());
+        }
     }
 
     crate::cli::config::write_agent_config(&config_path, &config).map_err(anyhow::Error::msg)?;

@@ -39,7 +39,7 @@ pub fn persist(
 }
 
 pub async fn providers() -> anyhow::Result<()> {
-    use std::io::{self, Write};
+    use std::io::{self, IsTerminal, Write};
 
     let config_path = crate::util::global_config_path()
         .ok_or_else(|| anyhow::anyhow!("home directory is not set, cannot locate config"))?;
@@ -73,11 +73,20 @@ pub async fn providers() -> anyhow::Result<()> {
             "Accepts an OpenAI- or Anthropic-compatible endpoint; /v1/ is added when missing.\n"
         );
         let url = prompt::line("Base URL", &url_default)?;
+        // Checked before the key is asked, so a wrong scheme or a typo does not
+        // cost a network round trip and a second prompt.
+        let normalized = match crate::agent::engine::validate_base_url(&url) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                println!("invalid base URL: {error}\n");
+                url_default = url;
+                continue;
+            }
+        };
 
-        screen(&config_path, &[("base_url", url.clone())]);
+        screen(&config_path, &[("base_url", normalized.clone())]);
         let key = prompt::secret("API key (optional)", &key_default)?;
 
-        let (normalized, _) = crate::agent::engine::normalize_base_url(&url);
         screen(
             &config_path,
             &[("base_url", normalized.clone()), ("api key", mask(&key))],
@@ -106,34 +115,60 @@ pub async fn providers() -> anyhow::Result<()> {
         }
     };
 
-    let mut rows = vec![
-        ("base_url", base_url.clone()),
-        ("api key", mask(&api_key)),
-        ("models", format!("{} available", available_models.len())),
-    ];
-    if available_models.is_empty() {
-        rows.pop();
-    }
-    screen(&config_path, &rows);
-    let efforts = crate::agent::engine::EFFORT_LEVELS.join("|");
-    let model = prompt::line("Model", &config.model)?;
-    if !available_models.is_empty() && !available_models.contains(&model) {
-        println!("warning: '{model}' is not in the endpoint's model list");
-    }
-
-    rows.push(("model", model.clone()));
-    screen(&config_path, &rows);
-    let effort = prompt::line(
-        &format!("Reasoning effort ({efforts})"),
-        config.reasoning_effort.as_deref().unwrap_or(""),
-    )?;
-
+    // One normalization, used by the live form and by the write below.
     let (stored_url, adapters) = crate::agent::engine::normalize_base_url(&base_url);
     let protocols = adapters
         .iter()
         .map(|a| format!("{a:?}"))
         .collect::<Vec<_>>()
         .join(", ");
+
+    let mut rows = vec![
+        ("base_url", base_url.clone()),
+        ("api key", mask(&api_key)),
+        ("models", format!("{} available", available_models.len())),
+        ("protocols", protocols.clone()),
+    ];
+    if available_models.is_empty() {
+        rows.remove(2);
+    }
+    screen(&config_path, &rows);
+    let efforts = crate::agent::engine::EFFORT_LEVELS.join("|");
+    let model = if available_models.is_empty() || !io::stdin().is_terminal() {
+        let typed = prompt::line("Model", &config.model)?;
+        if !available_models.is_empty() && !available_models.contains(&typed) {
+            println!("warning: '{typed}' is not in the endpoint's model list");
+        }
+        typed
+    } else {
+        // The endpoint answered, so the choice is its list: a typed default here
+        // is how a model the gateway does not serve gets saved.
+        prompt::pick("Model", &available_models, Some(&config.model))
+            .ok_or_else(|| anyhow::anyhow!("cancelled; nothing written"))?
+    };
+
+    rows.push(("model", model.clone()));
+    screen(&config_path, &rows);
+    let effort = if io::stdin().is_terminal() {
+        let levels: Vec<String> = crate::agent::engine::EFFORT_LEVELS
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect();
+        let current = config.reasoning_effort.clone().unwrap_or_default();
+        let current = if current.is_empty() {
+            "none".to_string()
+        } else {
+            current
+        };
+        prompt::pick("Reasoning effort", &levels, Some(&current))
+            .ok_or_else(|| anyhow::anyhow!("cancelled; nothing written"))?
+    } else {
+        prompt::line(
+            &format!("Reasoning effort ({efforts})"),
+            config.reasoning_effort.as_deref().unwrap_or(""),
+        )?
+    };
+
     config.base_url = Some(stored_url);
     config.model = model;
     if !api_key.is_empty() {

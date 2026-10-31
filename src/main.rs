@@ -41,10 +41,10 @@ enum Commands {
     /// Initialize SEAVX configuration
     Init,
 
-    /// Configure providers and other SEAVX settings
+    /// Configure providers and other SEAVX settings (default: providers)
     Setup {
         #[command(subcommand)]
-        section: SetupSection,
+        section: Option<SetupSection>,
     },
 
     /// Check the installation
@@ -262,8 +262,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("Config already exists at {}", config_path.display());
             }
         }
+        // `seavx setup` is the providers wizard: the only section, so naming it
+        // is optional rather than a usage error.
         Some(Commands::Setup { section }) => match section {
-            SetupSection::Providers => cli::setup::providers().await?,
+            None | Some(SetupSection::Providers) => cli::setup::providers().await?,
         },
         Some(Commands::Doctor { offline }) => {
             let report = cli::doctor::run(cli::doctor::DoctorOptions {
