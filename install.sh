@@ -15,19 +15,30 @@ BASE="${BASE%/}"
 UPDATE_KEY=""
 
 # Only these platforms have CI-built binaries; everything else builds from source.
+# `BINARY` is the last segment of the signed route, i.e. `Target::binary`.
 case "$(uname -s)-$(uname -m)" in
-    Linux-x86_64) PLATFORM="linux-x86_64"; CDN="linux/x86_64" ;;
-    Darwin-arm64) PLATFORM="macos-arm64"; CDN="macos/arm64" ;;
-    *) PLATFORM=""; CDN="" ;;
+    Linux-x86_64) PLATFORM="linux-x86_64"; CDN="linux/x86_64"; BINARY="seavx-linux-x86_64" ;;
+    Darwin-arm64) PLATFORM="macos-arm64"; CDN="macos/arm64"; BINARY="seavx-macos-arm64" ;;
+    *) PLATFORM=""; CDN=""; BINARY="" ;;
 esac
 
 echo "=== Seavx Installer ==="
 mkdir -p "$INSTALL_DIR"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; rm -f "${INSTALL_DIR}/${BIN}.new"' EXIT
 
 installed=false
+
+# `install` truncates the destination in place, so a short write would destroy the
+# binary this rule must keep: stage beside it and rename, which is atomic.
+place() {
+    install -m 755 "$1" "${INSTALL_DIR}/${BIN}.new"
+    mv -f "${INSTALL_DIR}/${BIN}.new" "${INSTALL_DIR}/${BIN}"
+}
+
+# `digest_matches` ignores case; `${x,,}` is bash 4 and macOS ships 3.2.
+lower() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
 
 # 1. CDN: the pointer is signed and names an immutable build; nothing is replaced
 #    until the signature, the channel, the target and the digest all hold.
@@ -42,8 +53,13 @@ if [[ -n "$CDN" ]]; then
     echo "Verifying the release pointer at ${BASE}/latest/${CDN}.json ..."
     curl -fsSL --retry 2 "${BASE}/latest/${CDN}.json" -o "$WORK/pointer.json"
 
-    # One field per line and no `"` inside a value: that is the pointer's own shape.
-    field() { sed -nE "s/^[[:space:]]*\"$1\":[[:space:]]*\"([^\"]*)\",?\$/\1/p" "$WORK/pointer.json"; }
+    # CI writes the pointer as ONE line and the fixtures are pretty-printed, so the
+    # key is matched wherever it sits; the first quoted value is the field.
+    field() {
+        grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$WORK/pointer.json" \
+            | head -n 1 \
+            | sed 's/^[^:]*:[[:space:]]*"//; s/"$//' || true
+    }
     CHANNEL="$(field channel)"
     TARGET="$(field target)"
     SHA="$(field sha)"
@@ -55,7 +71,17 @@ if [[ -n "$CDN" ]]; then
 
     [[ "$CHANNEL" == stable ]] || { echo "error: the pointer is for the ${CHANNEL:-no} channel, not stable." >&2; exit 1; }
     [[ "$TARGET" == "$PLATFORM" ]] || { echo "error: the pointer is for target ${TARGET:-none}, not ${PLATFORM}." >&2; exit 1; }
-    [[ -n "$KEY" && -n "$SHA256" ]] || { echo "error: the pointer names no build." >&2; exit 1; }
+    # The same shapes `Manifest::parse` enforces: a pointer the client rejects must
+    # not be installable either, or the binary can never update itself.
+    [[ "$SHA" =~ ^[0-9a-f]{7}$ ]] || { echo "error: sha: expected 7 lowercase hex characters, got \"${SHA}\"." >&2; exit 1; }
+    [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "error: sha256: expected 64 lowercase hex characters, got \"${SHA256}\"." >&2; exit 1; }
+    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] \
+        || { echo "error: version: expected a SemVer version, got \"${VERSION}\"." >&2; exit 1; }
+    [[ "$BUILT_AT" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$ ]] \
+        || { echo "error: built_at: expected YYYY-MM-DDTHH:MM:SSZ, got \"${BUILT_AT}\"." >&2; exit 1; }
+    # `key_matches_route`: the download path is exactly the one the digest names.
+    [[ "$KEY" == "builds/${SHA}/${SHA256}/${BINARY}" ]] \
+        || { echo "error: key: expected builds/${SHA}/${SHA256}/${BINARY}, got \"${KEY}\"." >&2; exit 1; }
 
     # The exact bytes minisign signed: `.github/scripts/pointer-manifest.sh` order,
     # which `manifest.rs::signed_bytes` reproduces byte for byte.
@@ -71,8 +97,9 @@ if [[ -n "$CDN" ]]; then
     } > "$WORK/manifest"
 
     if command -v minisign > /dev/null; then
-        # `sig` is one JSON line of `\n` escapes: the 4-line file is what minisign reads.
-        printf '%b\n' "$SIGNATURE" > "$WORK/sig"
+        # `sig` is one JSON line of `\n` escapes that already ends in a newline; a
+        # second one here would make the POSIX and Windows sig files differ.
+        printf '%b' "$SIGNATURE" > "$WORK/sig"
         minisign -V -m "$WORK/manifest" -x "$WORK/sig" -P "$UPDATE_KEY" > /dev/null
     else
         echo "warning: minisign is not installed; the checksum only detects transfer corruption, not a forged pointer or publisher"
@@ -87,12 +114,12 @@ if [[ -n "$CDN" ]]; then
     else
         ACTUAL="$(shasum -a 256 "$WORK/seavx" | cut -d' ' -f1)"
     fi
-    if [[ "$ACTUAL" != "$SHA256" ]]; then
+    if [[ "$(lower "$ACTUAL")" != "$(lower "$SHA256")" ]]; then
         echo "error: the download does not match the published checksum: expected ${SHA256}, got ${ACTUAL}" >&2
         exit 1
     fi
 
-    install -m 755 "$WORK/seavx" "${INSTALL_DIR}/${BIN}"
+    place "$WORK/seavx"
     installed=true
 fi
 
@@ -104,7 +131,7 @@ if [[ "$installed" != true ]]; then
         exit 1
     fi
     cargo build --release
-    install -m 755 target/release/seavx "${INSTALL_DIR}/${BIN}"
+    place target/release/seavx
 fi
 
 if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then

@@ -13,6 +13,8 @@ $Base = $Base.TrimEnd('/')
 $UpdateKey = ''
 
 $Target = 'windows-x86_64'
+# The last segment of the signed route, i.e. `Target::binary`.
+$Binary = 'seavx-windows-x86_64'
 $Pointer = "$Base/latest/windows/x86_64.json"
 
 $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\seavx'
@@ -34,11 +36,30 @@ try {
     Write-Host "Verifying the release pointer at $Pointer ..."
     $pointer = (Invoke-WebRequest -Uri $Pointer -UseBasicParsing).Content | ConvertFrom-Json
 
-    if ($pointer.channel -ne 'stable') {
+    if ($pointer.channel -cne 'stable') {
         throw "the pointer is for the $($pointer.channel) channel, not stable."
     }
-    if ($pointer.target -ne $Target) {
+    if ($pointer.target -cne $Target) {
         throw "the pointer is for target $($pointer.target), not $Target."
+    }
+    # The same shapes `Manifest::parse` enforces: a pointer the client rejects must
+    # not be installable either, or the binary can never update itself.
+    # A missing field makes `-notmatch` true, so absent values are refused here.
+    if ($pointer.sha -notmatch '^[0-9a-f]{7}$') {
+        throw "sha: expected 7 lowercase hex characters, got `"$($pointer.sha)`"."
+    }
+    if ($pointer.sha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "sha256: expected 64 lowercase hex characters, got `"$($pointer.sha256)`"."
+    }
+    if ($pointer.version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+        throw "version: expected a SemVer version, got `"$($pointer.version)`"."
+    }
+    if ($pointer.built_at -notmatch '^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\dZ$') {
+        throw "built_at: expected YYYY-MM-DDTHH:MM:SSZ, got `"$($pointer.built_at)`"."
+    }
+    # `key_matches_route`: the download path is exactly the one the digest names.
+    if ($pointer.key -cne "builds/$($pointer.sha)/$($pointer.sha256)/$Binary") {
+        throw "key: expected builds/$($pointer.sha)/$($pointer.sha256)/$Binary, got `"$($pointer.key)`"."
     }
 
     # The exact bytes minisign signed: `.github/scripts/pointer-manifest.sh` order,
@@ -68,8 +89,9 @@ try {
     Invoke-WebRequest -Uri "$Base/$($pointer.key)" -OutFile $Temp -UseBasicParsing
 
     $actual = (Get-FileHash -Path $Temp -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne $pointer.sha256) {
-        throw "the download does not match the published checksum: expected $($pointer.sha256), got $actual"
+    $expected = $pointer.sha256.ToLowerInvariant()
+    if ($actual -ne $expected) {
+        throw "the download does not match the published checksum: expected $expected, got $actual"
     }
 
     Move-Item -Force -Path $Temp -Destination $Exe
