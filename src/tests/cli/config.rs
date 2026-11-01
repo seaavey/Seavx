@@ -48,8 +48,8 @@ fn the_model_picker_keeps_comments_and_unknown_keys() {
     )
     .unwrap();
 
-    // The `/model` picker and `seavx model` both land here.
-    set_model_and_effort(&path, "new-model", Some("high")).unwrap();
+    // `seavx model` lands here; `/model` is session-scoped and writes nothing.
+    set_model_and_effort_repairing(&path, "new-model", Some("high")).unwrap();
 
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.contains("# keep me"), "{text}");
@@ -72,7 +72,7 @@ fn model_with_an_invalid_effort_changes_nothing() {
     let before = "# keep me\nmodel = \"old\"\nreasoning_effort = \"low\"\n";
     fs::write(&path, before).unwrap();
 
-    let error = set_model_and_effort(&path, "new-model", Some("turbo")).unwrap_err();
+    let error = set_model_and_effort_repairing(&path, "new-model", Some("turbo")).unwrap_err();
     assert!(error.contains("reasoning_effort"), "{error}");
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
@@ -81,7 +81,7 @@ fn model_with_an_invalid_effort_changes_nothing() {
     );
 
     // The model alone is still writable, and the effort is untouched.
-    set_model_and_effort(&path, "new-model", None).unwrap();
+    set_model_and_effort_repairing(&path, "new-model", None).unwrap();
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.contains("model = \"new-model\""), "{text}");
     assert!(text.contains("reasoning_effort = \"low\""), "{text}");
@@ -182,6 +182,34 @@ fn a_partial_config_file_is_merged_with_defaults() {
         "a missing key takes the built-in default"
     );
     assert_eq!(config.tool_permissions, "ask");
+}
+
+#[test]
+fn auto_compact_is_written_as_a_toml_boolean_and_loads() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join(".seavx/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    assert_eq!(
+        set_value(&path, ConfigKey::AutoCompact, "off").unwrap(),
+        "false"
+    );
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("auto_compact = false"), "{text}");
+    assert!(set_value(&path, ConfigKey::AutoCompact, "maybe").is_err());
+
+    let (config, report) = AgentConfig::load_with_report_env(temp.path(), |_| None);
+    assert!(report.parse_error.is_none(), "{:?}", report.parse_error);
+    assert!(!config.auto_compact, "the file turns it off");
+    assert!(
+        crate::cli::config::render_report(&config, &report).contains("auto_compact"),
+        "the report shows the row"
+    );
+    assert_eq!(
+        report.origin("auto_compact"),
+        crate::agent::engine::ConfigOrigin::Workspace,
+        "the report names where the value came from"
+    );
 }
 
 #[test]
@@ -311,6 +339,7 @@ fn config_writer_preserves_comments_and_unknown_keys() {
         reasoning_effort: None,
         system_prompt: None,
         stream: true,
+        auto_compact: true,
     };
     write_agent_config(&path, &config).unwrap();
     let text = stash_written_config(&path);
@@ -338,17 +367,17 @@ fn config_writer_validates_all_changes_before_write() {
 }
 
 #[test]
-fn set_model_and_effort_writes_both_fields_or_neither() {
+fn the_model_writer_writes_both_fields_or_neither() {
     let temp = tempdir().unwrap();
     let path = config_file(temp.path());
     let original = "model = \"old\"\nmax_turns = 10\n";
     fs::write(&path, original).unwrap();
 
-    let error = set_model_and_effort(&path, "new-model", Some("turbo")).unwrap_err();
+    let error = set_model_and_effort_repairing(&path, "new-model", Some("turbo")).unwrap_err();
     assert!(error.contains("reasoning_effort"), "{error}");
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
-    set_model_and_effort(&path, "new-model", Some("high")).unwrap();
+    set_model_and_effort_repairing(&path, "new-model", Some("high")).unwrap();
     let text = stash_written_config(&path);
     assert!(text.contains("model = \"new-model\""), "{text}");
     assert!(text.contains("reasoning_effort = \"high\""), "{text}");
@@ -551,6 +580,7 @@ fn agent_config(model: &str) -> AgentConfig {
         tool_permissions: "ask".to_string(),
         permitted_actions: Vec::new(),
         stream: true,
+        auto_compact: true,
     }
 }
 

@@ -59,6 +59,10 @@ pub fn keep_recent_budget(limit: i32) -> usize {
     request_budget(limit) * 60 / 100
 }
 
+/// Fewer older messages than this and there is no plan to carry: a summary of
+/// one or two rows is a restatement that costs more than the rows it replaces.
+pub const MIN_COMPACT_MESSAGES: usize = 4;
+
 /// Index of the first message that stays; `0` keeps everything. The cut lands
 /// on a user row, so a turn (a user row and everything it produced) is never
 /// split, and the newest turn is kept whole even when it alone exceeds the

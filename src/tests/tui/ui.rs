@@ -665,8 +665,11 @@ fn a_success_toast_is_green_and_an_error_toast_is_red() {
 #[test]
 fn the_effort_modal_marks_the_current_level() {
     let mut app = test_app();
-    let options = EFFORT_LEVELS.to_vec();
-    let selected = options.iter().position(|level| *level == "high").unwrap();
+    let options: Vec<String> = EFFORT_LEVELS
+        .iter()
+        .map(|level| level.to_string())
+        .collect();
+    let selected = options.iter().position(|level| level == "high").unwrap();
     app.modal = Some(ModalSelection::Effort {
         model: "fake-model".to_string(),
         options,

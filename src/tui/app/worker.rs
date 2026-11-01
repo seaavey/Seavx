@@ -184,9 +184,8 @@ pub async fn run_agent_worker(
     tokio::spawn(async move {
         let _done = DoneGuard(tx.clone());
         let security = crate::agent::security::WorkspaceSecurity::new(".");
-        let config = crate::agent::engine::AgentConfig::load(security.root());
-        let runtime = crate::agent::engine::AgentRuntime::new(config.clone(), security);
-
+        // The file supplies everything except the model: `/model` is session
+        // scoped, so this turn runs the one the app carries.
         let TurnRequest {
             prompt,
             session_id,
@@ -195,7 +194,17 @@ pub async fn run_agent_worker(
             cancel,
             steer,
             attachments,
+            model,
+            effort,
         } = request;
+        let mut config = crate::agent::engine::AgentConfig::load(security.root());
+        if let Some(model) = &model {
+            config.model = Some(model.clone());
+        }
+        if let Some(effort) = &effort {
+            config.reasoning_effort = Some(effort.clone());
+        }
+        let runtime = crate::agent::engine::AgentRuntime::new(config.clone(), security);
         let mut session_id = session_id;
 
         // The user row and the history for this request, off the UI thread.

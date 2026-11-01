@@ -100,11 +100,15 @@ pub fn load_system_prompt(workspace_root: &Path) -> String {
         "{custom_soul}\n\n{base_prompt}\n\n{DEVELOPER_POLICY}\n\n{CODING_POLICY}\n\n{SECURITY_POLICY}\n\n{TOOLS_POLICY}\n\n{SKILLS_POLICY}"
     );
 
-    // Auto-inject project MEMORY.md if available
-    let memory_candidates = [
+    // Auto-inject project MEMORY.md if available: the checkout's own file, a
+    // legacy root copy, then the global one a release run writes.
+    let mut memory_candidates = vec![
         workspace_root.join(".seavx/MEMORY.md"),
         workspace_root.join("MEMORY.md"),
     ];
+    if let Some(home) = crate::home::dir() {
+        memory_candidates.push(home.join(".seavx/MEMORY.md"));
+    }
 
     for memory_file in &memory_candidates {
         if memory_file.exists()

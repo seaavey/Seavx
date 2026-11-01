@@ -109,9 +109,43 @@ pub(crate) fn with_mode_policy(mut prompt: String, mode: AgentMode) -> String {
     prompt
 }
 
-/// Canonical reasoning-effort options, in menu order. Single source for the
-/// TUI modal, the CLI prompts and `parse_reasoning_effort`.
+/// Reasoning-effort options when the catalog knows nothing about the model, in
+/// menu order. Also the fallback `parse_reasoning_effort` answers for.
 pub const EFFORT_LEVELS: &[&str] = &["none", "minimal", "medium", "high", "highx", "max"];
+
+/// The levels the pickers offer: what models.dev publishes for the model, else
+/// [`EFFORT_LEVELS`]. Display only: a saved effort is never refused for being
+/// absent here, because a gateway can take a level the catalog does not list.
+pub fn effort_levels(model: Option<&str>) -> Vec<String> {
+    let static_levels = || -> Vec<String> {
+        EFFORT_LEVELS
+            .iter()
+            .map(|level| level.to_string())
+            .collect()
+    };
+    let Some(published) = model.and_then(crate::agent::models::catalog_efforts) else {
+        return static_levels();
+    };
+    // The catalog spells two levels `low` and `xhigh`; the config stores them as
+    // `minimal` and `highx`. One level, one name, or the picker opens on a row
+    // that never matches the saved effort.
+    let mut levels: Vec<String> = Vec::new();
+    for level in published {
+        let Some(canonical) =
+            parse_reasoning_effort(&level).and_then(crate::cli::config::canonical_effort)
+        else {
+            continue;
+        };
+        if !levels.iter().any(|known| known == canonical) {
+            levels.push(canonical.to_string());
+        }
+    }
+    if levels.is_empty() {
+        static_levels()
+    } else {
+        levels
+    }
+}
 
 /// Turn budget a new config starts with. An existing file keeps its own value.
 pub const DEFAULT_MAX_TURNS: usize = 100;
@@ -124,12 +158,13 @@ fn default_max_turns() -> usize {
 const NO_PROVIDER: &str = "no provider configured: run `seavx setup`";
 
 /// Config keys that can appear in a config file, in display order.
-pub const CONFIG_KEYS: [&str; 9] = [
+pub const CONFIG_KEYS: [&str; 10] = [
     "model",
     "base_url",
     "api_key",
     "reasoning_effort",
     "stream",
+    "auto_compact",
     "max_turns",
     "system_prompt",
     "tool_permissions",
@@ -199,6 +234,10 @@ pub struct AgentConfig {
     /// Stream the answer instead of waiting for the whole response.
     #[serde(default = "default_stream")]
     pub stream: bool,
+    /// Summarise an over-budget request instead of sending it as-is. Off means
+    /// the user manages the context himself (`/compact` is still manual).
+    #[serde(default = "default_auto_compact")]
+    pub auto_compact: bool,
     /// Which environment variable supplied `api_key`; `None` when the key came
     /// from a file. A key with no endpoint names a provider only through this,
     /// because a bare key's host is unknowable.
@@ -211,6 +250,10 @@ fn default_tool_permissions() -> String {
 }
 
 fn default_stream() -> bool {
+    true
+}
+
+fn default_auto_compact() -> bool {
     true
 }
 
@@ -255,6 +298,7 @@ impl AgentConfig {
             tool_permissions: default_tool_permissions(),
             permitted_actions: Vec::new(),
             stream: default_stream(),
+            auto_compact: default_auto_compact(),
         }
     }
 }
@@ -276,9 +320,16 @@ const HUNDRED_TWENTY_EIGHT_K_FAMILIES: [&str; 6] =
 /// Anything unrecognised gets this instead of the largest guess.
 pub const ASSUMED_CONTEXT_LIMIT: i32 = 64_000;
 
-/// One table, shared by the footer, the context budget and `doctor`. An
-/// unrecognised id is never assumed to be 128k.
+/// One table, shared by the footer, the context budget and `doctor`. The public
+/// catalog answers first — it knows the model, the family list only guesses its
+/// name — and an unrecognised id is never assumed to be 128k.
 pub fn model_context_limit(model: &str) -> ContextLimit {
+    if let Some(tokens) = crate::agent::models::catalog_context(model) {
+        return ContextLimit {
+            tokens,
+            assumed: false,
+        };
+    }
     let id = model.to_lowercase();
     if MILLION_TOKEN_FAMILIES
         .iter()
@@ -1130,6 +1181,10 @@ impl AgentRuntime {
                 event_sink(AgentEvent::Steer(steer));
             }
 
+            // Each tool result grew the request since the last send: measure it
+            // again, so the loop compacts instead of overflowing the window.
+            chat_req = self.fit_request(chat_req, &*summarizer, event_sink).await;
+
             // Log full request payload to .seavx/request.log
             Self::log_request_payload(
                 self.config.model_name(),
@@ -1220,9 +1275,15 @@ impl AgentRuntime {
                     match trigger {
                         Some(RetryTrigger::ReplayRejection) => chat_req = halve_turns(&chat_req),
                         Some(RetryTrigger::CapacityError) => {
-                            chat_req = self
+                            match self
                                 .aggressive_request(&retry_history, user, mode, &*summarizer)
                                 .await
+                            {
+                                Some(fitted) => chat_req = fitted,
+                                // Nothing to fold: re-sending would spend the
+                                // retry on the request that just failed.
+                                None => return Err(TurnError::Failed(error)),
+                            }
                         }
                         // The same request, unstreamed: nothing to rebuild.
                         Some(RetryTrigger::StreamUnavailable) | None => {}
@@ -1559,19 +1620,38 @@ impl AgentRuntime {
         event_sink: &mut impl FnMut(AgentEvent),
     ) -> ChatRequest {
         use crate::agent::budget::{
-            compact, estimate_tokens, keep_recent_budget, request_budget, window_start,
+            MIN_COMPACT_MESSAGES, compact, estimate_tokens, keep_recent_budget, request_budget,
+            window_start,
         };
 
         let limit = model_context_limit(self.config.model_name());
         let budget = request_budget(limit.tokens);
         let request = self.chat_request(None, &history, user, mode);
-        if estimate_tokens(&request) <= budget {
+        let estimated = estimate_tokens(&request);
+        if estimated <= budget {
+            return request;
+        }
+        if !self.config.auto_compact {
+            event_sink(AgentEvent::Notice(format!(
+                "auto_compact is off: {estimated} tokens over the {budget} budget for {}; sending it as-is",
+                self.config.model_name()
+            )));
             return request;
         }
 
         // One compaction, then at most three 10 % shrinks while the summary
         // itself keeps the request over the budget.
         let mut keep = keep_recent_budget(limit.tokens);
+        // Something to summarise but not enough of it: one or two rows cannot
+        // carry the plan, so the request goes as it is instead of losing them
+        // for nothing. A window with nothing older keeps its own wording.
+        let oldest = window_start(&history, keep);
+        if (1..MIN_COMPACT_MESSAGES).contains(&oldest) {
+            event_sink(AgentEvent::Notice(format!(
+                "auto compact skipped: fewer than {MIN_COMPACT_MESSAGES} messages are older than the recent window ({estimated} tokens over the {budget} budget)"
+            )));
+            return request;
+        }
         for _ in 0..=3 {
             match compact(&history, keep, summarizer).await {
                 Ok(compaction) => {
@@ -1584,7 +1664,8 @@ impl AgentRuntime {
                     let after = estimate_tokens(&candidate);
                     if after <= budget {
                         event_sink(AgentEvent::Notice(format!(
-                            "context compacted ({} → {after} tokens est.)",
+                            "{}\n{} → {after} tokens (estimated)",
+                            crate::tui::compact::AUTO_COMPACT_BANNER,
                             compaction.before
                         )));
                         return candidate;
@@ -1622,6 +1703,95 @@ impl AgentRuntime {
         request
     }
 
+    /// The request grows with every tool result, and only the turn's first send
+    /// is measured: re-measure before each send so a long tool loop compacts
+    /// instead of meeting a capacity error.
+    pub(crate) async fn fit_request(
+        &self,
+        mut request: ChatRequest,
+        summarizer: &dyn crate::tui::compact::Summarizer,
+        event_sink: &mut impl FnMut(AgentEvent),
+    ) -> ChatRequest {
+        use crate::agent::budget::{
+            MIN_COMPACT_MESSAGES, compact, estimate_tokens, keep_recent_budget, request_budget,
+            window_start,
+        };
+
+        let limit = model_context_limit(self.config.model_name());
+        let budget = request_budget(limit.tokens);
+        if estimate_tokens(&request) <= budget {
+            return request;
+        }
+
+        // The system row stays first; everything after it is the turn's history.
+        let head = usize::from(
+            request
+                .messages
+                .first()
+                .is_some_and(|message| message.role == genai::chat::ChatRole::System),
+        );
+        let history = &request.messages[head..];
+        let keep = keep_recent_budget(limit.tokens);
+
+        // Two reasons to leave the request alone, both silent here: the turn's
+        // first send already said why, and a notice per tool step would fill
+        // the transcript.
+        let oldest = window_start(history, keep);
+        if !self.config.auto_compact || (1..MIN_COMPACT_MESSAGES).contains(&oldest) {
+            return request;
+        }
+
+        let rebuilt = match compact(history, keep, summarizer).await {
+            Ok(compaction) => {
+                let mut messages = request.messages[..head].to_vec();
+                messages.push(ChatMessage::user(format!(
+                    "{}\n{}",
+                    crate::tui::compact::SESSION_CONTEXT_BANNER,
+                    compaction.summary
+                )));
+                messages.extend(compaction.history);
+                // The summary has to buy its way back under the budget: one that
+                // leaves the request over it is sent anyway, and the next tool
+                // step pays for another summary of the same rows.
+                let mut candidate = request.clone();
+                candidate.messages = messages;
+                if estimate_tokens(&candidate) > budget {
+                    event_sink(AgentEvent::Notice(format!(
+                        "compacted summary still exceeds the {budget} budget; older turns dropped"
+                    )));
+                    let mut messages = request.messages[..head].to_vec();
+                    messages.extend_from_slice(&history[oldest..]);
+                    request.messages = messages;
+                    return request;
+                }
+                event_sink(AgentEvent::Notice(format!(
+                    "{}\n{} → {} tokens (estimated), mid-turn",
+                    crate::tui::compact::AUTO_COMPACT_BANNER,
+                    compaction.before,
+                    compaction.after
+                )));
+                Some(candidate.messages)
+            }
+            Err(error) => {
+                // Same rule as the turn's first send: a bad summary is worse
+                // than none, so the older turns are dropped instead.
+                (oldest > 0).then(|| {
+                    event_sink(AgentEvent::Notice(format!(
+                        "compaction failed ({error}); older turns dropped"
+                    )));
+                    let mut messages = request.messages[..head].to_vec();
+                    messages.extend_from_slice(&history[oldest..]);
+                    messages
+                })
+            }
+        };
+
+        if let Some(messages) = rebuilt {
+            request.messages = messages;
+        }
+        request
+    }
+
     fn chat_request(
         &self,
         summary: Option<&str>,
@@ -1652,20 +1822,26 @@ impl AgentRuntime {
         request.append_message(user.clone())
     }
 
-    /// The capacity-error retry: compact against 40 % of the budget, keep the
-    /// newest turn when even that cannot summarise.
+    /// The capacity-error retry: compact against 40 % of the budget. `None` when
+    /// there is nothing to fold, because the retry would re-send the request the
+    /// provider just refused.
     async fn aggressive_request(
         &self,
         history: &[ChatMessage],
         user: &ChatMessage,
         mode: AgentMode,
         summarizer: &dyn crate::tui::compact::Summarizer,
-    ) -> ChatRequest {
+    ) -> Option<ChatRequest> {
         use crate::agent::budget::{compact, request_budget, window_start};
 
         let limit = model_context_limit(self.config.model_name());
         let aggressive = request_budget(limit.tokens) * 40 / 100;
-        match compact(history, aggressive, summarizer).await {
+        // Off, or nothing older than the window: the retry would spend itself on
+        // the same bytes.
+        if !self.config.auto_compact || window_start(history, aggressive) == 0 {
+            return None;
+        }
+        Some(match compact(history, aggressive, summarizer).await {
             Ok(compaction) => {
                 self.chat_request(Some(&compaction.summary), &compaction.history, user, mode)
             }
@@ -1673,7 +1849,7 @@ impl AgentRuntime {
                 let split = window_start(history, 0);
                 self.chat_request(None, &history[split..], user, mode)
             }
-        }
+        })
     }
 
     /// One place decides a tool call: the matrix, then the human, then the

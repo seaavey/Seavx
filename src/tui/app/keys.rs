@@ -6,7 +6,6 @@ use super::{
     App, EnterAction, ModalSelection, apply_command_effect, clipboard, edit_query, new_input,
     paste, run_agent_worker, spawn_session_resume, visible_models,
 };
-use crate::agent::engine::EFFORT_LEVELS;
 use crate::tui::event::Action;
 
 pub(super) fn is_mode_shortcut(key: &KeyEvent) -> bool {
@@ -99,13 +98,19 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                         let chosen = visible_models(&models, &query)
                             .get(selected)
                             .map(|model| (*model).clone());
-                        let options = EFFORT_LEVELS.to_vec();
                         let current_eff = app.config.reasoning_effort.as_deref().unwrap_or("none");
-                        let eff_sel = options.iter().position(|o| *o == current_eff).unwrap_or(0);
-                        app.modal = chosen.map(|model| ModalSelection::Effort {
-                            model,
-                            options,
-                            selected: eff_sel,
+                        app.modal = chosen.map(|model| {
+                            // The levels this model publishes, not the static list.
+                            let options = crate::agent::engine::effort_levels(Some(&model));
+                            let selected = options
+                                .iter()
+                                .position(|level| level == current_eff)
+                                .unwrap_or(0);
+                            ModalSelection::Effort {
+                                model,
+                                options,
+                                selected,
+                            }
                         });
                     }
                     _ => {}
@@ -168,23 +173,7 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                 }
                 KeyCode::Enter => {
                     let chosen_effort = options[selected].to_string();
-                    app.config.model = Some(model.clone());
-                    app.config.reasoning_effort = Some(chosen_effort.clone());
-
-                    // Persist through the one config writer.
-                    let saved = app.config.save(std::path::Path::new("."));
-
-                    let saved_line = match &saved {
-                        Ok(path) => format!("Saved to {}", path.display()),
-                        Err(error) => format!("Failed to save config: {error}"),
-                    };
-                    app.set_text(format!(
-                        "Switched model to: {}\nReasoning effort: {}\n{saved_line}",
-                        app.config.model.as_deref().unwrap_or("not set"),
-                        app.config.reasoning_effort.as_deref().unwrap_or("none")
-                    ));
-                    app.scroll = 0;
-                    app.auto_scroll = true;
+                    app.switch_model(model.clone(), Some(chosen_effort));
                     app.modal = None;
                 }
                 _ => {}

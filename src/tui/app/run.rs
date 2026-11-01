@@ -25,7 +25,7 @@ pub(super) fn redraw_interval(app: &App) -> Duration {
         || matches!(
             app.modal.as_ref(),
             Some(ModalSelection::Effort { options, selected, .. })
-                if options.get(*selected) == Some(&"max")
+                if options.get(*selected).is_some_and(|level| level == "max")
         )
     {
         Duration::from_millis(16)
@@ -59,6 +59,17 @@ pub async fn start_tui(
     initial_prompt: Option<String>,
     loaded: Option<crate::session::LoadedSession>,
 ) -> anyhow::Result<()> {
+    // The footer, the budget and `doctor` all read this table; the cached
+    // catalog answers at once and a stale one refreshes behind the session.
+    if crate::agent::models::load_context_catalog(std::path::Path::new(".")) {
+        tokio::spawn(async {
+            if let Err(error) =
+                crate::agent::models::refresh_context_catalog(std::path::Path::new(".")).await
+            {
+                tracing::warn!(%error, "context catalog not refreshed");
+            }
+        });
+    }
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(

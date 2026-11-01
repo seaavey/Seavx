@@ -1,6 +1,8 @@
 use crate::util::epoch_secs;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,6 +222,218 @@ impl ModelManager {
 
         self.refresh_remote_models(base_url, api_key).await
     }
+}
+
+/// Where the public catalog lives: context windows for the model ids a gateway
+/// lists but never describes.
+const CATALOG_URL: &str = "https://models.dev/api.json";
+/// A window changes when a model ships, not when a session starts.
+const CATALOG_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// Model-name tail → window, installed from the cache and swapped after a
+/// refresh. `BTreeMap` so the cache file keeps a stable order.
+static WINDOWS: OnceLock<RwLock<BTreeMap<String, i32>>> = OnceLock::new();
+
+fn windows() -> &'static RwLock<BTreeMap<String, i32>> {
+    WINDOWS.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+/// Model-name tail → the effort levels the catalog publishes, in menu order.
+static EFFORTS: OnceLock<RwLock<BTreeMap<String, Vec<String>>>> = OnceLock::new();
+
+fn efforts() -> &'static RwLock<BTreeMap<String, Vec<String>>> {
+    EFFORTS.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+/// The key a model id is looked up by: `rv/vendor/DeepSeek-V4.1-Flash-1017` and
+/// `amd/deepseek-v4.1-flash-1017:free` are one model to the catalog.
+fn window_key(id: &str) -> String {
+    let tail = id.rsplit('/').next().unwrap_or(id);
+    tail.split(':').next().unwrap_or(tail).trim().to_lowercase()
+}
+
+/// The window the catalog publishes for this id. `None` means it does not know
+/// the model, and the caller falls back to the family table.
+pub fn catalog_context(model: &str) -> Option<i32> {
+    windows().read().ok()?.get(&window_key(model)).copied()
+}
+
+/// The effort levels the catalog publishes for this id, in menu order. `None`
+/// means it publishes none for the model, and the caller falls back to the
+/// static list.
+pub fn catalog_efforts(model: &str) -> Option<Vec<String>> {
+    efforts().read().ok()?.get(&window_key(model)).cloned()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ContextCatalog {
+    fetched_at: u64,
+    windows: BTreeMap<String, i32>,
+    /// Absent from a cache written before the catalog kept effort levels.
+    #[serde(default)]
+    efforts: BTreeMap<String, Vec<String>>,
+}
+
+fn catalog_path(root: &Path) -> PathBuf {
+    root.join(".seavx/cache/contexts.json")
+}
+
+/// Install the cached catalog and report whether a refresh is due. A cache that
+/// cannot be read is no catalog: the family table still answers.
+pub fn load_context_catalog(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(catalog_path(root)) else {
+        return true;
+    };
+    let Ok(cache) = serde_json::from_str::<ContextCatalog>(&text) else {
+        return true;
+    };
+    if let Ok(mut installed) = windows().write() {
+        *installed = cache.windows;
+    }
+    if let Ok(mut installed) = efforts().write() {
+        *installed = cache.efforts.clone();
+    }
+    // A cache written before the catalog kept effort levels makes the picker
+    // fall back to the static list; one refresh fills it.
+    cache.efforts.is_empty() || epoch_secs().saturating_sub(cache.fetched_at) >= CATALOG_TTL_SECS
+}
+
+/// Fetch the catalog and keep only what answers a lookup. Callers spawn this:
+/// nothing waits on it, and a failed download leaves the previous numbers alone.
+pub async fn refresh_context_catalog(root: &Path) -> Result<usize, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+    let resp = client
+        .get(CATALOG_URL)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("catalog returned {}", resp.status()));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse catalog: {e}"))?;
+    let fetched = catalog_windows(&json);
+    if fetched.is_empty() {
+        return Err("catalog carried no context limits".to_string());
+    }
+    let levels = catalog_effort_levels(&json);
+
+    let cache = ContextCatalog {
+        fetched_at: epoch_secs(),
+        windows: fetched.clone(),
+        efforts: levels.clone(),
+    };
+    let text = serde_json::to_string(&cache).map_err(|e| format!("Serialization error: {e}"))?;
+    if let Err(error) = crate::atomic_file::write_atomic(
+        &catalog_path(root),
+        text.as_bytes(),
+        crate::atomic_file::ModePolicy::Preserve,
+    ) {
+        // The numbers are good for this run; only the next start pays again.
+        tracing::warn!(%error, "context catalog not written");
+    }
+    let count = fetched.len();
+    if let Ok(mut installed) = windows().write() {
+        *installed = fetched;
+    }
+    if let Ok(mut installed) = efforts().write() {
+        *installed = levels;
+    }
+    Ok(count)
+}
+
+/// Keep `limit.context` per model name. Providers disagree on one model's
+/// window — a free tier clamps it — so the largest wins: the budget guesses
+/// high, and a request the provider refuses is already retried once against a
+/// smaller one.
+fn catalog_windows(json: &serde_json::Value) -> BTreeMap<String, i32> {
+    let mut windows = BTreeMap::new();
+    let Some(providers) = json.as_object() else {
+        return windows;
+    };
+    for provider in providers.values() {
+        let Some(models) = provider.get("models").and_then(|models| models.as_object()) else {
+            continue;
+        };
+        for (id, model) in models {
+            let Some(context) = model
+                .get("limit")
+                .and_then(|limit| limit.get("context"))
+                .and_then(|context| context.as_i64())
+                .filter(|context| *context > 0 && *context <= i32::MAX as i64)
+            else {
+                continue;
+            };
+            let window = context as i32;
+            windows
+                .entry(window_key(id))
+                .and_modify(|known: &mut i32| *known = (*known).max(window))
+                .or_insert(window);
+        }
+    }
+    windows
+}
+
+/// The seven levels a request can carry, ascending. `default` is not one.
+fn effort_rank(level: &str) -> Option<u8> {
+    match level {
+        "none" => Some(0),
+        "minimal" => Some(1),
+        "low" => Some(2),
+        "medium" => Some(3),
+        "high" => Some(4),
+        "xhigh" => Some(5),
+        "max" => Some(6),
+        _ => None,
+    }
+}
+
+/// Keep the effort levels each model accepts, in menu order. Providers clamp one
+/// model differently, so the union wins: the picker offers every level some
+/// gateway takes, while a saved level is never refused for being absent here.
+fn catalog_effort_levels(json: &serde_json::Value) -> BTreeMap<String, Vec<String>> {
+    let mut levels: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Some(providers) = json.as_object() else {
+        return levels;
+    };
+    for provider in providers.values() {
+        let Some(models) = provider.get("models").and_then(|models| models.as_object()) else {
+            continue;
+        };
+        for (id, model) in models {
+            let Some(options) = model.get("reasoning_options").and_then(|o| o.as_array()) else {
+                continue;
+            };
+            let entry = levels.entry(window_key(id)).or_default();
+            for option in options
+                .iter()
+                .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("effort"))
+            {
+                for value in option
+                    .get("values")
+                    .and_then(|values| values.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                    .filter(|value| effort_rank(value).is_some())
+                {
+                    if !entry.iter().any(|known| known == value) {
+                        entry.push(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    levels.retain(|_, list| !list.is_empty());
+    for list in levels.values_mut() {
+        list.sort_by_key(|level| effort_rank(level).unwrap_or(u8::MAX));
+    }
+    levels
 }
 
 #[cfg(test)]

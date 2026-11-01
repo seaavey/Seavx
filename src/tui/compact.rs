@@ -11,6 +11,11 @@ pub const CHUNK_CHARS: usize = 24_000;
 /// The banner a compaction summary enters the request under.
 pub const SESSION_CONTEXT_BANNER: &str = "# SESSION CONTEXT (compacted)";
 
+/// The divider the transcript shows when the engine compacts on its own: the
+/// summary is invisible, the step that produced it must not be.
+pub const AUTO_COMPACT_BANNER: &str =
+    "----------------------------- AUTO COMPACT --------------------------------";
+
 const TRUNCATION_MARKER: &str = "\n...[truncated]...\n";
 
 const COMPACTION_PROMPT: &str = "\
@@ -25,7 +30,9 @@ Preserve, in this order:
 
 Do not invent facts. Do not include secrets or long code blocks.
 Keep exact paths, identifiers, and command names.
-Output Markdown with short headings and bullets, at most 800 words.";
+Every section heading starts with `#` and uses these four words verbatim:
+`# Goals`, `# Decisions`, `# Files`, `# Pending`. Under them, short bullets,
+at most 800 words.";
 
 #[derive(Debug, Clone)]
 pub struct CompactResult {

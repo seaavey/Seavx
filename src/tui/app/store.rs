@@ -164,6 +164,8 @@ impl App<'_> {
             store: self.store.clone(),
             cancel: self.cancel.clone(),
             attachments,
+            model: self.config.model.clone(),
+            effort: self.config.reasoning_effort.clone(),
         })
     }
 

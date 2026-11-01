@@ -1,7 +1,7 @@
 //! `seavx model`: set model and reasoning effort, either by flag or interactively.
 
 use super::prompt;
-use crate::agent::engine::{AgentConfig, EFFORT_LEVELS};
+use crate::agent::engine::AgentConfig;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -62,6 +62,8 @@ pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Resul
     // global config and drop its api_key. `seavx setup` writes the same file.
     let config_path = crate::cli::config::active_config_path(Path::new("."));
     let mut config = AgentConfig::load(Path::new("."));
+    // The effort menu reads what the TUI already cached; this never fetches.
+    crate::agent::models::load_context_catalog(Path::new("."));
     let base_url = match require_endpoint(&config) {
         Ok(base_url) => base_url,
         Err(reason) => {
@@ -166,33 +168,30 @@ pub async fn run(model: Option<String>, effort: Option<String>) -> anyhow::Resul
     }
 
     let current_effort = config.reasoning_effort.as_deref().unwrap_or("none");
+    let levels = crate::agent::engine::effort_levels(config.model.as_deref());
     if interactive {
-        let levels: Vec<String> = EFFORT_LEVELS
-            .iter()
-            .map(|level| (*level).to_string())
-            .collect();
         let Some(chosen) = prompt::pick("Reasoning effort", &levels, Some(current_effort)) else {
             anyhow::bail!("cancelled; nothing written");
         };
         config.reasoning_effort = Some(chosen);
     } else {
-        // Reasoning effort selection from the shared level list
+        // Reasoning effort selection from the levels this model publishes
         println!("\nReasoning Effort options:");
-        for (idx, level) in EFFORT_LEVELS.iter().enumerate() {
+        for (idx, level) in levels.iter().enumerate() {
             println!("  [{}] {}\n", idx + 1, level);
         }
 
         let eff_input = prompt::line(
             &format!(
                 "Select effort 1-{} (or press Enter to keep '{current_effort}')",
-                EFFORT_LEVELS.len()
+                levels.len()
             ),
             "",
         )?;
 
         if !eff_input.is_empty() {
             let chosen_effort = match eff_input.parse::<usize>() {
-                Ok(n) if (1..=EFFORT_LEVELS.len()).contains(&n) => EFFORT_LEVELS[n - 1],
+                Ok(n) if (1..=levels.len()).contains(&n) => levels[n - 1].as_str(),
                 _ => eff_input.as_str(),
             };
             config.reasoning_effort = Some(chosen_effort.to_string());

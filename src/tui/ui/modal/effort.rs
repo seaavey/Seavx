@@ -9,11 +9,11 @@ pub(super) fn render(
     area: Rect,
     frame: &mut Frame,
     model: &str,
-    options: &[&'static str],
+    options: &[String],
     selected: usize,
     millis: u128,
 ) {
-    let current_opt = options.get(selected).copied().unwrap_or("none");
+    let current_opt = options.get(selected).map(String::as_str).unwrap_or("none");
     let border_color = effort_color(current_opt, millis);
 
     let items: Vec<ListItem> = options
@@ -45,10 +45,12 @@ pub(super) fn render(
 fn effort_color(level: &str, millis: u128) -> Color {
     match level {
         "none" => Color::DarkGray,
-        "minimal" => Color::Blue,
+        // `minimal` and `low` are the same level under two names in the catalog.
+        "minimal" | "low" => Color::Blue,
         "medium" => Color::Cyan,
         "high" => Color::Green,
-        "highx" => Color::Magenta,
+        // The static list spells it `highx`, the catalog `xhigh`.
+        "highx" | "xhigh" => Color::Magenta,
         "max" => {
             const RAINBOW: [Color; 7] = [
                 Color::Red,

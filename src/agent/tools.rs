@@ -920,18 +920,33 @@ fn memory_target(
     security: &WorkspaceSecurity,
     target: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
-    let user_target = target == Some("user");
-    let is_debug = crate::util::is_debug();
-    let path = match (user_target, is_debug) {
-        (true, true) => security.root().join(".seavx").join("USER.md"),
-        (true, false) => crate::home::dir()
-            .ok_or_else(|| "home directory not set".to_string())?
-            .join(".seavx")
-            .join("USER.md"),
-        (false, true) => security.root().join(".seavx").join("MEMORY.md"),
-        (false, false) => security.root().join("MEMORY.md"),
+    memory_target_at(
+        crate::home::dir().as_deref(),
+        security,
+        target,
+        crate::util::is_debug(),
+    )
+}
+
+/// A debug run keeps memory inside the checkout it is editing; a release run
+/// keeps it in `~/.seavx`. Project memory is `MEMORY.md`, preferences `USER.md`.
+fn memory_target_at(
+    home: Option<&std::path::Path>,
+    security: &WorkspaceSecurity,
+    target: Option<&str>,
+    debug: bool,
+) -> Result<std::path::PathBuf, String> {
+    let file = match target {
+        Some("user") => "USER.md",
+        _ => "MEMORY.md",
     };
-    Ok(path)
+    if debug {
+        return Ok(security.root().join(".seavx").join(file));
+    }
+    Ok(home
+        .ok_or_else(|| "home directory not set".to_string())?
+        .join(".seavx")
+        .join(file))
 }
 
 // 7. save_memory

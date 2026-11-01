@@ -2147,13 +2147,14 @@ fn test_tui_redraw_interval_tracks_live_animation_work() {
     );
 
     app.refreshing_models = false;
+    let options: Vec<String> = crate::agent::engine::EFFORT_LEVELS
+        .iter()
+        .map(|level| level.to_string())
+        .collect();
     app.modal = Some(ModalSelection::Effort {
         model: "test".to_string(),
-        options: crate::agent::engine::EFFORT_LEVELS.to_vec(),
-        selected: crate::agent::engine::EFFORT_LEVELS
-            .iter()
-            .position(|level| *level == "max")
-            .unwrap(),
+        selected: options.iter().position(|level| level == "max").unwrap(),
+        options,
     });
     assert_eq!(
         run::redraw_interval(&app),
@@ -2353,4 +2354,33 @@ fn the_same_bytes_attach_once() {
         transcript(&app).contains("already attached as #1"),
         "the second paste says where it went"
     );
+}
+
+#[test]
+fn switching_the_model_changes_this_session_not_the_saved_default() {
+    let mut app = test_app();
+    app.config.model = Some("saved-model".to_string());
+    app.config.reasoning_effort = Some("low".to_string());
+    let path = crate::cli::config::active_config_path(std::path::Path::new("."));
+    let before = std::fs::read_to_string(&path).ok();
+
+    app.switch_model("session-model".to_string(), Some("high".to_string()));
+
+    assert_eq!(app.config.model.as_deref(), Some("session-model"));
+    assert_eq!(app.config.reasoning_effort.as_deref(), Some("high"));
+    assert!(
+        transcript(&app).contains("for this session"),
+        "the notice must say the change is not the default: {}",
+        transcript(&app)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).ok(),
+        before,
+        "`/model` must not write the saved default"
+    );
+
+    // The turn carries it, because the worker cannot read it from the file.
+    let request = app.submit_turn("hello").expect("a turn starts");
+    assert_eq!(request.model.as_deref(), Some("session-model"));
+    assert_eq!(request.effort.as_deref(), Some("high"));
 }

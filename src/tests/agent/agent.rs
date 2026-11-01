@@ -104,7 +104,13 @@ mod test_cases {
             "rejected lessons must not create a memory file"
         );
 
-        // Test singularity acceptance (>= 70%)
+        // Test singularity acceptance (>= 70%). A release run keeps project
+        // memory in `~/.seavx`, so HOME points at a temp dir for the write.
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        // SAFETY: this test owns HOME for the length of the write and restores
+        // it below; no other test asserts on its value.
+        unsafe { std::env::set_var("HOME", home.path()) };
         let high_conf_res = registry
             .get("save_memory")
             .unwrap()
@@ -114,14 +120,20 @@ mod test_cases {
                 &crate::agent::cancel::CancelToken::new(),
             )
             .await;
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
         assert!(high_conf_res.is_ok());
 
-        let memory_file = memory_paths
-            .iter()
-            .find(|path| path.exists())
-            .unwrap_or_else(|| panic!("no memory file under {}", mem_sec.root().display()));
-        let written = std::fs::read_to_string(memory_file).unwrap();
+        let memory_file = home.path().join(".seavx/MEMORY.md");
+        assert!(memory_file.exists(), "expected {}", memory_file.display());
+        let written = std::fs::read_to_string(&memory_file).unwrap();
         assert!(written.contains("High confidence verified rule"));
+        assert!(
+            !mem_sec.root().join(".seavx/MEMORY.md").exists(),
+            "a release run must not write project memory into the checkout"
+        );
         assert_eq!(
             checkout_before,
             snapshot_all(&checkout_paths),
@@ -1714,10 +1726,10 @@ mod context_budget {
             "the summary is a user message, never a mid-conversation system one"
         );
         assert!(
-            notices
-                .iter()
-                .any(|notice| notice.contains("context compacted")),
-            "{notices:?}"
+            notices.iter().any(|notice| notice.contains(
+                "----------------------------- AUTO COMPACT --------------------------------"
+            )),
+            "the transcript divider is shown: {notices:?}"
         );
         assert!(
             request
@@ -1855,6 +1867,207 @@ mod context_budget {
             Some("z".repeat(480_000).as_str()),
             "the oversized message is never truncated"
         );
+    }
+
+    /// The tool loop appends results after the turn's first send: that grown
+    /// request is measured again, not sent as-is.
+    #[tokio::test]
+    async fn a_grown_request_compacts_before_the_next_send() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        let summarizer = ScriptedSummarizer::ok(valid_summary());
+        let mut notices = notices();
+        let mut sink = notice_sink(&mut notices);
+
+        let mut request =
+            ChatRequest::default().append_message(ChatMessage::system("system prompt"));
+        for message in over_budget_history() {
+            request = request.append_message(message);
+        }
+        request = request.append_message(ChatMessage::user("current task"));
+        assert!(
+            crate::agent::budget::estimate_tokens(&request) > 102_400,
+            "the fixture is over the budget"
+        );
+
+        let fitted = runtime.fit_request(request, &summarizer, &mut sink).await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
+
+        assert!(summarizer.calls() >= 2, "chunk calls plus a merge");
+        assert!(
+            notices.iter().any(|notice| notice.contains("mid-turn")),
+            "{notices:?}"
+        );
+        assert_eq!(
+            fitted.messages[0].role,
+            genai::chat::ChatRole::System,
+            "the system row stays first"
+        );
+        assert!(
+            fitted.messages[1]
+                .content
+                .first_text()
+                .is_some_and(|text| text.contains("# SESSION CONTEXT (compacted)")),
+            "the summary enters as the second row"
+        );
+        assert_eq!(
+            fitted
+                .messages
+                .last()
+                .and_then(|message| message.content.first_text()),
+            Some("current task"),
+            "the newest instruction survives the compaction"
+        );
+        assert!(
+            crate::agent::budget::estimate_tokens(&fitted) <= 102_400,
+            "the fitted request is back under the budget"
+        );
+    }
+    /// A summary that leaves the request over the budget is not kept: the older
+    /// turns go, as they do when the summary fails the gate.
+    #[tokio::test]
+    async fn a_summary_that_does_not_fit_drops_the_older_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        let summarizer = ScriptedSummarizer::ok(valid_summary());
+        let mut notices = notices();
+        let mut sink = notice_sink(&mut notices);
+
+        let mut request =
+            ChatRequest::default().append_message(ChatMessage::system("system prompt"));
+        for message in over_budget_history() {
+            request = request.append_message(message);
+        }
+        // One turn bigger than the whole budget: no summary can bring the
+        // request back under it.
+        request = request.append_message(ChatMessage::user("z".repeat(480_000)));
+
+        let fitted = runtime.fit_request(request, &summarizer, &mut sink).await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
+
+        assert!(summarizer.calls() >= 1, "the summary was attempted");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("older turns dropped")),
+            "{notices:?}"
+        );
+        assert!(
+            !fitted.messages.iter().any(|message| message
+                .content
+                .first_text()
+                .is_some_and(|text| text.contains("# SESSION CONTEXT (compacted)"))),
+            "a summary that does not fit is not kept"
+        );
+    }
+
+    /// One or two older rows cannot carry a plan: below the minimum the request
+    /// is sent as it is, never silently trimmed for a summary nobody gets.
+    #[tokio::test]
+    async fn too_few_messages_to_compact_are_sent_as_they_are() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(temp.path());
+        let summarizer = ScriptedSummarizer::ok(valid_summary());
+        let mut notices = notices();
+        let mut sink = notice_sink(&mut notices);
+
+        // Two turns, both huge: only two rows are older than the recent window.
+        let history = vec![
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("z".repeat(480_000)),
+            ChatMessage::user("second question"),
+            ChatMessage::assistant("y".repeat(480_000)),
+        ];
+        let request = runtime
+            .prepare_request(
+                history,
+                &genai::chat::ChatMessage::user("current task"),
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
+
+        assert_eq!(summarizer.calls(), 0, "no summary is requested");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("auto compact skipped")),
+            "{notices:?}"
+        );
+        assert_eq!(
+            request.messages[1].content.first_text(),
+            Some("first question"),
+            "no older turn is dropped"
+        );
+    }
+
+    /// `auto_compact = false` is the user's own context management: nothing is
+    /// summarised and nothing is dropped.
+    #[tokio::test]
+    async fn auto_compact_off_sends_the_request_as_is() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::load(temp.path());
+        config.model = Some("deepseek-chat".to_string());
+        config.system_prompt = Some("system prompt".to_string());
+        config.auto_compact = false;
+        let runtime = AgentRuntime::new(config, WorkspaceSecurity::new(temp.path()));
+        let summarizer = ScriptedSummarizer::ok(valid_summary());
+
+        let mut notices = notices();
+        let mut sink = notice_sink(&mut notices);
+        let request = runtime
+            .prepare_request(
+                over_budget_history(),
+                &genai::chat::ChatMessage::user("current task"),
+                AgentMode::Build,
+                &summarizer,
+                &mut sink,
+            )
+            .await;
+        // The sink holds the only borrow of `notices` until it is dropped.
+        drop(sink);
+
+        assert_eq!(summarizer.calls(), 0, "no summariser call");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("auto_compact is off")),
+            "{notices:?}"
+        );
+        assert!(
+            !request.messages.iter().any(|message| message
+                .content
+                .first_text()
+                .is_some_and(|text| text.contains("# SESSION CONTEXT (compacted)"))),
+            "no summary enters the request"
+        );
+        assert!(
+            crate::agent::budget::estimate_tokens(&request) > 102_400,
+            "the over-budget request is sent as-is"
+        );
+
+        let fitted = runtime
+            .fit_request(request, &summarizer, &mut sink_free())
+            .await;
+        assert_eq!(summarizer.calls(), 0, "the tool loop stays untouched too");
+        assert_eq!(
+            fitted
+                .messages
+                .last()
+                .and_then(|message| message.content.first_text()),
+            Some("current task"),
+            "the newest instruction is still there"
+        );
+    }
+
+    /// A sink that keeps nothing, for a call whose notices this test ignores.
+    fn sink_free() -> impl FnMut(crate::agent::events::AgentEvent) {
+        |_| {}
     }
 }
 

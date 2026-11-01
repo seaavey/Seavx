@@ -7,6 +7,35 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### feat
 
+- The reasoning-effort pickers offer what the model publishes instead of one
+  fixed list: `seavx model`, `seavx setup` and the TUI modal read
+  `reasoning_options[type = effort]` from the same models.dev catalog that
+  answers context windows, and keep the static list (`none`, `minimal`,
+  `medium`, `high`, `highx`, `max`) only for an id the catalog does not know or
+  lists with no effort option of its own.
+  Providers clamp one model differently, so the entry is the union of their
+  levels in menu order. Nothing validates a saved effort against it: a gateway
+  can take a level the catalog does not list.
+- Automatic compaction is a visible step now: the transcript shows the divider
+  `----------------------------- AUTO COMPACT --------------------------------`
+  with the `before → after` estimate under it, and the one that happens inside a
+  tool loop says `(estimated), mid-turn`. A summary nobody sees is a summary
+  nobody can trust. It also refuses to run for nothing: fewer than
+  `MIN_COMPACT_MESSAGES = 4` messages older than the recent window and the
+  request is sent as it is (`auto compact skipped …`) instead of replacing one
+  or two rows with a one-line restatement.
+- `auto_compact` is a config key (default `true`). `/config set auto_compact
+  false` writes `auto_compact = false` as a TOML boolean, and the engine then
+  summarises nothing and drops nothing: the over-budget request goes as it is
+  with `auto_compact is off: N tokens over the M budget` in the transcript.
+  `/config` and `/config get auto_compact` read the same value.
+- A request that grows inside one turn is measured again before every send:
+  the tool loop appends results after `prepare_request` ran, so a long read or
+  build loop could exceed the window with nothing to catch it before the
+  provider refused. The grown request now compacts at the same 80 % budget
+  (the same `AUTO COMPACT` divider, marked `mid-turn`) and falls back to
+  dropping older turns when the summary fails the gate — the system row and the
+  newest turn stay whole.
 - An image on the clipboard is a turn attachment: `Ctrl+V` reads it on a worker
   thread, encodes the pixels to PNG once, refuses anything over 24 MP or 4 MiB,
   dedupes by SHA-256, labels it in the transcript as
@@ -18,13 +47,59 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### breaking
 
+- `/model` and the model picker no longer save anything: they switch the model
+  for the turns that follow and leave the config file's default alone, which only
+  `seavx model [name]` (or `/config set model …`) changes. A run that used to
+  re-point the default now starts from it again next time; the transcript says
+  `Model for this session: …` instead of `Saved to …`.
 - `Esc` no longer exits and `Ctrl+D`/`Ctrl+Q` are not shortcuts any more:
   `Ctrl+C` twice within 1.5 s is the only way out of the TUI. `Esc` still closes
   the ghost, an open menu and the running turn, and twice on an idle prompt it
   clears the line.
+- A config that names no model is refused instead of calling a built-in one.
+  `model` is now optional, `seavx init` writes no `model` key, and a config that
+  relied on the built-in `openai/gpt-4o-mini` fails its first turn with
+  ``no model configured: run `seavx setup` or `seavx model <name>``.
+  `/config`, `/status`, `doctor` and the footer say `not set` instead of an id.
 
 ### fix
 
+- The context window comes from the public models.dev catalog instead of a
+  guess from the model name. `deepseek` meant 128 000 for the whole family, so
+  `DeepSeek-V4.1-Flash` — a 1M window — compacted at 102 400 tokens and refused
+  the rest of it. The catalog (`limit.context` per model name, cached seven days
+  in `.seavx/cache/contexts.json`, refreshed in the background at TUI start and
+  once at the end of `seavx setup`) answers first; the family table stands
+  behind it for ids the catalog does not list, and `(assumed)` now means the
+  catalog missed too. A headless `exec` on a fresh install used to have no cache
+  at all, so the 1M window it was meant to get never arrived.
+- The effort pickers speak the names the config stores: a level the catalog
+  publishes as `low` or `xhigh` is offered as `minimal` or `highx`, one row
+  each. Before, a saved `highx` was not in a menu that said `xhigh`, so the
+  picker opened on `none` and Enter silently downgraded the session.
+- A mid-turn compaction is measured before it is kept: a summary that still
+  leaves the request over the budget drops the older turns instead of being
+  sent, so one oversized turn cannot make every later tool step of the same turn
+  pay for another summary of the same rows.
+- A capacity error with nothing older to fold (`auto_compact = false`, or a
+  window that holds one turn) fails the turn with the provider's message
+  instead of spending the turn's one retry on the request that just failed.
+- The compaction prompt now asks for the headings the gate requires. The gate
+  accepts a summary only when it carries `# Goals`, `# Decisions`, `# Files` and
+  `# Pending`, while the prompt asked for "short headings" and listed six topics
+  — so a summary written as bold labels (`**Goals:**`) or a numbered list failed
+  validation and the older turns were dropped with no summary at all. Both
+  paths (`/compact` and the automatic one) share that prompt, so one prompt now
+  names the four headings verbatim.
+- `save_memory` keeps a release run's memory in `~/.seavx`: project memory is
+  `~/.seavx/MEMORY.md` and preferences `~/.seavx/USER.md`, so a lesson saved in
+  one checkout is there in the next. A `--debug` run keeps both files inside the
+  workspace (`.seavx/MEMORY.md`, `.seavx/USER.md`) instead of writing the real
+  store. Before, a release run wrote `<workspace>/MEMORY.md` — a path `prompt`
+  and `seavx memory` only read as a fallback behind `.seavx/MEMORY.md` and one
+  `.gitignore` does not cover, so a saved lesson surfaced as an untracked file at
+  the repository root and never reached the global store. Prompt injection,
+  `seavx memory`, `/memory` and `seavx doctor` now read the global file too.
 - `seavx setup` re-asks the API key when `/models` answers `401` or `403`: the
   endpoint refused that credential, so the wizard says so and loops back to the
   key prompt instead of offering `Save this endpoint anyway?`. Saving an endpoint
@@ -84,14 +159,6 @@ per landed change; no entry describes behaviour that is not in the code.
   (`seavx setup providers · endpoint (1/3)`, `model (2/3)`, `effort (3/3)`,
   `saved`), and prints the config path from platform components, so Windows shows
   `.seavx` and `config.toml` separated by a backslash.
-
-### breaking
-
-- A config that names no model is refused instead of calling a built-in one.
-  `model` is now optional, `seavx init` writes no `model` key, and a config that
-  relied on the built-in `openai/gpt-4o-mini` fails its first turn with
-  `no model configured: run `seavx setup`or`seavx model <name>``.
-`/config`, `/status`, `doctor`and the footer say`not set` instead of an id.
 
 ## 0.1.3 — 2026-10-30
 

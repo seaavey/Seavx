@@ -30,8 +30,11 @@ layer (`genai`), SQLite sessions, and a checkpoint store `/undo` restores from.
 | `seavx memory`, `seavx skills …` | inspect `MEMORY.md`/`USER.md`; list, install, remove skills |
 | `seavx update [--force]`, `seavx uninstall` | self-update, removal |
 
-`--debug`/`-d` is global: `seavx -d doctor` is valid. Effort values are `none`,
-`minimal`, `medium`, `high`, `highx`, `max`.
+`--debug`/`-d` is global: `seavx -d doctor` is valid. The effort pickers
+(`seavx model`, `seavx setup`, the TUI modal) offer the levels the model
+publishes in the models.dev catalog, and fall back to `none`, `minimal`,
+`medium`, `high`, `highx`, `max` for an id the catalog does not know. A saved
+effort is never refused for being absent from that list.
 
 ## Debug mode decides where the data goes
 
@@ -43,6 +46,12 @@ binary.
 | --- | --- | --- |
 | sessions | `./.seavx/sessions.db` | `~/.seavx/sessions.db` |
 | tracing | `./.seavx/debug.log` | stderr |
+| project memory | `./.seavx/MEMORY.md` | `~/.seavx/MEMORY.md` |
+| user preferences | `./.seavx/USER.md` | `~/.seavx/USER.md` |
+
+Reads are not the write path: prompt injection and `seavx memory` take the
+checkout's `.seavx/MEMORY.md` first, then a legacy root `MEMORY.md`, then the
+global file — so a repro that reuses one store can hide a bug in the other.
 
 A TUI run records the state it resolved in the workspace `.env` as
 `SEAVX_DEBUG=true|false`: created when missing, that one line rewritten in place,
@@ -66,7 +75,10 @@ semantics the table cannot show:
   refused, never saved as a name. In the picker, letters filter (case-insensitive,
   Backspace widens), `ctrl+r` refetches `/models` in the background behind a
   spinner and is ignored while that fetch runs, and the list scrolls with the
-  cursor.
+  cursor. `/model` and both pickers are **session-scoped**: they change the model
+  of the turns that follow and leave the config file alone, so the saved default
+  survives the run. Only `seavx model [name]` (and `/config set model …`) write
+  the file. `/clear` keeps the session's model for the rest of the process.
 
 ## Configuration
 
@@ -89,13 +101,25 @@ override the file. `permitted_actions` lifts kinds from `ask` to `allow`; it
 cannot lift global writes or destructive actions, which always ask. `/config` and
 `seavx model` write atomically, owner-only (`0600`), and never print the key back.
 
-A write that names no file — `/model`, the model picker, `seavx model`, a
-permission approval, `/config set` — lands in the config the loader reads: the
-workspace file when one exists, the global one otherwise. The workspace file
-shadows the global config *entirely*, and these writers never persist `api_key`,
-so one created where none existed leaves the key behind and the next turn dies
-with `ApiKeyEnvNotFound`. `seavx setup` is the deliberate exception: it writes
-the global file by default and this workspace's with `--workspace`.
+Context windows are not a config key: the models.dev catalog answers first,
+cached seven days in `.seavx/cache/contexts.json` (one `limit.context` and one
+`reasoning_options` effort list per model name, matched on the id's tail, so a
+routed `rv/vendor/Model-1017` resolves) and refreshed in the background at TUI
+start and once at the end of `seavx setup`. `doctor` and `exec` read the cache
+and never fetch. An id the catalog misses falls back to the family table —
+`claude`, `gemini`, `nemotron` → 1M; `deepseek`, `glm`, `gpt-4o`, `gpt-4.1`,
+`o3`, `o4` → 128k — and then to 64 000 marked `(assumed)` in the footer and
+`doctor`. The budget is 80 % of whichever answer wins.
+
+A write that names no file — `seavx model`, a permission approval, `/config set`
+— lands in the config the loader reads: the workspace file when one exists, the
+global one otherwise. The workspace file shadows the global config *entirely*,
+and these writers never persist `api_key`, so one created where none existed
+leaves the key behind and the next turn dies with `ApiKeyEnvNotFound`. `seavx
+setup` is the deliberate exception: it writes the global file by default and this
+workspace's with `--workspace`. `/model` is no writer: the session's model is
+carried by the turn request (`TurnRequest::model`), so the file keeps the default
+that `seavx model` wrote.
 
 ## Permissions and safety
 

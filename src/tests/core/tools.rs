@@ -746,3 +746,29 @@ async fn undo_refuses_a_file_the_user_edited_after_the_write() {
         "the newer edit survives the undo"
     );
 }
+
+#[test]
+fn memory_target_follows_the_mode_and_the_target() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let security = WorkspaceSecurity::new(workspace.path());
+
+    let cases = [
+        (None, false, home.path().join(".seavx/MEMORY.md")),
+        (Some("user"), false, home.path().join(".seavx/USER.md")),
+        (None, true, workspace.path().join(".seavx/MEMORY.md")),
+        (Some("user"), true, workspace.path().join(".seavx/USER.md")),
+    ];
+    for (target, debug, expected) in cases {
+        assert_eq!(
+            memory_target_at(Some(home.path()), &security, target, debug).unwrap(),
+            expected,
+            "target {target:?}, debug {debug}"
+        );
+    }
+
+    assert!(
+        memory_target_at(None, &security, None, false).is_err(),
+        "a release run with no home must refuse instead of guessing a path"
+    );
+}

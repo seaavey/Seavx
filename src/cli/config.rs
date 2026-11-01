@@ -31,12 +31,13 @@ pub fn model_label(config: &AgentConfig) -> String {
 }
 
 /// Keys `/config set` and `/config unset` accept.
-pub const WRITABLE_KEYS: [&str; 5] = [
+pub const WRITABLE_KEYS: [&str; 6] = [
     "model",
     "base_url",
     "reasoning_effort",
     "max_turns",
     "system_prompt",
+    "auto_compact",
 ];
 
 /// Message for every attempt to write the API key through `/config`.
@@ -55,6 +56,7 @@ pub enum ConfigKey {
     ApiKey,
     ReasoningEffort,
     Stream,
+    AutoCompact,
     MaxTurns,
     SystemPrompt,
     ToolPermissions,
@@ -69,6 +71,7 @@ impl ConfigKey {
             "api_key" => Some(Self::ApiKey),
             "effort" | "reasoning_effort" => Some(Self::ReasoningEffort),
             "stream" => Some(Self::Stream),
+            "auto_compact" => Some(Self::AutoCompact),
             "max_turns" => Some(Self::MaxTurns),
             "system_prompt" => Some(Self::SystemPrompt),
             "tool_permissions" | "permissions" => Some(Self::ToolPermissions),
@@ -84,6 +87,7 @@ impl ConfigKey {
             Self::ApiKey => "api_key",
             Self::ReasoningEffort => "reasoning_effort",
             Self::Stream => "stream",
+            Self::AutoCompact => "auto_compact",
             Self::MaxTurns => "max_turns",
             Self::SystemPrompt => "system_prompt",
             Self::ToolPermissions => "tool_permissions",
@@ -218,6 +222,11 @@ pub fn render_report(config: &AgentConfig, report: &ConfigReport) -> String {
         ("model", model_label(config), ConfigKey::Model),
         ("reasoning_effort", effort, ConfigKey::ReasoningEffort),
         ("stream", config.stream.to_string(), ConfigKey::Stream),
+        (
+            "auto_compact",
+            config.auto_compact.to_string(),
+            ConfigKey::AutoCompact,
+        ),
         ("base_url", base_url, ConfigKey::BaseUrl),
         ("api_key", api_key, ConfigKey::ApiKey),
         (
@@ -292,6 +301,7 @@ pub fn render_value(config: &AgentConfig, report: &ConfigReport, key: ConfigKey)
             .clone()
             .unwrap_or_else(|| "default".to_string()),
         ConfigKey::Stream => config.stream.to_string(),
+        ConfigKey::AutoCompact => config.auto_compact.to_string(),
         ConfigKey::MaxTurns => config.max_turns.to_string(),
         ConfigKey::SystemPrompt => config
             .system_prompt
@@ -327,6 +337,15 @@ fn origin_label(origin: ConfigOrigin) -> String {
 fn display_path(path: &Path) -> String {
     let text = path.display().to_string();
     text.strip_prefix("./").unwrap_or(&text).to_string()
+}
+
+/// `true`/`on`/`1` and `false`/`off`/`0`, named in the refusal.
+fn canonical_bool(raw: &str, key: &str) -> Result<String, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" => Ok("true".to_string()),
+        "false" | "off" | "0" => Ok("false".to_string()),
+        _ => Err(format!("{key} must be true or false, got: {raw}")),
+    }
 }
 
 /// Validate and canonicalise a value before it can touch the file.
@@ -386,11 +405,8 @@ fn canonical_value(key: ConfigKey, raw: &str) -> Result<String, String> {
                 .map(str::to_string)
                 .ok_or_else(|| format!("invalid reasoning_effort: {raw}"))
         }
-        ConfigKey::Stream => match raw.trim().to_ascii_lowercase().as_str() {
-            "true" | "on" | "1" => Ok("true".to_string()),
-            "false" | "off" | "0" => Ok("false".to_string()),
-            _ => Err(format!("stream must be true or false, got: {raw}")),
-        },
+        ConfigKey::Stream => canonical_bool(raw, "stream"),
+        ConfigKey::AutoCompact => canonical_bool(raw, "auto_compact"),
         ConfigKey::MaxTurns => {
             let turns: u64 = raw
                 .trim()
@@ -405,7 +421,7 @@ fn canonical_value(key: ConfigKey, raw: &str) -> Result<String, String> {
     }
 }
 
-fn canonical_effort(effort: genai::chat::ReasoningEffort) -> Option<&'static str> {
+pub(crate) fn canonical_effort(effort: genai::chat::ReasoningEffort) -> Option<&'static str> {
     use genai::chat::ReasoningEffort;
     match effort {
         ReasoningEffort::Zero => Some("none"),
@@ -435,7 +451,7 @@ pub enum ConfigLoad {
 pub fn set_value(path: &Path, key: ConfigKey, raw: &str) -> Result<String, String> {
     let value = canonical_value(key, raw)?;
     update_config(path, |document| {
-        if key == ConfigKey::Stream {
+        if matches!(key, ConfigKey::Stream | ConfigKey::AutoCompact) {
             // A boolean is written as a TOML boolean, not a string.
             document[key.name()] = toml_edit::value(value == "true");
         } else if key == ConfigKey::MaxTurns {
@@ -567,35 +583,28 @@ pub fn set_api_key(path: &Path, key: &str) -> Result<(), String> {
     })
 }
 
-/// [`set_model_and_effort`] with the repair mode `seavx model` needs.
+/// The pair a write stores, validated and canonical — also what the
+/// session-scoped `/model` needs without touching the file.
+pub fn canonical_model_and_effort(
+    model: &str,
+    effort: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let model = canonical_value(ConfigKey::Model, model)?;
+    let effort = match effort {
+        Some(raw) => Some(canonical_value(ConfigKey::ReasoningEffort, raw)?),
+        None => None,
+    };
+    Ok((model, effort))
+}
+
+/// [`canonical_model_and_effort`] plus the repair mode `seavx model` needs.
 pub fn set_model_and_effort_repairing(
     path: &Path,
     model: &str,
     effort: Option<&str>,
 ) -> Result<Option<PathBuf>, String> {
-    let model = canonical_value(ConfigKey::Model, model)?;
-    let effort = match effort {
-        Some(raw) => Some(canonical_value(ConfigKey::ReasoningEffort, raw)?),
-        None => None,
-    };
+    let (model, effort) = canonical_model_and_effort(model, effort)?;
     update_config_with(path, ConfigLoad::RepairUnparsable, |document| {
-        document["model"] = toml_edit::value(model.clone());
-        if let Some(effort) = &effort {
-            document["reasoning_effort"] = toml_edit::value(effort.clone());
-        }
-        Ok(())
-    })
-}
-
-/// Set the model and, optionally, the reasoning effort as one write.
-pub fn set_model_and_effort(path: &Path, model: &str, effort: Option<&str>) -> Result<(), String> {
-    let model = canonical_value(ConfigKey::Model, model)?;
-    let effort = match effort {
-        Some(raw) => Some(canonical_value(ConfigKey::ReasoningEffort, raw)?),
-        None => None,
-    };
-
-    update_config(path, |document| {
         document["model"] = toml_edit::value(model.clone());
         if let Some(effort) = &effort {
             document["reasoning_effort"] = toml_edit::value(effort.clone());

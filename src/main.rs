@@ -192,6 +192,9 @@ async fn main() -> anyhow::Result<()> {
 
             let security = agent::security::WorkspaceSecurity::new(".");
             let config = agent::engine::AgentConfig::load(security.root());
+            // The turn's budget needs the same window the TUI footer shows; a
+            // missing cache just leaves the family table in charge.
+            agent::models::load_context_catalog(security.root());
             for batch in crate::checkpoint::recover_pending(security.root()).unwrap_or_default() {
                 eprintln!("{}", batch.render());
             }

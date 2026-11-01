@@ -62,6 +62,9 @@ pub async fn run(options: DoctorOptions) -> DoctorReport {
 }
 
 pub async fn run_with_probe(options: DoctorOptions, probe: &dyn EndpointProbe) -> DoctorReport {
+    // `context` must report the window the budget will use: the cached catalog
+    // first, the family table behind it. No network here — doctor reads.
+    crate::agent::models::load_context_catalog(&options.workspace_root);
     let (config, config_report) = AgentConfig::load_with_report_home(
         &options.workspace_root,
         options.home.as_deref(),
@@ -476,7 +479,7 @@ fn session_check(options: &DoctorOptions) -> CheckResult {
 }
 
 fn memory_check(options: &DoctorOptions) -> CheckResult {
-    let found: Vec<String> = project_candidates(&options.workspace_root)
+    let found: Vec<String> = project_candidates(&options.workspace_root, options.home.as_deref())
         .into_iter()
         .chain(user_candidates(
             &options.workspace_root,

@@ -146,6 +146,20 @@ fn a_tool_result_never_leads_the_window() {
 }
 
 #[test]
+fn the_summary_prompt_asks_for_the_headings_the_gate_requires() {
+    use crate::agent::budget::SUMMARY_HEADINGS;
+    use crate::tui::compact::build_summary_prompt;
+
+    let prompt = build_summary_prompt("transcript", None).to_lowercase();
+    for heading in SUMMARY_HEADINGS {
+        assert!(
+            prompt.contains(&format!("`# {heading}")),
+            "{heading} is not named as a required heading: {prompt}"
+        );
+    }
+}
+
+#[test]
 fn a_short_or_headless_summary_is_rejected() {
     use crate::agent::budget::validate_summary;
 

@@ -244,7 +244,22 @@ impl App<'_> {
         true
     }
 
-    /// Switch the model, optionally with a reasoning effort, and persist it.
+    /// Point this session at a model, leaving the saved default alone.
+    pub fn switch_model(&mut self, model: String, effort: Option<String>) {
+        self.config.model = Some(model.clone());
+        if let Some(effort) = &effort {
+            self.config.reasoning_effort = Some(effort.clone());
+        }
+        self.set_text(format!(
+            "Model for this session: {model}\nReasoning effort: {}\nThe saved default is unchanged; `seavx model <name>` sets it.",
+            self.config.reasoning_effort.as_deref().unwrap_or("none")
+        ));
+        self.scroll = 0;
+        self.auto_scroll = true;
+    }
+
+    /// Switch the model for this session; the config file keeps the default
+    /// that `seavx model` writes.
     pub fn set_model(&mut self, target: &str, effort: Option<&str>) {
         let models = cached_models(self);
         let resolved_model = match resolve_model_target(&models, target) {
@@ -274,32 +289,10 @@ impl App<'_> {
             return;
         }
 
-        // The active config, not a fresh workspace file: one would shadow the
-        // global config and drop its api_key.
-        let config_path = crate::cli::config::active_config_path(std::path::Path::new("."));
-        // One write: the model and the effort change together or not at all.
-        let mut errors = Vec::new();
-        if let Err(error) =
-            crate::cli::config::set_model_and_effort(&config_path, &resolved_model, effort)
-        {
-            errors.push(error);
+        match crate::cli::config::canonical_model_and_effort(&resolved_model, effort) {
+            Ok((model, effort)) => self.switch_model(model, effort),
+            Err(error) => self.push_notice(error),
         }
-
-        self.config = crate::agent::engine::AgentConfig::load(std::path::Path::new("."));
-
-        let mut message = format!(
-            "Switched model to: {}\nEffort: {}\nSaved to {}",
-            self.config.model.as_deref().unwrap_or("not set"),
-            self.config.reasoning_effort.as_deref().unwrap_or("none"),
-            config_path.display()
-        );
-        for error in errors {
-            message.push_str(&format!("\n{error}"));
-        }
-
-        self.set_text(message);
-        self.scroll = 0;
-        self.auto_scroll = true;
     }
 }
 

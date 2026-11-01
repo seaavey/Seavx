@@ -72,7 +72,7 @@ pub enum ModalSelection {
     },
     Effort {
         model: String,
-        options: Vec<&'static str>,
+        options: Vec<String>,
         selected: usize,
     },
     /// Prompt presets: the name list, the preview of each one, and the search box.
@@ -203,6 +203,11 @@ pub struct TurnRequest {
     pub cancel: crate::agent::cancel::CancelToken,
     /// Images the turn carries; each becomes a `Binary` part of the user row.
     pub attachments: Vec<crate::session::Attachment>,
+    /// The model this session runs. `/model` sets it in memory only, so the
+    /// worker cannot take the file's default instead.
+    pub model: Option<String>,
+    /// The effort that goes with it, when the session has one.
+    pub effort: Option<String>,
 }
 
 /// What Enter does with the line in the prompt.

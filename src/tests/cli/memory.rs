@@ -14,6 +14,17 @@ fn workspace_memory_wins_over_root_memory() {
 }
 
 #[test]
+fn global_memory_is_read_when_the_checkout_has_none() {
+    let temp = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".seavx")).unwrap();
+    fs::write(home.path().join(".seavx/MEMORY.md"), "global memory").unwrap();
+
+    let report = build_report_with_home(temp.path(), Some(home.path()));
+    assert_eq!(report.project.unwrap().content, "global memory");
+}
+
+#[test]
 fn truncates_long_files_on_a_char_boundary() {
     let temp = tempdir().unwrap();
     fs::create_dir_all(temp.path().join(".seavx")).unwrap();

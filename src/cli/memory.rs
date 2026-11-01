@@ -30,12 +30,17 @@ pub struct MemoryReport {
     pub user: Option<MemoryFile>,
 }
 
-/// Project memory candidates, highest precedence first.
-pub(crate) fn project_candidates(workspace: &Path) -> Vec<PathBuf> {
-    vec![
+/// Project memory candidates, highest precedence first: the checkout's own file,
+/// then a legacy root `MEMORY.md`, then the global `~/.seavx/MEMORY.md`.
+pub(crate) fn project_candidates(workspace: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = vec![
         workspace.join(".seavx/MEMORY.md"),
         workspace.join("MEMORY.md"),
-    ]
+    ];
+    if let Some(home) = home {
+        candidates.push(home.join(".seavx/MEMORY.md"));
+    }
+    candidates
 }
 
 /// User preference candidates, highest precedence first.
@@ -53,7 +58,7 @@ pub fn build_report(workspace: &Path) -> MemoryReport {
 
 /// Testable core: `home` is injected so tests never read the real home.
 pub fn build_report_with_home(workspace: &Path, home: Option<&Path>) -> MemoryReport {
-    let project = project_candidates(workspace)
+    let project = project_candidates(workspace, home)
         .iter()
         .find_map(|path| read_memory_file(path));
     let user = user_candidates(workspace, home)
@@ -128,14 +133,14 @@ pub fn render_text(report: &MemoryReport, view: MemoryView) -> String {
         sections.push(render_file_section(
             "Project memory",
             report.project.as_ref(),
-            ".seavx/MEMORY.md",
+            "~/.seavx/MEMORY.md",
         ));
     }
     if matches!(view, MemoryView::All | MemoryView::User) {
         sections.push(render_file_section(
             "User preferences",
             report.user.as_ref(),
-            ".seavx/USER.md",
+            "~/.seavx/USER.md",
         ));
     }
     if matches!(view, MemoryView::Path) {
@@ -179,7 +184,8 @@ fn render_paths(report: &MemoryReport) -> String {
         ));
     };
 
-    for path in project_candidates(Path::new(".")) {
+    let home = crate::home::dir();
+    for path in project_candidates(Path::new("."), home.as_deref()) {
         push(
             &path,
             report
@@ -189,18 +195,18 @@ fn render_paths(report: &MemoryReport) -> String {
         );
     }
     if let Some(project) = &report.project
-        && !project_candidates(Path::new(".")).contains(&project.path)
+        && !project_candidates(Path::new("."), home.as_deref()).contains(&project.path)
     {
         push(&project.path, true);
     }
-    for path in user_candidates(Path::new("."), crate::home::dir().as_deref()) {
+    for path in user_candidates(Path::new("."), home.as_deref()) {
         push(
             &path,
             report.user.as_ref().is_some_and(|file| file.path == path),
         );
     }
     if let Some(user) = &report.user
-        && !user_candidates(Path::new("."), crate::home::dir().as_deref()).contains(&user.path)
+        && !user_candidates(Path::new("."), home.as_deref()).contains(&user.path)
     {
         push(&user.path, true);
     }

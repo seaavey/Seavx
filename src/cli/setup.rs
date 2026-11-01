@@ -71,6 +71,8 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
         .ok()
         .and_then(|content| toml::from_str(&content).ok())
         .unwrap_or_else(|| crate::agent::engine::AgentConfig::load(std::path::Path::new(".")));
+    // The effort menu reads what the TUI already cached; this never fetches.
+    crate::agent::models::load_context_catalog(std::path::Path::new("."));
 
     let mask = |key: &str| {
         if key.is_empty() {
@@ -201,10 +203,7 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
     rows.push(("model", model.clone()));
     screen(&config_path, EFFORT_STEP, &rows);
     let effort = if io::stdin().is_terminal() {
-        let levels: Vec<String> = crate::agent::engine::EFFORT_LEVELS
-            .iter()
-            .map(|level| (*level).to_string())
-            .collect();
+        let levels = crate::agent::engine::effort_levels(Some(&model));
         let current = config.reasoning_effort.clone().unwrap_or_default();
         let current = if current.is_empty() {
             "none".to_string()
@@ -271,6 +270,14 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
             .exists()
     {
         println!("note: ./.seavx/config.toml overrides this file in the current workspace.");
+    }
+
+    // The budget and the effort menus read this cache, and setup is the first
+    // command a new install runs: fetch it here so a headless `exec` has one.
+    if let Err(error) =
+        crate::agent::models::refresh_context_catalog(std::path::Path::new(".")).await
+    {
+        tracing::warn!(%error, "context catalog not refreshed");
     }
 
     Ok(())
