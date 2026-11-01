@@ -86,12 +86,28 @@ From a checkout:
 cargo install --path .
 ```
 
-Every push to master publishes a build tagged with its commit:
+Every push to master publishes a build tagged with its commit, for linux
+x86_64, macOS arm64 and windows x86_64:
 
 ```bash
 curl -sI https://cdn.seavx.com/latest/linux/x86_64   # 302 to the newest linux build
-curl -O https://cdn.seavx.com/builds/<sha>/seavx-linux-x86_64
+curl -O https://cdn.seavx.com/builds/<sha>/<sha256>/seavx-linux-x86_64
 ```
+
+An installed binary updates itself from the same origin:
+
+```bash
+seavx update                   # newest tagged release
+seavx update --channel edge    # newest master build
+```
+
+Before anything is replaced, the client verifies the minisign signature over the
+release pointer, that the pointer is for the requested channel and this
+platform, that its route names the digest, the `sha256` of the bytes it
+downloaded, and that the candidate itself reports the pointer's version.
+`--force` only skips the version ordering; a failure leaves the installed binary
+untouched. The release signing key is not published yet, so `seavx update`
+refuses with `no pinned update key` on this branch.
 
 ## Configure a provider
 

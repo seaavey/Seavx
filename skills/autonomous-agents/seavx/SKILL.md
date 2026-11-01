@@ -28,13 +28,38 @@ layer (`genai`), SQLite sessions, and a checkpoint store `/undo` restores from.
 | `seavx doctor [--offline]` | environment and health report |
 | `seavx init`, `seavx setup providers` | write a config file (`seavx init` → workspace, `seavx setup [--workspace]` → global by default); ask for base URL, key, model, effort; a `401`/`403` from `/models` re-asks the key instead of saving the endpoint |
 | `seavx memory`, `seavx skills …` | inspect `MEMORY.md`/`USER.md`; list, install, remove skills |
-| `seavx update [--force]`, `seavx uninstall` | self-update, removal |
+| `seavx update [--force] [--channel stable\|edge]`, `seavx uninstall` | self-update, removal (`uninstall` asks whether to keep data) |
 
 `--debug`/`-d` is global: `seavx -d doctor` is valid. The effort pickers
 (`seavx model`, `seavx setup`, the TUI modal) offer the levels the model
 publishes in the models.dev catalog, and fall back to `none`, `minimal`,
 `medium`, `high`, `highx`, `max` for an id the catalog does not know. A saved
 effort is never refused for being absent from that list.
+
+## Updates
+
+`seavx update` installs the build the CDN's signed pointer names. The channel is
+`stable` by default — the pointer at `latest/<os>/<arch>.json` — and
+`--channel edge` reads `edge/<os>/<arch>.json`, the newest master build. The
+client verifies the pointer's minisign signature over its canonical
+`SEAVX-UPDATE-v1` bytes against keys compiled into the binary first, then the
+signed channel, the target it was built for, the `builds/{sha}/{sha256}/{binary}`
+route and the version ordering, then the download's `sha256`, then the
+candidate's own `--version` output, and only then renames it over the binary. A
+failure at any point leaves the installed binary byte-identical and deletes the
+temp file; `--force` relaxes ordering only, never a check.
+
+An empty key set refuses, so a build from this branch answers
+`no pinned update key` — a pointer that is not signed by a pinned key answers
+`signature: not signed by a pinned update key`. Do not "fix" that by disabling
+the check.
+
+`SEAVX_UPDATE_BASE` moves the origin for a test server; it changes no check, and
+both installers read it too. `install.sh` and `install.ps1` pin the same key and
+refuse while it is empty. With a key present but `minisign` not on `PATH`, they
+warn and verify the checksum only — that installer run is not authenticated,
+which is why a machine that installs this way should also run `seavx update`
+once a pinned build exists.
 
 ## Debug mode decides where the data goes
 

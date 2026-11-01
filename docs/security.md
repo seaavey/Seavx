@@ -41,3 +41,32 @@
   - `ask_user`: One structured question (single, multi, or free text) written to the store before it is shown. The turn pauses: no later tool call runs and no provider request starts until the answer arrives. Answer, skip and cancel each resolve once and produce exactly one correlated tool result; a restart restores the open question instead of inventing an interrupted result. Headless `exec` has no human, so it returns an explicit unavailable result instead of waiting.
 - **Batched edits**: one `apply_patch` call writes all its files or none. Each file is capped at 16 MB, a batch at 64 files and 128 MB of staged bytes; the checkpoint store keeps the newest 200 batches and never evicts a live one. Batch atomicity holds while the process lives; a crash is reported at the next start (`batch interrupted: …`) and undone with `/undo`. Nothing is rolled back automatically. A journal that cannot be appended after a rename is a commit failure, not a staging one: the files already renamed are put back and the error says which. A checkpoint whose manifest can no longer be read is reported (`batch checkpoint … is unreadable`) instead of being skipped.
 - **Autonomous Self-Improvement**: Post-task workflow evaluator with ≥ 75% confidence singularity gate, persisting reusable workflows to `.seavx/skills/`. Skills load from four roots in order — `.seavx/skills`, the repo's own `skills/`, `~/.seavx/skills`, `~/.agents/skills` — and a name found earlier shadows the same name later.
+
+## Updates
+
+`seavx update` installs the build a release pointer names, and it accepts nothing that pointer did not sign. The pointer is a JSON object at `latest/<os>/<arch>.json` for the stable channel and `edge/<os>/<arch>.json` for master builds; `--channel` picks which one, stable by default. The client checks these in order and stops at the first failure:
+
+- **Signature.** The pointer's minisign signature must verify over the canonical `SEAVX-UPDATE-v1` bytes — `channel`, `target`, `sha`, `key`, `version`, `built_at`, `sha256`, in that fixed order with a trailing newline — against a key compiled into the binary. The set is a list so a rotation adds a second entry; a pointer matching any entry is accepted. The bytes are rebuilt from the validated fields, never re-serialised from the incoming JSON, so a field that parses differently than it signs cannot slip through.
+- **Channel and target.** Both must be the ones requested and the platform this process was compiled for (`linux-x86_64`, `windows-x86_64`, `macos-arm64`). A pointer signed for another channel or target is refused before its download route is fetched.
+- **Route.** `key` must be exactly `builds/{sha}/{sha256}/{binary}`, so the download path is the one the digest names rather than one that merely starts with it.
+- **Ordering.** A lower version is refused as a downgrade unless `--force`; an equal version with a different commit is a newer build of the same version. A build made outside a git checkout records no commit, and then the version stands alone.
+- **Digest.** The download streams into a temp file beside the binary, and its SHA-256 must equal the pointer's `sha256`.
+- **Probe.** The downloaded file is run with `--version` and must report the pointer's version — bytes with the right hash still have to be the build that was signed.
+
+Only then is the temp file renamed over the binary. A failure at any step leaves the installed binary byte-identical and removes the temp file. `--force` bypasses the version ordering and nothing else: verification, channel, target, route, digest and probe still run. An update that replaces nothing prints what it compared; a successful one prints `signature ok` / `checksum ok` and the path.
+
+The URL a pointer was fetched from proves nothing on its own — the client trusts the channel in the signed bytes. Until the first stable tag, master therefore also writes `latest-*` signed for the stable channel, so the default channel has something to verify; after that, CI reads the channel already stored there and leaves a stable pointer alone.
+
+**Not yet pinned.** `PINNED_KEYS` is empty in this branch because the release signing key does not exist yet, and an empty key set refuses rather than falling back to the checksum. So `seavx update` fails with `no pinned update key` until the key is published and compiled in. Nothing here should be read as a working update path today.
+
+**The installers are not the client.** `install.sh` and `install.ps1` pin the same key, rebuild the same canonical bytes and check channel, target, route shapes and digest, staging beside the binary and renaming into place. They also pin an empty key today: both refuse and print the TODO instead of installing. With a key present but `minisign` absent from `PATH`, they print a warning and verify the checksum only — and a checksum that arrives from an unsigned pointer authenticates nothing. An installer run without `minisign` is not authenticated.
+
+**`SEAVX_UPDATE_BASE`** moves the CDN origin, in the client and in both installers. It is a test seam: it changes where the pointer is fetched from and no check that the pointer must pass. Serving fixtures from a local server exercises the same verification as production.
+
+**What an update does not prove:**
+
+- A compromised release signing key, or a compromised CI run, can sign any pointer and any binary. The pinned key is the whole trust anchor; rotating it is the only remedy and it reaches users through a new binary.
+- A machine that is already compromised is out of scope: the client, the temp file beside the binary and the binary itself are all writable by whoever owns the account.
+- An older, validly signed pointer can be replayed. The pointer carries `built_at` but no expiry and no counter, so a stale one for a higher version still verifies; there is no freshness check to fail.
+- The edge channel has no same-version freshness guarantee: master builds share one unreleased version, and an edge pointer for a different commit is installed without asking which commit is newer — so a stale pointer can move you to an older master build.
+- The installers are unauthenticated when `minisign` is absent, as above; and their source-build fallback (`cargo build --release`) verifies nothing at all.
