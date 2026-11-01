@@ -73,6 +73,10 @@ mod end_to_end {
     /// The route both fixture pointers sign for their artifact.
     const ARTIFACT: &str = "builds/06a4060/81ce1245c381cf69a80d627853806331651fed06808598e34d8af628102ea0eb/seavx-linux-x86_64";
 
+    /// Installs run one at a time: each one execs a freshly written file, and two
+    /// in flight make `spawn` fail with `ETXTBSY` on the sibling's open handle.
+    static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn bytes(name: &str) -> Vec<u8> {
         std::fs::read(format!("{FIXTURES}/{name}")).unwrap()
     }
@@ -189,6 +193,7 @@ mod end_to_end {
 
     #[tokio::test]
     async fn an_up_to_date_binary_is_left_alone() {
+        let _install = INSTALL.lock().await;
         let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
 
         install(
@@ -209,6 +214,7 @@ mod end_to_end {
     #[tokio::test]
     async fn an_unwritable_install_directory_fails_and_leaves_the_binary_alone() {
         use std::os::unix::fs::PermissionsExt;
+        let _install = INSTALL.lock().await;
 
         let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
         std::fs::set_permissions(fixture.dir.path(), std::fs::Permissions::from_mode(0o555))
@@ -234,8 +240,40 @@ mod end_to_end {
             message.contains(&fixture.dir.path().display().to_string()),
             "{message}"
         );
-        assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
         assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
+    /// The guard's job at a late failure: the replace target is a directory, so a
+    /// real temp file exists on disk when `replace_exe` fails.
+    #[tokio::test]
+    async fn a_failed_replace_leaves_no_temp_file() {
+        let _install = INSTALL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("seavx");
+        std::fs::create_dir(&exe).unwrap();
+        let (base, server, requests) = serve(stable_routes()).await;
+        let fixture = Fixture {
+            dir,
+            exe,
+            base,
+            requests,
+            _server: server,
+        };
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("replace"), "{error}");
+        assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
+        assert!(fixture.exe.is_dir(), "the target is untouched");
     }
 
     /// An executable shell script in `dir`.
@@ -271,6 +309,7 @@ mod end_to_end {
 
     #[tokio::test]
     async fn a_probe_that_disagrees_with_the_manifest_is_refused() {
+        let _install = INSTALL.lock().await;
         // Signed for 0.9.9 over bytes that report 0.1.3: the digest is right, the
         // build is not the one the pointer names.
         let mut routes = stable_routes();
@@ -300,8 +339,10 @@ mod end_to_end {
         assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
     }
 
+    /// `--force` relaxes the version ordering and nothing else.
     #[tokio::test]
-    async fn a_forced_update_skips_ordering_only() {
+    async fn force_does_not_skip_verification() {
+        let _install = INSTALL.lock().await;
         let mut routes = stable_routes();
         routes.insert(
             STABLE_POINTER.to_string(),
@@ -326,7 +367,50 @@ mod end_to_end {
     }
 
     #[tokio::test]
+    async fn a_forced_update_installs_an_up_to_date_build() {
+        let _install = INSTALL.lock().await;
+        let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
+
+        install(
+            true,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.3"),
+            &[key()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fixture.installed(), bytes("fake-artifact.sh"));
+        assert_eq!(fixture.pointer_requests(), 2, "pointer, then artifact");
+        assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
+    }
+
+    #[tokio::test]
+    async fn a_forced_downgrade_installs_the_older_build() {
+        let _install = INSTALL.lock().await;
+        let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
+
+        install(
+            true,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.2.0"),
+            &[key()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fixture.installed(), bytes("fake-artifact.sh"));
+        assert_eq!(fixture.pointer_requests(), 2, "pointer, then artifact");
+        assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
+    }
+
+    #[tokio::test]
     async fn a_downgrade_is_refused_without_force() {
+        let _install = INSTALL.lock().await;
         let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
 
         let error = install(
@@ -355,6 +439,7 @@ mod end_to_end {
 
     #[tokio::test]
     async fn a_pointer_for_another_target_is_refused_before_any_download() {
+        let _install = INSTALL.lock().await;
         let mut routes = stable_routes();
         routes.insert(EDGE_POINTER.to_string(), bytes("edge.json"));
         let fixture = Fixture::new(routes, b"old binary\n").await;
@@ -383,6 +468,7 @@ mod end_to_end {
 
     #[tokio::test]
     async fn a_pointer_for_another_channel_is_refused_before_any_download() {
+        let _install = INSTALL.lock().await;
         let mut routes = stable_routes();
         routes.insert(STABLE_POINTER.to_string(), bytes("edge.json"));
         let fixture = Fixture::new(routes, b"old binary\n").await;
@@ -407,8 +493,41 @@ mod end_to_end {
         assert_eq!(fixture.installed(), b"old binary\n");
     }
 
+    /// The signature is checked before the channel binding: a pointer for the
+    /// wrong channel whose signature is also broken must be refused as unsigned.
+    #[tokio::test]
+    async fn a_wrong_channel_pointer_with_a_broken_signature_is_refused_as_unsigned() {
+        let _install = INSTALL.lock().await;
+        let mut edge: serde_json::Value = serde_json::from_slice(&bytes("edge.json")).unwrap();
+        edge["version"] = "0.1.4".into();
+        let mut routes = stable_routes();
+        routes.insert(STABLE_POINTER.to_string(), edge.to_string().into_bytes());
+        let fixture = Fixture::new(routes, b"old binary\n").await;
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("signature"), "{message}");
+        assert!(
+            !message.contains("channel"),
+            "the binding was checked before the signature: {message}"
+        );
+        assert_eq!(fixture.pointer_requests(), 1);
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
     #[tokio::test]
     async fn an_unsigned_pointer_is_refused() {
+        let _install = INSTALL.lock().await;
         let mut routes = stable_routes();
         routes.insert(
             STABLE_POINTER.to_string(),
@@ -436,6 +555,7 @@ mod end_to_end {
 
     #[tokio::test]
     async fn a_modified_pointer_is_refused() {
+        let _install = INSTALL.lock().await;
         let mut routes = stable_routes();
         routes.insert(
             STABLE_POINTER.to_string(),
@@ -465,6 +585,7 @@ mod end_to_end {
 
     #[tokio::test]
     async fn a_tampered_artifact_leaves_the_binary_and_no_temp_file() {
+        let _install = INSTALL.lock().await;
         let mut routes = stable_routes();
         routes.insert(
             ARTIFACT.to_string(),
@@ -490,6 +611,7 @@ mod end_to_end {
 
     #[tokio::test]
     async fn a_signed_pointer_installs_the_artifact() {
+        let _install = INSTALL.lock().await;
         let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
 
         install(

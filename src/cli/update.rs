@@ -96,7 +96,7 @@ async fn install(
     // pointer failing it cannot carry a valid signature.
     if !manifest.key_matches_route() {
         anyhow::bail!(
-            "pointer: signed key {} should be builds/{}/{}/{}",
+            "{pointer_url}: signed key {} should be builds/{}/{}/{}",
             manifest.key,
             manifest.sha,
             manifest.sha256,
@@ -119,6 +119,10 @@ async fn install(
                 manifest.version
             );
         }
+        Ordering::SameVersionNewCommit => println!(
+            "A newer build of v{} is available ({}).",
+            current.version, manifest.sha
+        ),
         _ => {}
     }
 
@@ -171,7 +175,8 @@ async fn install(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| anyhow::anyhow!("cannot chmod {}: {error}", temp.display()))?;
     }
 
     // The downloaded file is run to prove it is the build the pointer signed,
@@ -210,24 +215,43 @@ async fn install(
     Ok(())
 }
 
-/// Run the candidate with `--version`, killing it if it hangs: a stuck probe must
-/// not hold the temp file open when the guard tries to remove it.
+/// Run the candidate with `--version`, killing it if it hangs. The child is always
+/// reaped before this returns: the caller deletes the temp file it runs from, and
+/// Windows refuses that while the process still exists.
 async fn probe_exe(bin: &Path, timeout: Duration) -> anyhow::Result<String> {
-    let mut command = tokio::process::Command::new(bin);
-    command.arg("--version").kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("did not answer --version within {timeout:?}"))??;
-    if !output.status.success() {
+    use tokio::io::AsyncReadExt;
+
+    let mut child = tokio::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        // A dropped child is killed; the timeout arm below still waits for it.
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            // Kill then wait: `kill_on_drop` alone closes the handle without
+            // waiting, leaving the process alive to hold the temp file.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(anyhow::anyhow!(
+                "did not answer --version within {timeout:?}"
+            ));
+        }
+    };
+    if !status.success() {
         anyhow::bail!(
             "--version exited with {}",
-            output
-                .status
+            status
                 .code()
                 .map_or_else(|| "a signal".to_string(), |code| code.to_string())
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    // Read after the exit: the pipe is at EOF, so this cannot block.
+    let mut output = Vec::new();
+    stdout.read_to_end(&mut output).await?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 /// The temp path next to the binary, removed on every failure path unless kept.
