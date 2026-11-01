@@ -113,8 +113,9 @@ cannot lift global writes or destructive actions, which always ask. `/config` an
 
 Context windows are not a config key: the models.dev catalog answers first,
 cached seven days in `.seavx/cache/contexts.json` (one `limit.context` and one
-`reasoning_options` effort list per model name, matched on the id's tail, so a
-routed `rv/vendor/Model-1017` resolves) and refreshed in the background at TUI
+`reasoning_options` effort list per model name, matched on the id's tail with
+every separator dropped, so a routed `rv/vendor/Model-1017` resolves and
+`v4.1`/`v4-1`/`V4_1` are one name) and refreshed in the background at TUI
 start and once at the end of `seavx setup`. `doctor` and `exec` read the cache
 and never fetch. An id the catalog misses falls back to the family table —
 `claude`, `gemini`, `nemotron` → 1M; `deepseek`, `glm`, `gpt-4o`, `gpt-4.1`,

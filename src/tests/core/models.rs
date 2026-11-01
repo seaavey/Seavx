@@ -104,22 +104,31 @@ fn the_catalog_keys_on_the_model_tail_and_keeps_the_largest_window() {
 
     let windows = catalog_windows(&json);
     assert_eq!(
-        windows.get("deepseek-v4.1-flash-1017").copied(),
+        windows.get("deepseekv41flash1017").copied(),
         Some(1_048_576)
     );
     assert_eq!(
-        catalog_windows(&json).get("qwen3.8-27b").copied(),
+        catalog_windows(&json).get("qwen3827b").copied(),
         Some(120_000),
         "one model, two provider clamps: the largest window wins, and the `:free` suffix is not part of the name"
     );
-    assert!(!windows.contains_key("no-limit"));
+    assert!(!windows.contains_key("nolimit"));
     assert!(
-        !windows.contains_key("zero-limit"),
+        !windows.contains_key("zerolimit"),
         "a zero window is no window"
     );
     assert_eq!(
         window_key("rv/deepseek-ai/DeepSeek-V4.1-Flash-1017"),
-        "deepseek-v4.1-flash-1017"
+        "deepseekv41flash1017",
+        "no separator survives the key: one gateway writes `v4.1`, another `v4-1`"
+    );
+    assert_eq!(
+        window_key("deepseek-v4-1-flash-1017:free"),
+        "deepseekv41flash1017"
+    );
+    assert_eq!(
+        window_key("deepseek_v4_1_flash_1017"),
+        "deepseekv41flash1017"
     );
 }
 
@@ -128,9 +137,14 @@ fn the_cached_catalog_answers_a_gateway_id_and_expires_after_a_week() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path().join(".seavx/cache");
     std::fs::create_dir_all(&dir).unwrap();
-    let windows = [("deepseek-v4.1-flash-1017".to_string(), 1_048_576)]
-        .into_iter()
-        .collect();
+    // Two gateway spellings of one model, as a cache written before the key
+    // ignored separators holds them.
+    let windows = [
+        ("deepseek-v4-1-flash-1017".to_string(), 500_000),
+        ("deepseek-v4.1-flash-1017".to_string(), 1_048_576),
+    ]
+    .into_iter()
+    .collect();
     let efforts = [(
         "deepseek-v4.1-flash-1017".to_string(),
         models(&["low", "high", "max"]),
@@ -155,7 +169,7 @@ fn the_cached_catalog_answers_a_gateway_id_and_expires_after_a_week() {
     assert_eq!(
         catalog_context("rv/deepseek-ai/DeepSeek-V4.1-Flash-1017"),
         Some(1_048_576),
-        "the gateway lists a routed id; the catalog knows the model behind it"
+        "the gateway lists a routed id: both spellings of one model answer, window maxed"
     );
     assert_eq!(
         catalog_context("deepseek-chat"),
@@ -239,18 +253,18 @@ fn the_catalog_keeps_the_effort_levels_a_model_accepts() {
 
     let levels = catalog_effort_levels(&json);
     assert_eq!(
-        levels.get("deepseek-v4.1-flash-1017"),
+        levels.get("deepseekv41flash1017"),
         Some(&models(&["none", "low", "high", "xhigh", "max"])),
         "two gateways clamp one model differently: the union wins, in menu order"
     );
     assert_eq!(
-        levels.get("qwen3.8-27b"),
+        levels.get("qwen3827b"),
         Some(&models(&["none", "low", "medium", "high", "xhigh", "max"])),
         "`default` is not a level, and a budget option is not one either"
     );
     assert!(
-        !levels.contains_key("toggle-only") || levels["toggle-only"].is_empty(),
+        !levels.contains_key("toggleonly") || levels["toggleonly"].is_empty(),
         "a model with no effort option stays out, so the static list answers"
     );
-    assert!(!levels.contains_key("no-options"));
+    assert!(!levels.contains_key("nooptions"));
 }

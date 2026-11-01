@@ -16,8 +16,9 @@ declared impossible.
 
 - The catalog is `https://models.dev/api.json` reduced to one `limit.context`
   per model name, cached seven days in `.seavx/cache/contexts.json`. A routed
-  id (`rv/deepseek-ai/DeepSeek-V4.1-Flash-1017`) is matched on its tail, so the
-  name a gateway lists does not have to be the name the catalog uses. A stale
+  id (`rv/deepseek-ai/DeepSeek-V4.1-Flash-1017`) is matched on its tail with
+  every separator dropped, so the name a gateway lists does not have to be the
+  name the catalog uses: `v4.1`, `v4-1` and `V4_1` are one model. A stale
   cache refreshes in the background at TUI start, and `seavx setup` fetches it
   once at the end; `seavx exec` and `doctor` never fetch, they read what is
   cached.

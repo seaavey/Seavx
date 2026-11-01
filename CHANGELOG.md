@@ -80,6 +80,13 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- Catalog lookups ignore the separators a gateway spells a model with:
+  `deepseek-v4-1-flash-1017`, `deepseek-v4.1-flash-1017:free` and a routed
+  `rv/deepseek-ai/DeepSeek-V4.1-Flash-1017` are one key, so a gateway that
+  writes `v4-1` for a model the catalog writes `v4.1` no longer loses the
+  context window and the effort levels to the fallback. A cache written under
+  the old keys is re-keyed on load instead of waiting a week for the refresh,
+  and two spellings of one model merge: larger window, union of the levels.
 - The context window comes from the public models.dev catalog instead of a
   guess from the model name. `deepseek` meant 128 000 for the whole family, so
   `DeepSeek-V4.1-Flash` — a 1M window — compacted at 102 400 tokens and refused

@@ -245,11 +245,18 @@ fn efforts() -> &'static RwLock<BTreeMap<String, Vec<String>>> {
     EFFORTS.get_or_init(|| RwLock::new(BTreeMap::new()))
 }
 
-/// The key a model id is looked up by: `rv/vendor/DeepSeek-V4.1-Flash-1017` and
-/// `amd/deepseek-v4.1-flash-1017:free` are one model to the catalog.
+/// The key a model id is looked up by: `rv/vendor/DeepSeek-V4.1-Flash-1017`,
+/// `deepseek-v4-1-flash-1017` and `amd/DeepSeek-V4_1-Flash-1017:free` are one
+/// model to the catalog. Gateways disagree on the separators, so none survives.
 fn window_key(id: &str) -> String {
     let tail = id.rsplit('/').next().unwrap_or(id);
-    tail.split(':').next().unwrap_or(tail).trim().to_lowercase()
+    tail.split(':')
+        .next()
+        .unwrap_or(tail)
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// The window the catalog publishes for this id. `None` means it does not know
@@ -287,11 +294,31 @@ pub fn load_context_catalog(root: &Path) -> bool {
     let Ok(cache) = serde_json::from_str::<ContextCatalog>(&text) else {
         return true;
     };
+    // A cache written before the key ignored separators holds both spellings
+    // (`deepseek-v4-1-flash` and `deepseek-v4.1-flash`), so it is re-keyed
+    // rather than thrown away: one refresh per spelling would be a week of the
+    // static list. Two spellings of one model merge — larger window, union of
+    // the levels.
     if let Ok(mut installed) = windows().write() {
-        *installed = cache.windows;
+        installed.clear();
+        for (key, window) in &cache.windows {
+            let entry = installed.entry(window_key(key)).or_insert(*window);
+            *entry = (*entry).max(*window);
+        }
     }
     if let Ok(mut installed) = efforts().write() {
-        *installed = cache.efforts.clone();
+        installed.clear();
+        for (key, levels) in &cache.efforts {
+            let entry = installed.entry(window_key(key)).or_default();
+            for level in levels {
+                if !entry.contains(level) {
+                    entry.push(level.clone());
+                }
+            }
+        }
+        for list in installed.values_mut() {
+            list.sort_by_key(|level| effort_rank(level).unwrap_or(u8::MAX));
+        }
     }
     // A cache written before the catalog kept effort levels makes the picker
     // fall back to the static list; one refresh fills it.
