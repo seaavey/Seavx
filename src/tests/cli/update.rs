@@ -589,6 +589,39 @@ mod end_to_end {
         assert_eq!(fixture.installed(), b"old binary\n");
     }
 
+    /// A hostile CDN's cheapest attack: a body nobody can hold. The cap trips
+    /// while reading, before the body is parsed, so nothing downstream is asked.
+    #[tokio::test]
+    async fn an_oversized_pointer_is_refused_before_any_download() {
+        let _install = INSTALL.lock().await;
+        let mut routes = stable_routes();
+        routes.insert(STABLE_POINTER.to_string(), vec![b' '; POINTER_LIMIT + 1]);
+        let fixture = Fixture::new(routes, b"old binary\n").await;
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&POINTER_LIMIT.to_string()) && message.contains(STABLE_POINTER),
+            "{message}"
+        );
+        assert_eq!(
+            fixture.pointer_requests(),
+            1,
+            "the artifact was not fetched"
+        );
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
     #[tokio::test]
     async fn an_unsigned_pointer_is_refused() {
         let _install = INSTALL.lock().await;

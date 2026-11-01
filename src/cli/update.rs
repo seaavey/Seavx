@@ -13,6 +13,8 @@ const PINNED_KEYS: &[&str] = &[]; // TODO(update): paste the Task 0 public key h
 
 const CDN: &str = "https://cdn.seavx.com";
 const POINTER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Eight short fields: a larger body is a hostile CDN, not a newer pointer.
+const POINTER_LIMIT: usize = 64 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -73,15 +75,7 @@ async fn install(
         .build()?;
 
     let pointer_url = format!("{base}/{}", channel.pointer_path(&target));
-    let pointer = client
-        .get(&pointer_url)
-        .timeout(POINTER_TIMEOUT)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await
-        .map_err(|error| anyhow::anyhow!("{pointer_url}: {error}"))?;
+    let pointer = fetch_pointer(&client, &pointer_url).await?;
     let manifest =
         Manifest::parse(&pointer).map_err(|error| anyhow::anyhow!("{pointer_url}: {error}"))?;
 
@@ -213,6 +207,30 @@ async fn install(
     );
 
     Ok(())
+}
+
+/// Read the pointer under the size cap: nothing is verified until the whole body
+/// is buffered, so an unbounded read is the CDN's cheapest way to exhaust the
+/// updater. `content-length` is only a hint, so the cap is enforced per chunk.
+async fn fetch_pointer(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
+    use futures::StreamExt;
+
+    let response = client
+        .get(url)
+        .timeout(POINTER_TIMEOUT)
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| anyhow::anyhow!("{url}: {error}"))?;
+        if body.len() + chunk.len() > POINTER_LIMIT {
+            anyhow::bail!("{url}: pointer body exceeds {POINTER_LIMIT} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Run the candidate with `--version`, killing it if it hangs. The child is always
