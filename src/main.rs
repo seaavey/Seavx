@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
-#[command(name = "seavx", version, about = "A customizable AI coding agent")]
+#[command(name = "seavx", version = env!("SEAVX_VERSION"), about = "A customizable AI coding agent")]
 struct Cli {
     /// Log at trace level to `.seavx/debug.log`; RUST_LOG overrides this
     #[arg(short, long, global = true)]

@@ -30,8 +30,20 @@ fn verify_digest(expected: Option<&str>, actual: &str) -> Result<bool, String> {
     }
 }
 
+/// True when the pointer names the commit this binary was built from. CI republishes
+/// every master build under the same unreleased version, so the version alone cannot
+/// answer that. A build made outside git has no commit, and the version stands alone.
+fn same_commit(current: Option<&str>, latest: &Latest) -> bool {
+    match current {
+        Some(sha) => sha.eq_ignore_ascii_case(&latest.sha),
+        None => true,
+    }
+}
+
 pub async fn run(force: bool) -> anyhow::Result<()> {
     const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+    // Absent when the build ran outside a git checkout.
+    const CURRENT_SHA: Option<&str> = option_env!("SEAVX_GIT_SHA");
 
     let (os, arch) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => ("linux", "x86_64"),
@@ -57,12 +69,22 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
         .json()
         .await?;
 
+    let current_exe = std::env::current_exe()?;
+
+    // CI republishes every master build under the same unreleased version, so a
+    // matching version alone does not mean the running binary is that build.
     if !force && latest.version == CURRENT_VERSION {
+        if same_commit(CURRENT_SHA, &latest) {
+            println!(
+                "SEAVX is already up to date (v{}, {})",
+                latest.version, latest.sha
+            );
+            return Ok(());
+        }
         println!(
-            "SEAVX is already up to date (v{}, {})",
-            latest.version, latest.sha
+            "A newer build of v{CURRENT_VERSION} is available ({}).",
+            latest.sha
         );
-        return Ok(());
     }
 
     println!("Downloading v{} ({})...", latest.version, latest.sha);
@@ -93,7 +115,6 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
         }
     };
 
-    let current_exe = std::env::current_exe()?;
     let current_dir = current_exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Unable to get parent dir of executable"))?;
@@ -159,10 +180,13 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
         );
     }
 
+    let transition = if latest.version == CURRENT_VERSION {
+        format!("v{}", latest.version)
+    } else {
+        format!("v{CURRENT_VERSION} to v{}", latest.version)
+    };
     println!(
-        "Successfully updated SEAVX from v{} to v{} ({}, {})",
-        CURRENT_VERSION,
-        latest.version,
+        "Successfully updated SEAVX {transition} ({}, {})",
         latest.sha,
         current_exe.display()
     );
