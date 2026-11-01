@@ -7,6 +7,14 @@ pub(super) fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+/// The block a transcript drag paints: a background with dark text, because a
+/// bare foreground swap disappears in a dark theme.
+pub(super) fn selection() -> Style {
+    Style::default()
+        .fg(Color::Rgb(24, 24, 24))
+        .bg(Color::Rgb(214, 202, 170))
+}
+
 /// Mode tag the header shows, plus the style that paints mode text: the header
 /// tag and the footer's mode label. The colour marks what the mode changes:
 /// yellow restricts, green stops asking for writes, red stops asking at all.

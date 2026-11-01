@@ -94,6 +94,48 @@ fn screen_of(app: &App) -> String {
 }
 
 #[test]
+fn a_drag_selection_is_painted_on_a_background_block() {
+    let mut app = test_app();
+    app.push_text("hello world");
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+
+    // The row the transcript painted, and the column its first glyph sits at.
+    let (row, column) = {
+        let buffer = terminal.backend().buffer();
+        (0..20)
+            .find_map(|y| {
+                let text: String = (0..60).map(|x| buffer[(x, y)].symbol()).collect();
+                text.find("hello").map(|x| (y, x as u16))
+            })
+            .expect("the transcript is painted")
+    };
+
+    app.selection_begin(column, row);
+    app.selection_extend(column + 4, row);
+    terminal.draw(|frame| render(&app, frame)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    for x in column..=column + 4 {
+        assert_eq!(
+            buffer[(x, row)].bg,
+            Color::Rgb(214, 202, 170),
+            "the dragged cells carry a background block"
+        );
+        assert_eq!(
+            buffer[(column + 5, row)].bg,
+            Color::Reset,
+            "and nothing outside the drag does"
+        );
+    }
+    assert_eq!(
+        buffer[(column, row)].symbol(),
+        "h",
+        "the glyphs stay where they were; only the style changes"
+    );
+}
+
+#[test]
 fn header_and_footer_show_build_mode() {
     let app = test_app();
     let screen = screen_of(&app);
@@ -508,7 +550,7 @@ fn the_model_picker_scrolls_the_list_to_the_selection() {
     app.modal = Some(ModalSelection::Model {
         models,
         query: String::new(),
-        selected: 30,
+        selected: 31,
     });
 
     let text = screen_of(&app);
@@ -528,7 +570,7 @@ fn the_model_picker_scrolls_the_list_to_the_selection() {
     app.modal = Some(ModalSelection::Model {
         models,
         query: String::new(),
-        selected: 14,
+        selected: 15,
     });
     let text = screen_of(&app);
     assert!(
@@ -544,7 +586,7 @@ fn typing_narrows_the_model_picker_to_matching_rows() {
     app.modal = Some(ModalSelection::Model {
         models: ["alpha", "beta", "gamma"].map(str::to_string).to_vec(),
         query: "et".to_string(),
-        selected: 0,
+        selected: 1,
     });
 
     let text = screen_of(&app);
@@ -588,6 +630,48 @@ fn a_notice_keeps_the_rows_it_was_printed_with() {
     assert!(
         prompt_row.contains("(workspace)"),
         "markdown used to fold every row into one paragraph: {prompt_row:?}"
+    );
+}
+
+#[test]
+fn the_refresh_row_is_always_first_and_names_the_host() {
+    let mut app = test_app();
+    app.config.base_url = Some("https://gateway.test/v1/".to_string());
+    app.modal = Some(ModalSelection::Model {
+        models: vec!["alpha".to_string()],
+        query: String::new(),
+        selected: 0,
+    });
+
+    let text = screen_of(&app);
+    assert!(
+        text.contains("↻ Refresh models from gateway.test"),
+        "the refresh action is on screen, not only on a chord: {text}"
+    );
+    assert!(
+        text.find("↻ Refresh models").unwrap() < text.find("alpha").unwrap(),
+        "the refresh row is row 0: {text}"
+    );
+}
+
+#[test]
+fn an_empty_filter_says_what_matched_nothing_and_how_to_refresh() {
+    let mut app = test_app();
+    app.config.base_url = Some("https://gateway.test/v1/".to_string());
+    app.modal = Some(ModalSelection::Model {
+        models: ["alpha", "beta"].map(str::to_string).to_vec(),
+        query: "refresh".to_string(),
+        selected: 0,
+    });
+
+    let text = screen_of(&app);
+    assert!(
+        text.contains("no match for \"refresh\""),
+        "an empty box is not feedback: {text}"
+    );
+    assert!(
+        text.contains("↻ Refresh models from gateway.test"),
+        "the empty state points at the action: {text}"
     );
 }
 

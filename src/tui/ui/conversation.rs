@@ -38,6 +38,38 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
         area,
     );
 
+    // The pointer works in painted rows and columns, so the frame hands the
+    // geometry and the text it painted back to the app: a copy reads the text,
+    // and the highlight below is painted over those same cells.
+    let painted: Vec<String> = {
+        let buffer = frame.buffer_mut();
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    };
+    app.set_transcript(area, scroll_offset, painted);
+    if let Some(selection) = app.selection.as_ref()
+        && selection.width == area.width
+    {
+        let style = theme::selection();
+        let buffer = frame.buffer_mut();
+        for y in area.y..area.y + area.height {
+            let row = scroll_offset + (y - area.y);
+            let Some((from, to)) = selection.columns(row, area.width) else {
+                continue;
+            };
+            for column in from..=to {
+                if let Some(cell) = buffer.cell_mut((area.x + column, y)) {
+                    cell.set_style(style);
+                }
+            }
+        }
+    }
+
     if app.segments.is_empty() {
         splash::render(app, area, frame);
     }
