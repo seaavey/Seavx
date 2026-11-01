@@ -16,6 +16,9 @@ pub struct ClipboardImage {
 pub trait Clipboard: Send + Sync {
     fn text(&self) -> Result<String, String>;
     fn image(&self) -> Result<ClipboardImage, String>;
+    /// Put text on the clipboard. The writer must keep its handle alive after
+    /// returning: on X11 the clipboard *is* that connection.
+    fn write(&self, text: &str) -> Result<(), String>;
 }
 
 type Reply = Sender<Result<Answer, String>>;
@@ -23,11 +26,13 @@ type Reply = Sender<Result<Answer, String>>;
 enum Answer {
     Text(String),
     Image(ClipboardImage),
+    Written,
 }
 
 enum Request {
     Text(Reply),
     Image(Reply),
+    Write(String, Reply),
 }
 
 /// The real clipboard. One worker thread owns one arboard handle for the life of
@@ -66,26 +71,43 @@ fn serve(inbox: &Receiver<Request>) {
         if handle.is_none() {
             handle = arboard::Clipboard::new().ok();
         }
-        let (wants_image, reply) = match request {
-            Request::Text(reply) => (false, reply),
-            Request::Image(reply) => (true, reply),
-        };
-        let answer = match handle.as_mut() {
-            None => Err("no clipboard on this display".to_string()),
-            Some(clipboard) if wants_image => clipboard
-                .get_image()
-                .map(|image| {
-                    Answer::Image(ClipboardImage {
-                        width: image.width as u32,
-                        height: image.height as u32,
-                        bytes: image.bytes.into_owned(),
-                    })
-                })
-                .map_err(|error| error.to_string()),
-            Some(clipboard) => clipboard
-                .get_text()
-                .map(Answer::Text)
-                .map_err(|error| error.to_string()),
+        let (reply, answer) = match request {
+            Request::Text(reply) => (
+                reply,
+                match handle.as_mut() {
+                    None => Err("no clipboard on this display".to_string()),
+                    Some(clipboard) => clipboard
+                        .get_text()
+                        .map(Answer::Text)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            Request::Image(reply) => (
+                reply,
+                match handle.as_mut() {
+                    None => Err("no clipboard on this display".to_string()),
+                    Some(clipboard) => clipboard
+                        .get_image()
+                        .map(|image| {
+                            Answer::Image(ClipboardImage {
+                                width: image.width as u32,
+                                height: image.height as u32,
+                                bytes: image.bytes.into_owned(),
+                            })
+                        })
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            Request::Write(text, reply) => (
+                reply,
+                match handle.as_mut() {
+                    None => Err("no clipboard on this display".to_string()),
+                    Some(clipboard) => clipboard
+                        .set_text(text)
+                        .map(|_| Answer::Written)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
         };
         let _ = reply.send(answer);
     }
@@ -95,14 +117,23 @@ impl Clipboard for SystemClipboard {
     fn text(&self) -> Result<String, String> {
         match self.ask(Request::Text)? {
             Answer::Text(text) => Ok(text),
-            Answer::Image(_) => Err("not available as text".to_string()),
+            Answer::Image(_) | Answer::Written => Err("not available as text".to_string()),
         }
     }
 
     fn image(&self) -> Result<ClipboardImage, String> {
         match self.ask(Request::Image)? {
             Answer::Image(image) => Ok(image),
-            Answer::Text(_) => Err("not available as an image".to_string()),
+            Answer::Text(_) | Answer::Written => Err("not available as an image".to_string()),
+        }
+    }
+
+    fn write(&self, text: &str) -> Result<(), String> {
+        match self.ask(|reply| Request::Write(text.to_string(), reply))? {
+            Answer::Written => Ok(()),
+            Answer::Text(_) | Answer::Image(_) => {
+                Err("the clipboard did not take the text".to_string())
+            }
         }
     }
 }

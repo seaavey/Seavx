@@ -56,6 +56,26 @@ pub(super) fn handle(app: &mut App, mouse: MouseEvent, screen: Rect) {
         }
     }
 
+    // A drag over the transcript selects text and copies it on release. An open
+    // modal owns the pointer: what it covers is not the transcript.
+    if app.modal.is_none() {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                app.selection_begin(mouse.column, mouse.row);
+                return;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                app.selection_extend(mouse.column, mouse.row);
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                app.selection_finish();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match mouse.kind {
         MouseEventKind::ScrollUp => app.scroll_up(3),
         MouseEventKind::ScrollDown => app.scroll_down(3),

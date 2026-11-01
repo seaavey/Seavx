@@ -382,6 +382,32 @@ async fn a_command_outliving_its_timeout_leaves_no_child() {
 }
 
 #[tokio::test]
+async fn a_timed_out_command_keeps_the_output_it_produced() {
+    let (_temp, _root, security) = prepare().await;
+
+    let error = match super::run_shell(
+        "echo before-hang; echo oops >&2; exec sleep 60",
+        &security,
+        std::time::Duration::from_millis(300),
+        &crate::agent::cancel::CancelToken::new(),
+    )
+    .await
+    {
+        Ok(_) => panic!("the timeout must be reported"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.contains("timed out"),
+        "the timeout must be reported: {error}"
+    );
+    assert!(
+        error.contains("before-hang") && error.contains("oops"),
+        "both streams must survive a timeout: {error}"
+    );
+}
+
+#[tokio::test]
 async fn ambiguous_snippet_is_refused_with_count_and_samples() {
     let (_temp, root, security) = prepare().await;
     std::fs::write(root.join("notes.txt"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();

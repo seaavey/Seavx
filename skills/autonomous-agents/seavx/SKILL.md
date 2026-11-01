@@ -73,12 +73,22 @@ semantics the table cannot show:
 - `/new` is `/clear`; `/resume` is `/sessions`; `/model` with no argument opens a
   picker over the cached models — a number is a 1-based index and out of range is
   refused, never saved as a name. In the picker, letters filter (case-insensitive,
-  Backspace widens), `ctrl+r` refetches `/models` in the background behind a
-  spinner and is ignored while that fetch runs, and the list scrolls with the
-  cursor. `/model` and both pickers are **session-scoped**: they change the model
+  Backspace widens), row 0 is always `↻ Refresh models from <host>` and runs the
+  same fetch as `ctrl+r` (background, behind a spinner, ignored while that fetch
+  runs), a filter matching nothing says `no match for "<query>" · ctrl+r
+  refreshes`, and a cache past its 24 h TTL is refetched on open with the stale
+  rows still listed. `/model` and both pickers are **session-scoped**: they change the model
   of the turns that follow and leave the config file alone, so the saved default
   survives the run. Only `seavx model [name]` (and `/config set model …`) write
   the file. `/clear` keeps the session's model for the rest of the process.
+- Mouse capture belongs to the app, so dragging in the transcript selects text:
+  the block is painted on a background and released to the clipboard with a
+  `copied N lines` toast. The block is held in painted rows, so scrolling moves
+  it with the text; `Esc` clears it and a resize drops it. A click copies
+  nothing, and `Shift`+drag still reaches the terminal's own selection.
+- `run_command` runs with a 120 s ceiling and, when it fires, returns the stdout
+  and stderr it had already drained behind the timeout line — a slow network
+  install is not reported as a hang with no evidence.
 
 ## Configuration
 

@@ -44,6 +44,22 @@ per landed change; no entry describes behaviour that is not in the code.
   replays the same line. What waits on the next Enter is drawn on its own strip
   above the prompt (newest three, clipped before the prompt box), never in the
   transcript.
+- A drag over the transcript selects text: the covered characters are painted on
+  a background block and released straight to the clipboard, with a
+  `copied N lines` toast. The block is stored as painted rows and columns, so the
+  wheel and auto-scroll move it with the text instead of leaving it behind at
+  screen coordinates; `Esc` drops it, and so does a resize, which retires the
+  rows it was mapped against. A click copies nothing, and the composer, footer
+  and popups keep the pointer they had. The read-only `Clipboard` trait grew
+  `write`, serving from the same worker thread that owns the single `arboard`
+  handle — a handle dropped after writing loses the X11 selection.
+- The model picker says it can refresh: row 0 is always
+  `↻ Refresh models from <host>`, reachable with the arrows and Enter and running
+  the fetch `ctrl+r` already ran. A filter that matches nothing used to paint an
+  empty box under `0/88`; it now says `no match for "<query>" · ctrl+r refreshes`.
+  Opening the picker on a cache past its 24 h TTL refreshes it in the
+  background — stale rows stay on screen behind the spinner — so a model added at
+  the gateway today is not invisible for a day.
 
 ### breaking
 
@@ -159,6 +175,13 @@ per landed change; no entry describes behaviour that is not in the code.
   (`seavx setup providers · endpoint (1/3)`, `model (2/3)`, `effort (3/3)`,
   `saved`), and prints the config path from platform components, so Windows shows
   `.seavx` and `config.toml` separated by a backslash.
+- `run_command` no longer throws away what it captured when it hits its ceiling,
+  and the ceiling is 120 s instead of 30 s. A cold `npx skills add …` needs ~57 s:
+  the old limit killed it every time, the result was one line — `Command execution
+  timed out (30s limit)` — with no evidence of what the command was doing, and the
+  repeat-error guard then stopped the turn. The timeout error now carries the
+  stdout and stderr already drained (same caps and redaction as a completed
+  result), so "slow but progressing" is distinguishable from "hung".
 
 ## 0.1.3 — 2026-10-30
 

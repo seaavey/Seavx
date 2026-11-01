@@ -49,6 +49,11 @@ impl Clipboard for FakeClipboard {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.image.clone()
     }
+
+    fn write(&self, _text: &str) -> Result<(), String> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 /// Every method panics: a guard, not a tautology, for "no key, no clipboard".
@@ -61,6 +66,10 @@ impl Clipboard for PanicClipboard {
 
     fn image(&self) -> Result<ClipboardImage, String> {
         panic!("the clipboard was read without a key")
+    }
+
+    fn write(&self, _text: &str) -> Result<(), String> {
+        panic!("the clipboard was written without a drag")
     }
 }
 

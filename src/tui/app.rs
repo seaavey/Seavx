@@ -20,6 +20,8 @@ mod mouse;
 mod paste;
 mod references;
 mod run;
+pub use selection::Selection;
+mod selection;
 mod store;
 mod transcript;
 mod worker;
@@ -116,6 +118,15 @@ pub struct App<'a> {
     pub segments: Vec<Segment>,
     pub revision: u64,
     pub transcript_cache: std::cell::RefCell<Option<TranscriptCache>>,
+    /// Drag selection over the transcript; `Esc` clears it.
+    pub selection: Option<Selection>,
+    /// True between a press and its release that started inside the transcript.
+    pub(crate) dragging: bool,
+    /// The transcript geometry the last frame painted: a press is mapped through
+    /// it and a copy reads the text back out of it.
+    transcript_area: std::cell::Cell<ratatui::layout::Rect>,
+    transcript_scroll: std::cell::Cell<u16>,
+    transcript_rows: std::cell::RefCell<Vec<String>>,
     /// Prompts the user submitted, recallable with the arrow keys.
     pub history: Vec<String>,
     history_view: Vec<String>,
@@ -460,6 +471,11 @@ impl<'a> App<'a> {
             segments: Vec::new(),
             revision: 0,
             transcript_cache: std::cell::RefCell::new(None),
+            selection: None,
+            dragging: false,
+            transcript_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            transcript_scroll: std::cell::Cell::new(0),
+            transcript_rows: std::cell::RefCell::new(Vec::new()),
             history,
             history_view: Vec::new(),
             history_cursor: None,
@@ -554,6 +570,11 @@ impl<'a> App<'a> {
     /// `Esc` closes what is open, then cancels what runs; it never quits. Twice
     /// while idle clears the line, the way a shell clears a half-typed command.
     pub fn escape(&mut self) {
+        // A selected block is the first thing Esc throws away.
+        if self.selection.is_some() {
+            self.selection = None;
+            return;
+        }
         if self.ghost_active() {
             self.clear_ghost();
             return;
