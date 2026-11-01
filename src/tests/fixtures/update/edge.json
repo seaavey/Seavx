@@ -1,0 +1,10 @@
+{
+  "channel": "edge",
+  "target": "macos-arm64",
+  "sha": "06a4060",
+  "key": "builds/06a4060/81ce1245c381cf69a80d627853806331651fed06808598e34d8af628102ea0eb/seavx-macos-arm64",
+  "version": "0.1.3",
+  "built_at": "2026-10-31T16:41:34Z",
+  "sha256": "81ce1245c381cf69a80d627853806331651fed06808598e34d8af628102ea0eb",
+  "sig": "untrusted comment: signature from rsign secret key\nRUQkqsrNANQV1dwGt3SUn6FwJhWa+l+sm4yC8cfgU3VJPg14K3zSmJF3kD/DM4+jAReUuGms23BhYmwTmgzRFBSgQOvJ7O9eJgk=\ntrusted comment: seavx fixture pointer - signs no release\nCNgKFkOiPMiu6uu9TPORzz8tEqsAlt311CN3hudY4IM1Ng/ScXl8tb3SjRGmgHup+ia+pWGsc9Ue6LU5P+lIBA==\n"
+}

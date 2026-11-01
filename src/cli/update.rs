@@ -1,5 +1,13 @@
 //! `seavx update`: replace the running binary with the newest CI build served by cdn.seavx.com.
 
+// Task 4 hands the parsed pointer to `run`; until then only the tests reach in.
+#[allow(dead_code)]
+mod manifest;
+
+/// The keys a release pointer must be signed by. A rotation adds a second entry.
+#[allow(dead_code)] // passed to `Manifest::verify` by `run` in Task 4
+const PINNED_KEYS: &[&str] = &[]; // TODO(update): paste the Task 0 public key here before the first release build
+
 /// Pointer object CI publishes next to each build.
 #[derive(serde::Deserialize)]
 struct Latest {
@@ -10,24 +18,6 @@ struct Latest {
     /// field existed, so a missing value warns instead of blocking an update.
     #[serde(default)]
     sha256: Option<String>,
-}
-
-/// Lowercase hex, the spelling `sha256sum` and the CI pointer use.
-fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Compare what the pointer published with the bytes actually received.
-/// `Ok(true)` on a match, `Ok(false)` when the pointer carries no checksum, and
-/// `Err` with both values when they differ.
-fn verify_digest(expected: Option<&str>, actual: &str) -> Result<bool, String> {
-    match expected {
-        Some(expected) if expected.eq_ignore_ascii_case(actual) => Ok(true),
-        Some(expected) => Err(format!(
-            "download does not match the published checksum: expected {expected}, got {actual}"
-        )),
-        None => Ok(false),
-    }
 }
 
 /// True when the pointer names the commit this binary was built from. CI republishes
@@ -150,17 +140,18 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     // The pointer arrives over TLS from the same origin as the build, so the
     // digest catches a corrupt or swapped object. It cannot prove authenticity
     // to a client whose pointer was already forged: that needs a signature.
-    let actual = hex_lower(&digest.finalize());
-    match verify_digest(latest.sha256.as_deref(), &actual) {
-        Ok(true) => {}
-        Ok(false) => eprintln!(
+    let actual = manifest::hex_lower(&digest.finalize());
+    match latest.sha256.as_deref() {
+        Some(expected) => {
+            if let Err(message) = manifest::digest_matches(expected, &actual) {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                pb.abandon();
+                anyhow::bail!(message);
+            }
+        }
+        None => eprintln!(
             "warning: this build was published without a checksum; the download was not verified"
         ),
-        Err(message) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            pb.abandon();
-            anyhow::bail!(message);
-        }
     }
     pb.finish_with_message("Download complete");
 
