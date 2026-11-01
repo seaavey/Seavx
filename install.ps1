@@ -14,7 +14,7 @@ $UpdateKey = ''
 
 $Target = 'windows-x86_64'
 # The last segment of the signed route, i.e. `Target::binary`.
-$Binary = 'seavx-windows-x86_64'
+$Binary = 'seavx-windows-x86_64.exe'
 $Pointer = "$Base/latest/windows/x86_64.json"
 
 $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\seavx'
