@@ -93,6 +93,10 @@ enum Commands {
         /// Force update even if already up to date
         #[arg(short, long)]
         force: bool,
+
+        /// Release channel: stable (a tag) or edge (master)
+        #[arg(long, default_value = "stable", value_parser = ["stable", "edge"])]
+        channel: String,
     },
 
     /// Uninstall SEAVX: remove the binary, with either a data-keeping or a full wipe choice
@@ -291,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Skills { command }) => cli::skills::run(command)?,
         Some(Commands::Sessions { command }) => cli::sessions::run(command).await?,
         Some(Commands::Resume { id }) => cli::sessions::run_resume(id).await?,
-        Some(Commands::Update { force }) => cli::update::run(force).await?,
+        Some(Commands::Update { force, channel }) => cli::update::run(force, &channel).await?,
         Some(Commands::Uninstall) => cli::uninstall::run()?,
         None => {
             tui::app::start_tui(None, None).await?;

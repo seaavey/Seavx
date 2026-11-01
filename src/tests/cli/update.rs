@@ -1,38 +1,514 @@
 use super::*;
 
-#[test]
-fn a_pointer_without_a_checksum_still_parses() {
-    // Published before the field existed: the update must still run.
-    let latest: Latest = serde_json::from_str(
-        r#"{"sha":"abc1234","key":"builds/abc1234/seavx-linux-x86_64","version":"0.1.2","built_at":"2026-01-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-    assert!(latest.sha256.is_none());
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/fixtures/update");
+const FIXTURE_KEY: &str = include_str!("../fixtures/update/fixture.pub");
 
-    let latest: Latest = serde_json::from_str(
-        r#"{"sha":"abc1234","key":"k","version":"0.1.2","built_at":"t","sha256":"abc"}"#,
-    )
-    .unwrap();
-    assert_eq!(latest.sha256.as_deref(), Some("abc"));
+/// The public half of the throwaway fixture key, one line below its comment.
+fn key() -> &'static str {
+    FIXTURE_KEY.lines().nth(1).unwrap().trim()
 }
 
 #[test]
-fn the_recorded_commit_decides_whether_a_build_is_latest() {
-    let latest: Latest = serde_json::from_str(
-        r#"{"sha":"06a4060","key":"k","version":"0.1.3","built_at":"t","sha256":"3e92be"}"#,
-    )
-    .unwrap();
+fn the_base_url_keeps_one_slash() {
+    assert_eq!(
+        resolve_base(Some("http://127.0.0.1:8080/".to_string())),
+        "http://127.0.0.1:8080"
+    );
+    assert_eq!(resolve_base(None), "https://cdn.seavx.com");
+}
 
-    assert!(
-        same_commit(Some("06a4060"), &latest),
-        "built from the published commit: nothing to download"
+#[test]
+fn the_pointer_path_is_channel_plus_target() {
+    let linux = Target::from_name("linux-x86_64").unwrap();
+    let macos = Target::from_name("macos-arm64").unwrap();
+
+    assert_eq!(
+        Channel::Stable.pointer_path(&linux),
+        "latest/linux/x86_64.json"
     );
-    assert!(
-        !same_commit(Some("1111111"), &latest),
-        "an older commit is not latest, even under the same version"
-    );
-    assert!(
-        same_commit(None, &latest),
-        "a build with no recorded commit leaves the version check standing"
-    );
+    assert_eq!(Channel::Edge.pointer_path(&linux), "edge/linux/x86_64.json");
+    assert_eq!(Channel::Edge.pointer_path(&macos), "edge/macos/arm64.json");
+}
+
+#[test]
+fn an_unknown_channel_is_a_usage_error() {
+    use clap::Parser;
+
+    let error =
+        crate::Cli::try_parse_from(["seavx", "update", "--channel", "nightly"]).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("stable"), "{message}");
+    assert!(message.contains("edge"), "{message}");
+}
+
+#[test]
+fn the_cli_defaults_to_stable_and_accepts_edge() {
+    use clap::Parser;
+
+    let cli = crate::Cli::try_parse_from(["seavx", "update"]).unwrap();
+    match cli.command {
+        Some(crate::Commands::Update { channel, .. }) => assert_eq!(channel, "stable"),
+        other => panic!("expected update, got {other:?}"),
+    }
+
+    let cli = crate::Cli::try_parse_from(["seavx", "update", "--channel", "edge"]).unwrap();
+    match cli.command {
+        Some(crate::Commands::Update { channel, .. }) => assert_eq!(channel, "edge"),
+        other => panic!("expected update, got {other:?}"),
+    }
+}
+
+/// The whole ordered path against a local server: the fixture pointers name
+/// linux-x86_64, so these run only where `Target::detect` answers that.
+#[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+mod end_to_end {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const STABLE_POINTER: &str = "latest/linux/x86_64.json";
+    const EDGE_POINTER: &str = "edge/linux/x86_64.json";
+    /// The route both fixture pointers sign for their artifact.
+    const ARTIFACT: &str = "builds/06a4060/81ce1245c381cf69a80d627853806331651fed06808598e34d8af628102ea0eb/seavx-linux-x86_64";
+
+    fn bytes(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{FIXTURES}/{name}")).unwrap()
+    }
+
+    /// A stable pointer plus its artifact, the shape a real update request takes.
+    fn stable_routes() -> HashMap<String, Vec<u8>> {
+        HashMap::from([
+            (STABLE_POINTER.to_string(), bytes("stable.json")),
+            (ARTIFACT.to_string(), bytes("fake-artifact.sh")),
+        ])
+    }
+
+    /// Every path answers its body with 200 and anything else with 404; the
+    /// counter is what "the artifact was never requested" asserts on.
+    async fn serve(
+        routes: HashMap<String, Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0u8; 2048];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .trim_start_matches('/');
+                match routes.get(path) {
+                    Some(body) => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(body).await;
+                    }
+                    None => {
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                    }
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), handle, requests)
+    }
+
+    struct Fixture {
+        dir: tempfile::TempDir,
+        exe: PathBuf,
+        base: String,
+        requests: Arc<AtomicUsize>,
+        _server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Fixture {
+        /// `old` is the byte string the installed binary holds before the update.
+        async fn new(routes: HashMap<String, Vec<u8>>, old: &[u8]) -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join("seavx");
+            std::fs::write(&exe, old).unwrap();
+            let (base, _server, requests) = serve(routes).await;
+            Fixture {
+                dir,
+                exe,
+                base,
+                requests,
+                _server,
+            }
+        }
+
+        fn installed(&self) -> Vec<u8> {
+            std::fs::read(&self.exe).unwrap()
+        }
+
+        /// Any file the updater parked next to the binary.
+        fn leftovers(&self) -> Vec<String> {
+            std::fs::read_dir(self.dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".seavx-update-"))
+                .collect()
+        }
+
+        fn pointer_requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    fn current(version: &str) -> Current {
+        Current {
+            version: semver::Version::parse(version).unwrap(),
+            sha: None,
+        }
+    }
+
+    /// The stable pointer with one field rewritten, signature left as published.
+    fn pointer(change: impl Fn(&mut serde_json::Value)) -> Vec<u8> {
+        let mut raw: serde_json::Value = serde_json::from_slice(&bytes("stable.json")).unwrap();
+        change(&mut raw);
+        raw.to_string().into_bytes()
+    }
+
+    #[tokio::test]
+    async fn an_up_to_date_binary_is_left_alone() {
+        let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
+
+        install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.3"),
+            &[key()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fixture.pointer_requests(), 1, "nothing was downloaded");
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_install_directory_fails_and_leaves_the_binary_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
+        std::fs::set_permissions(fixture.dir.path(), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        // Restore before asserting so a failure still lets the temp dir go.
+        std::fs::set_permissions(fixture.dir.path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&fixture.dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
+    /// An executable shell script in `dir`.
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn the_probe_times_out_and_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(dir.path(), "slow", "#!/bin/sh\nsleep 5\n");
+
+        let error = probe_exe(&bin, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("--version"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_non_zero_probe_exit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(dir.path(), "broken", "#!/bin/sh\nexit 3\n");
+
+        let error = probe_exe(&bin, Duration::from_secs(5)).await.unwrap_err();
+
+        assert!(error.to_string().contains('3'), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_disagrees_with_the_manifest_is_refused() {
+        // Signed for 0.9.9 over bytes that report 0.1.3: the digest is right, the
+        // build is not the one the pointer names.
+        let mut routes = stable_routes();
+        routes.insert(
+            STABLE_POINTER.to_string(),
+            bytes("stable-pointer-0.9.9.json"),
+        );
+        let fixture = Fixture::new(routes, b"old binary\n").await;
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("0.9.9") && message.contains("0.1.3"),
+            "{message}"
+        );
+        assert_eq!(fixture.installed(), b"old binary\n");
+        assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
+    }
+
+    #[tokio::test]
+    async fn a_forced_update_skips_ordering_only() {
+        let mut routes = stable_routes();
+        routes.insert(
+            STABLE_POINTER.to_string(),
+            pointer(|raw| raw["version"] = "0.1.4".into()),
+        );
+        let fixture = Fixture::new(routes, b"old binary\n").await;
+
+        let error = install(
+            true,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("signature"), "{error}");
+        assert_eq!(fixture.pointer_requests(), 1);
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
+    #[tokio::test]
+    async fn a_downgrade_is_refused_without_force() {
+        let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.2.0"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("0.2.0") && message.contains("0.1.3"),
+            "{message}"
+        );
+        assert_eq!(
+            fixture.pointer_requests(),
+            1,
+            "the artifact was not fetched"
+        );
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
+    #[tokio::test]
+    async fn a_pointer_for_another_target_is_refused_before_any_download() {
+        let mut routes = stable_routes();
+        routes.insert(EDGE_POINTER.to_string(), bytes("edge.json"));
+        let fixture = Fixture::new(routes, b"old binary\n").await;
+
+        let error = install(
+            false,
+            Channel::Edge,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("target")
+                && message.contains("macos-arm64")
+                && message.contains("linux-x86_64"),
+            "{message}"
+        );
+        assert_eq!(fixture.pointer_requests(), 1);
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
+    #[tokio::test]
+    async fn a_pointer_for_another_channel_is_refused_before_any_download() {
+        let mut routes = stable_routes();
+        routes.insert(STABLE_POINTER.to_string(), bytes("edge.json"));
+        let fixture = Fixture::new(routes, b"old binary\n").await;
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("edge") && message.contains("stable"),
+            "{message}"
+        );
+        assert_eq!(fixture.pointer_requests(), 1);
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_pointer_is_refused() {
+        let mut routes = stable_routes();
+        routes.insert(
+            STABLE_POINTER.to_string(),
+            pointer(|raw| {
+                raw.as_object_mut().unwrap().remove("sig");
+            }),
+        );
+        let fixture = Fixture::new(routes, b"old binary\n").await;
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("sig"), "{error}");
+        assert_eq!(fixture.pointer_requests(), 1);
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
+    #[tokio::test]
+    async fn a_modified_pointer_is_refused() {
+        let mut routes = stable_routes();
+        routes.insert(
+            STABLE_POINTER.to_string(),
+            pointer(|raw| raw["version"] = "0.1.4".into()),
+        );
+        let fixture = Fixture::new(routes, b"old binary\n").await;
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("signature"), "{error}");
+        assert_eq!(
+            fixture.pointer_requests(),
+            1,
+            "a forged pointer must not reach the artifact"
+        );
+        assert_eq!(fixture.installed(), b"old binary\n");
+    }
+
+    #[tokio::test]
+    async fn a_tampered_artifact_leaves_the_binary_and_no_temp_file() {
+        let mut routes = stable_routes();
+        routes.insert(
+            ARTIFACT.to_string(),
+            b"#!/bin/sh\necho 'seavx 0.1.3 (06a4060)'\n".to_vec(),
+        );
+        let fixture = Fixture::new(routes, b"old binary\n").await;
+
+        let error = install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("checksum"), "{error}");
+        assert_eq!(fixture.installed(), b"old binary\n");
+        assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
+    }
+
+    #[tokio::test]
+    async fn a_signed_pointer_installs_the_artifact() {
+        let fixture = Fixture::new(stable_routes(), b"old binary\n").await;
+
+        install(
+            false,
+            Channel::Stable,
+            &fixture.exe,
+            &fixture.base,
+            &current("0.1.2"),
+            &[key()],
+        )
+        .await
+        .unwrap();
+
+        let output = std::process::Command::new(&fixture.exe).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "seavx 0.1.3 (06a4060)"
+        );
+        assert_eq!(fixture.pointer_requests(), 2, "pointer, then artifact");
+        assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
+    }
 }
