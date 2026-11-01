@@ -147,6 +147,15 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      - name: Install minisign
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux)   sudo apt-get update && sudo apt-get install -y minisign ;;
+            macOS)   brew install minisign ;;
+            Windows) choco install minisign -y ;;
+          esac
+
       - name: Mirror to R2
         if: env.HAS_R2 == 'true'
         shell: bash
@@ -155,24 +164,57 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
           set -euo pipefail
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          key="builds/$SHORT_SHA/${{ matrix.binary_name }}"
-
-          aws s3 cp "dist/${{ matrix.binary_name }}" "s3://seavx/$key" \
-            --endpoint-url "$endpoint" \
-            --content-type application/octet-stream
-
-          # Pointer the worker's /latest/ routes resolve; short cache, the target is immutable.
+          key="builds/$SHORT_SHA/$SHA256/${{ matrix.binary_name }}"
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          printf '{"sha":"%s","key":"%s","version":"%s","built_at":"%s","sha256":"%s"}\n' \
-            "$SHORT_SHA" "$key" "$version" "$(date -u +%FT%TZ)" "$SHA256" > "pointer/latest-${{ matrix.platform }}.json"
-          aws s3 cp "pointer/latest-${{ matrix.platform }}.json" \
-            "s3://seavx/latest-${{ matrix.platform }}.json" \
-            --endpoint-url "$endpoint" \
-            --content-type application/json \
-            --cache-control "public, max-age=60"
+          built_at=$(date -u +%FT%TZ)
+          channel=$([[ "$GITHUB_REF" == refs/tags/* ]] && echo stable || echo edge)
+
+          # Rerun safety: reuse the key only when the stored bytes are this build.
+          if aws s3api head-object --bucket seavx --key "$key" --endpoint-url "$endpoint" >/dev/null 2>&1; then
+            aws s3 cp "s3://seavx/$key" existing.bin --endpoint-url "$endpoint"
+            actual=$(sha256sum existing.bin | cut -d' ' -f1)
+            [[ "$actual" == "$SHA256" ]] || { echo "refusing to overwrite $key: digest differs" >&2; exit 1; }
+            rm -f existing.bin
+          else
+            aws s3 cp "dist/${{ matrix.binary_name }}" "s3://seavx/$key" \
+              --endpoint-url "$endpoint" --content-type application/octet-stream
+          fi
+
+          # $1 = the channel the manifest is signed for, $2 = the pointer object name.
+          publish() {
+            bash .github/scripts/pointer-manifest.sh "$1" "${{ matrix.platform }}" \
+              "$SHORT_SHA" "$key" "$version" "$built_at" "$SHA256" > pointer/manifest.txt
+            printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > pointer/minisign.key
+            minisign -S -s pointer/minisign.key -m pointer/manifest.txt \
+              -x pointer/manifest.sig -t "seavx $version"
+            sig=$(python3 -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read()))' pointer/manifest.sig)
+            printf '{"channel":"%s","target":"%s","sha":"%s","key":"%s","version":"%s","built_at":"%s","sha256":"%s","sig":%s}\n' \
+              "$1" "${{ matrix.platform }}" "$SHORT_SHA" "$key" "$version" "$built_at" "$SHA256" "$sig" \
+              > "pointer/$2"
+            aws s3 cp "pointer/$2" "s3://seavx/$2" --endpoint-url "$endpoint" \
+              --content-type application/json --cache-control "public, max-age=60"
+            rm -f pointer/minisign.key pointer/manifest.sig
+          }
+
+          if [[ "$channel" == stable ]]; then
+            publish stable "latest-${{ matrix.platform }}.json"
+          else
+            publish edge "edge-${{ matrix.platform }}.json"
+            # Rollout state 1: a master build also seeds latest-*, because the client's
+            # default channel is stable and would otherwise refuse the only pointer there
+            # is. Reading the published channel is the whole transition rule: once a tag
+            # has written latest-*, master never touches it again. No tag query, no
+            # workflow state to keep in sync.
+            existing=$(aws s3 cp "s3://seavx/latest-${{ matrix.platform }}.json" - \
+              --endpoint-url "$endpoint" 2>/dev/null || true)
+            published=$(printf '%s' "$existing" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("channel",""))' 2>/dev/null || true)
+            [[ "$published" == stable ]] || publish stable "latest-${{ matrix.platform }}.json"
+          fi
 
       - name: Upload Release Assets
         if: startsWith(github.ref, 'refs/tags/')
