@@ -134,6 +134,9 @@ jobs:
           file="dist/${{ matrix.binary_name }}"
           if command -v sha256sum >/dev/null 2>&1; then
             digest=$(sha256sum "$file" | cut -d' ' -f1)
+          elif command -v shasum >/dev/null 2>&1; then
+            # macOS ships no coreutils; shasum is the digest tool that is there.
+            digest=$(shasum -a 256 "$file" | cut -d' ' -f1)
           else
             # Windows without coreutils: certutil prints the hash on line 2.
             digest=$(certutil -hashfile "$file" SHA256 | sed -n '2p' | tr -d ' \r')
@@ -173,10 +176,27 @@ jobs:
           built_at=$(date -u +%FT%TZ)
           channel=$([[ "$GITHUB_REF" == refs/tags/* ]] && echo stable || echo edge)
 
+          # A signed pointer is cached for a minute and trusted downstream, so a
+          # field the step cannot verify must stop the build here, not ship.
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+            || { echo "invalid version: '$version'" >&2; exit 1; }
+          [[ "$SHORT_SHA" =~ ^[0-9a-f]{7}$ ]] \
+            || { echo "invalid SHORT_SHA: '$SHORT_SHA'" >&2; exit 1; }
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "invalid SHA256: '$SHA256'" >&2; exit 1; }
+
           # Rerun safety: reuse the key only when the stored bytes are this build.
           if aws s3api head-object --bucket seavx --key "$key" --endpoint-url "$endpoint" >/dev/null 2>&1; then
             aws s3 cp "s3://seavx/$key" existing.bin --endpoint-url "$endpoint"
-            actual=$(sha256sum existing.bin | cut -d' ' -f1)
+            if command -v sha256sum >/dev/null 2>&1; then
+              actual=$(sha256sum existing.bin | cut -d' ' -f1)
+            elif command -v shasum >/dev/null 2>&1; then
+              # macOS ships no coreutils; shasum is the digest tool that is there.
+              actual=$(shasum -a 256 existing.bin | cut -d' ' -f1)
+            else
+              # Windows without coreutils: certutil prints the hash on line 2.
+              actual=$(certutil -hashfile existing.bin SHA256 | sed -n '2p' | tr -d ' \r')
+            fi
             [[ "$actual" == "$SHA256" ]] || { echo "refusing to overwrite $key: digest differs" >&2; exit 1; }
             rm -f existing.bin
           else
@@ -191,7 +211,8 @@ jobs:
             printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > pointer/minisign.key
             minisign -S -s pointer/minisign.key -m pointer/manifest.txt \
               -x pointer/manifest.sig -t "seavx $version"
-            sig=$(python3 -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read()))' pointer/manifest.sig)
+            # Windows python3 ends its output with CRLF; a stray CR would land inside the JSON sig.
+            sig=$(python3 -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read()))' pointer/manifest.sig | tr -d '\r')
             printf '{"channel":"%s","target":"%s","sha":"%s","key":"%s","version":"%s","built_at":"%s","sha256":"%s","sig":%s}\n' \
               "$1" "${{ matrix.platform }}" "$SHORT_SHA" "$key" "$version" "$built_at" "$SHA256" "$sig" \
               > "pointer/$2"
@@ -211,8 +232,9 @@ jobs:
             # workflow state to keep in sync.
             existing=$(aws s3 cp "s3://seavx/latest-${{ matrix.platform }}.json" - \
               --endpoint-url "$endpoint" 2>/dev/null || true)
+            # Same CR strip: "stable\r" never equals stable, which would re-sign latest-* on every push.
             published=$(printf '%s' "$existing" \
-              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("channel",""))' 2>/dev/null || true)
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("channel",""))' 2>/dev/null | tr -d '\r' || true)
             [[ "$published" == stable ]] || publish stable "latest-${{ matrix.platform }}.json"
           fi
 
