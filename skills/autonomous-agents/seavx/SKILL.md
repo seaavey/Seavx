@@ -38,21 +38,26 @@ effort is never refused for being absent from that list.
 
 ## Updates
 
-`seavx update` installs the build the CDN's signed pointer names. The channel is
-`stable` by default — the pointer at `latest/<os>/<arch>.json` — and
-`--channel edge` reads `edge/<os>/<arch>.json`, the newest master build. The
-client verifies the pointer's minisign signature over its canonical
-`SEAVX-UPDATE-v1` bytes against keys compiled into the binary first, then the
-signed channel, the target it was built for, the `builds/{sha}/{sha256}/{binary}`
-route and the version ordering, then the download's `sha256`, then the
-candidate's own `--version` output, and only then renames it over the binary. A
-failure at any point leaves the installed binary byte-identical and deletes the
-temp file; `--force` relaxes ordering only, never a check.
+`seavx update` is built to install the build the CDN's signed pointer names; with
+no key pinned it installs nothing (see below). The channel is `stable` by default
+— the pointer at `latest/<os>/<arch>.json` — and `--channel edge` reads
+`edge/<os>/<arch>.json`, the newest master build. That one answers a 404 today:
+no `edge-<os>-<arch>.json` object has been published. The client verifies the
+pointer's minisign signature over its canonical `SEAVX-UPDATE-v1` bytes against
+keys compiled into the binary first, then the signed channel, the target it was
+built for, the `builds/{sha}/{sha256}/{binary}` route and the version ordering,
+then the download's `sha256`, then the candidate's own `--version` output, and
+only then renames it over the binary. A failure at any point leaves the installed
+binary byte-identical and deletes the temp file; `--force` relaxes ordering only,
+never a check.
 
-An empty key set refuses, so a build from this branch answers
-`no pinned update key` — a pointer that is not signed by a pinned key answers
-`signature: not signed by a pinned update key`. Do not "fix" that by disabling
-the check.
+`PINNED_KEYS` is empty, so nothing installs from this branch. The pointer
+production serves still predates the signed format (no `channel`, `target` or
+`sig`), and parsing runs before the key set is consulted, so the message a run
+gets today is `<url>: channel: missing or not a string`. Once a signed pointer
+exists, the empty key set answers `no pinned update key`, and a pointer no pinned
+key signed answers `signature: not signed by a pinned update key`. Do not "fix"
+either by disabling the check.
 
 `SEAVX_UPDATE_BASE` moves the origin for a test server; it changes no check, and
 both installers read it too. `install.sh` and `install.ps1` pin the same key and
