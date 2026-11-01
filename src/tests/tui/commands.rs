@@ -775,8 +775,8 @@ fn resuming_a_read_only_session_is_refused_with_the_reason() {
 }
 
 #[test]
-fn the_readme_command_table_matches_the_registry() {
-    let readme = include_str!("../../../README.md");
+fn the_docs_command_table_matches_the_registry() {
+    let readme = include_str!("../../../docs/tui.md");
     let mut names: Vec<&str> = Vec::new();
     for line in readme.lines() {
         let Some(cell) = line.strip_prefix("| `") else {
@@ -793,7 +793,7 @@ fn the_readme_command_table_matches_the_registry() {
     let registered: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
     assert_eq!(
         names, registered,
-        "the README command table and the registry drifted; the palette is generated from the registry"
+        "the docs/tui.md command table and the registry drifted; the palette is generated from the registry"
     );
 }
 
