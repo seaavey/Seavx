@@ -511,7 +511,7 @@ impl AgentTool for RunCommandTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run shell command safely in workspace root with 30s timeout"
+        "Run shell command safely in workspace root with 120s timeout"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -566,7 +566,7 @@ impl AgentTool for RunCommandTool {
 }
 
 /// Wall-clock ceiling for one command; the child is killed when it expires.
-pub(crate) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Per-stream ceiling, in characters, split evenly between the head and the
 /// tail.
 const STREAM_CAP: usize = 32 * 1024;
@@ -693,12 +693,19 @@ pub(crate) async fn run_shell(
         End::TimedOut => {
             let cleanup = kill_tree(&mut child, pid).await;
             cancel.note_cleanup(pid, cleanup);
-            let mut message = format!("Command execution timed out ({}s limit)", limit.as_secs());
+            // The drained output is the only evidence of how far the command got;
+            // dropped, "slow but progressing" is indistinguishable from "hung".
+            let mut message = format!(
+                "Command execution timed out ({}s limit)\nstdout:\n{}\nstderr:\n{}",
+                limit.as_secs(),
+                cap_stream(&String::from_utf8_lossy(&stdout)),
+                cap_stream(&String::from_utf8_lossy(&stderr))
+            );
             if cleanup == Cleanup::Unconfirmed {
                 message.push('\n');
                 message.push_str(&cleanup_notice(pid));
             }
-            return Err(message);
+            return Err(crate::agent::security::redact(&message));
         }
     };
 
