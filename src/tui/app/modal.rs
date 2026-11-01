@@ -18,9 +18,9 @@ pub(super) fn next_index(sel: usize, len: usize) -> usize {
 }
 
 impl App<'_> {
-    /// Open the cached-model picker. Returns `false` when the cache is empty and
-    /// a fetch is needed: the modal is open and empty, so the caller starts the
-    /// same refresh `ctrl+r` runs.
+    /// Open the cached-model picker. Returns `false` when the caller should start
+    /// a fetch: nothing cached, or a cache past its TTL — the rows it already
+    /// has stay on screen while the refresh runs behind the spinner.
     pub fn open_model_picker(&mut self) -> bool {
         let models = cached_models(self);
         if models.is_empty() {
@@ -32,16 +32,18 @@ impl App<'_> {
             return false;
         }
 
+        // Row 0 is the refresh action, so a model's row is its index plus one.
         let current_idx = models
             .iter()
             .position(|m| Some(m.as_str()) == self.config.model.as_deref())
+            .map(|index| index + 1)
             .unwrap_or(0);
         self.modal = Some(ModalSelection::Model {
             models,
             query: String::new(),
             selected: current_idx,
         });
-        true
+        !models_cache_stale(self)
     }
 
     /// Move the open model picker's cursor by one row, wrapping. Arrows and the
@@ -140,7 +142,7 @@ impl App<'_> {
         else {
             return;
         };
-        let len = visible_models(&models, &query).len();
+        let len = visible_models(&models, &query).len() + 1;
         let selected = if down {
             next_index(selected, len)
         } else {
@@ -153,9 +155,14 @@ impl App<'_> {
         });
     }
 
-    /// Fetch the endpoint's model list off the UI thread. `ctrl+r` and a cold
-    /// picker both come through here; nothing awaits the request.
+    /// Fetch the endpoint's model list off the UI thread. The refresh row,
+    /// `ctrl+r` and a cold picker all come through here; nothing awaits the
+    /// request.
     pub fn spawn_model_refresh(&mut self, tx: &tokio::sync::mpsc::UnboundedSender<Action>) {
+        // The refresh row and `ctrl+r` reach this: one fetch at a time.
+        if self.refreshing_models {
+            return;
+        }
         let Some(base_url) = self.config.base_url.clone() else {
             if let Some(ModalSelection::Model { .. }) = self.modal {
                 self.modal = None;
@@ -194,6 +201,7 @@ impl App<'_> {
                     let selected = visible_models(&models, &query)
                         .iter()
                         .position(|model| Some(model.as_str()) == self.config.model.as_deref())
+                        .map(|index| index + 1)
                         .unwrap_or(0);
                     self.modal = Some(ModalSelection::Model {
                         models,
@@ -366,6 +374,17 @@ fn cached_models(app: &App) -> Vec<String> {
     model_mgr
         .get_cached_models_allow_stale(&crate::agent::models::ModelManager::domain_slug(base_url))
         .unwrap_or_default()
+}
+
+/// True when the cached list is past its TTL (or missing), so opening the
+/// picker refreshes it instead of answering from yesterday's list.
+fn models_cache_stale(app: &App) -> bool {
+    let Some(base_url) = app.config.base_url.as_deref() else {
+        return false;
+    };
+    crate::agent::models::ModelManager::new(std::path::Path::new("."))
+        .get_cached_models(&crate::agent::models::ModelManager::domain_slug(base_url))
+        .is_none()
 }
 
 /// Resolve a `/model` argument: a 1-based index into the cached list, or a

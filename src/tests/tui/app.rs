@@ -594,23 +594,32 @@ fn typed_letters_are_the_model_filter_and_never_reach_the_row_list() {
 #[test]
 fn stepping_the_model_picker_wraps_inside_the_filtered_rows() {
     let mut app = test_app();
-    app.modal = picker(&["alpha", "beta", "gamma"], 2);
+    app.modal = picker(&["alpha", "beta", "gamma"], 3);
 
-    // The wheel and Down are the same call.
+    // The wheel and Down are the same call. Four rows: refresh, then three
+    // models.
     app.step_model_picker(true);
-    assert_eq!(selected_of(&app), 0, "the last row wraps to the first");
+    assert_eq!(
+        selected_of(&app),
+        0,
+        "the last row wraps to the refresh row"
+    );
     app.step_model_picker(false);
-    assert_eq!(selected_of(&app), 2, "and back up wraps to the last");
+    assert_eq!(selected_of(&app), 3, "and back up wraps to the last");
 
-    // One matching row: stepping cannot leave it.
+    // One matching row plus the refresh row: stepping cannot reach a
+    // filtered-out model.
     app.modal = Some(ModalSelection::Model {
         models: ["alpha", "beta", "gamma"].map(str::to_string).to_vec(),
         query: "et".to_string(),
-        selected: 0,
+        selected: 1,
     });
     for down in [true, false, true] {
         app.step_model_picker(down);
-        assert_eq!(selected_of(&app), 0, "the only filtered row stays selected");
+        assert!(
+            selected_of(&app) <= 1,
+            "a filtered-out row stays unreachable"
+        );
     }
 
     // No picker at all: the wheel is a no-op instead of a panic.
@@ -650,8 +659,8 @@ fn a_refresh_keeps_the_filter_and_the_cursor_stays_inside_it() {
             assert_eq!(query, "et", "the typed filter survives the refresh");
             assert_eq!(models.len(), 3);
             assert_eq!(
-                *selected, 0,
-                "beta is the only filtered row, so it is row 0"
+                *selected, 1,
+                "beta is the only filtered row, so it is row 1"
             );
         }
         other => panic!("the picker stays open: {other:?}"),
@@ -1221,6 +1230,36 @@ fn model_index_outside_the_cached_list_is_an_error_not_a_name() {
     );
 }
 
+#[tokio::test]
+async fn enter_on_the_refresh_row_runs_the_same_fetch_as_ctrl_r() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.config.base_url = Some("https://phase4-refresh-row.invalid/v1/".to_string());
+    app.modal = picker(&["alpha"], 0);
+
+    super::keys::handle(&mut app, KeyEvent::from(KeyCode::Enter), &tx).await;
+
+    assert!(app.refreshing_models, "the refresh row starts the fetch");
+    assert!(
+        matches!(app.modal, Some(ModalSelection::Model { .. })),
+        "the picker stays open while the list arrives"
+    );
+}
+
+#[tokio::test]
+async fn enter_on_a_model_row_still_opens_the_effort_picker() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = test_app();
+    app.modal = picker(&["alpha"], 1);
+
+    super::keys::handle(&mut app, KeyEvent::from(KeyCode::Enter), &tx).await;
+
+    match &app.modal {
+        Some(ModalSelection::Effort { model, .. }) => assert_eq!(model, "alpha"),
+        other => panic!("row 1 is the first model, not refresh: {other:?}"),
+    }
+}
+
 fn picker(models: &[&str], selected: usize) -> Option<ModalSelection> {
     Some(ModalSelection::Model {
         models: models.iter().map(|model| model.to_string()).collect(),
@@ -1244,7 +1283,7 @@ fn a_finished_refresh_replaces_the_open_picker_and_stops_the_spinner() {
             models, selected, ..
         }) => {
             assert_eq!(models, &["alpha", "beta"]);
-            assert_eq!(*selected, 1, "the active model is where the cursor lands");
+            assert_eq!(*selected, 2, "the active model is where the cursor lands");
         }
         other => panic!("the picker stays open: {other:?}"),
     }

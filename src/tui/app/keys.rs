@@ -73,10 +73,17 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                 // Typing is the search box, so 'j'/'k' no longer
                 // move: arrows do.
                 if let Some(query) = edit_query(&query, &key) {
+                    // Row 0 is refresh, so the first matching model is row 1;
+                    // with no match the refresh row stays the only target.
+                    let selected = if visible_models(&models, &query).is_empty() {
+                        0
+                    } else {
+                        1
+                    };
                     app.modal = Some(ModalSelection::Model {
                         models,
                         query,
-                        selected: 0,
+                        selected,
                     });
                     return;
                 }
@@ -95,8 +102,13 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
                         app.spawn_model_refresh(tx);
                     }
                     KeyCode::Enter => {
+                        // Row 0 is the refresh action, the rest are models.
+                        if selected == 0 {
+                            app.spawn_model_refresh(tx);
+                            return;
+                        }
                         let chosen = visible_models(&models, &query)
-                            .get(selected)
+                            .get(selected - 1)
                             .map(|model| (*model).clone());
                         let current_eff = app.config.reasoning_effort.as_deref().unwrap_or("none");
                         app.modal = chosen.map(|model| {
