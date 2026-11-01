@@ -67,7 +67,7 @@ impl Target {
 }
 
 /// Every `platform` in ci.yml's build matrix.
-const TARGETS: &[Target] = &[
+pub(super) const TARGETS: &[Target] = &[
     Target {
         name: "linux-x86_64",
         os: "linux",

@@ -58,6 +58,70 @@ fn the_cli_defaults_to_stable_and_accepts_edge() {
     }
 }
 
+/// Both installers pick the artifact by hand, so a name that drifts from
+/// `Target::binary` 404s a real install: every name they spell must be one the
+/// table publishes, and every published target must be spelled by one of them.
+#[test]
+fn the_installers_name_only_published_binaries() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let scripts: Vec<(&str, String)> = ["install.sh", "install.ps1"]
+        .iter()
+        .map(|name| (*name, std::fs::read_to_string(root.join(name)).unwrap()))
+        .collect();
+
+    for (name, script) in &scripts {
+        for binary in binaries_named(script) {
+            assert!(
+                manifest::TARGETS
+                    .iter()
+                    .any(|target| target.binary == binary),
+                "{name} names {binary}, which no target publishes"
+            );
+        }
+    }
+    for target in manifest::TARGETS {
+        assert!(
+            scripts
+                .iter()
+                .any(|(_, script)| binaries_named(script).contains(&target.binary)),
+            "no installer names {}, so that platform cannot install",
+            target.binary
+        );
+    }
+
+    for (name, script) in &scripts {
+        if PINNED_KEYS.is_empty() {
+            // While the pin is empty the TODO is the only thing tying the three
+            // files together, so a key pasted into the client alone still fails.
+            assert!(
+                script.contains("TODO(update): paste the Task 0 release public key here"),
+                "{name} lost the pinned-key TODO"
+            );
+        } else {
+            for key in PINNED_KEYS {
+                assert!(
+                    script.contains(*key),
+                    "{name} does not carry pinned key {key}"
+                );
+            }
+        }
+    }
+}
+
+/// The `seavx-` artifact names a script spells, up to the closing quote.
+fn binaries_named(script: &str) -> Vec<&str> {
+    script
+        .match_indices("seavx-")
+        .map(|(at, _)| {
+            let tail = &script[at..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+                .unwrap_or(tail.len());
+            &tail[..end]
+        })
+        .collect()
+}
+
 /// The whole ordered path against a local server: the fixture pointers name
 /// linux-x86_64, so these run only where `Target::detect` answers that.
 #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
