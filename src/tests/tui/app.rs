@@ -848,7 +848,22 @@ fn esc_cancels_while_busy_and_never_quits() {
     let mut busy = test_app();
     busy.status = AgentState::Streaming;
     busy.escape();
-    assert!(busy.cancel.is_cancelled(), "Esc cancels the running turn");
+    assert!(
+        !busy.cancel.is_cancelled(),
+        "one press only arms: a running turn is not lost by accident"
+    );
+    assert!(
+        busy.toast
+            .as_ref()
+            .is_some_and(|(toast, _)| toast.contains("Press Esc again")),
+        "the arming press says what a second one does"
+    );
+
+    busy.escape();
+    assert!(
+        busy.cancel.is_cancelled(),
+        "the second Esc cancels the turn"
+    );
     assert!(!busy.should_quit, "a running turn is not a reason to quit");
     assert_eq!(
         busy.status,
@@ -1244,9 +1259,15 @@ async fn a_submitted_prompt_leaves_no_ghost_to_swallow_the_first_esc() {
     );
 
     // The reported bug: the first Esc after a submit only cleared that leftover
-    // ghost, so cancelling took two presses.
+    // ghost, so cancelling needed a press nobody expected. The first press must
+    // now be the arming press, and the second the cancel.
     app.escape();
-    assert!(app.cancel.is_cancelled(), "one Esc cancels the turn");
+    assert!(!app.cancel.is_cancelled(), "one Esc only arms the cancel");
+    let (toast, _) = app.toast.clone().expect("the arming press says so");
+    assert!(toast.contains("Press Esc again"), "{toast}");
+
+    app.escape();
+    assert!(app.cancel.is_cancelled(), "the second Esc cancels the turn");
 }
 
 #[test]
@@ -1397,7 +1418,17 @@ async fn escape_closes_the_ghost_then_the_popup_then_cancels_the_turn() {
     assert!(!app.cancel.is_cancelled(), "and still does not cancel");
 
     super::keys::handle(&mut app, esc(), &tx).await;
-    assert!(app.cancel.is_cancelled(), "the third Esc cancels");
+    assert!(
+        !app.cancel.is_cancelled(),
+        "one Esc only arms: a turn is too expensive to lose by accident"
+    );
+    assert!(
+        app.toast.is_some(),
+        "the arming press says a second one will cancel"
+    );
+
+    super::keys::handle(&mut app, esc(), &tx).await;
+    assert!(app.cancel.is_cancelled(), "the second press cancels");
     assert_eq!(
         app.status,
         crate::tui::event::AgentState::Thinking,

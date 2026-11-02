@@ -359,10 +359,11 @@ fn hanging_gateway() -> (String, Arc<std::sync::atomic::AtomicBool>) {
     (format!("http://127.0.0.1:{port}/v1/"), requested)
 }
 
-/// One `Esc` must cancel a running turn. The reported bug is that it takes two:
-/// the first press is swallowed by something that is not the cancel branch.
+/// Two `Esc` presses cancel a running turn: the first only arms it, so one
+/// stray key cannot throw away a turn that is costing tokens. `Ctrl+C` is the
+/// single-press stop.
 #[test]
-fn one_esc_cancels_a_running_turn() {
+fn two_esc_presses_cancel_a_running_turn() {
     use std::sync::atomic::Ordering;
 
     let home = tempfile::tempdir().expect("temp home");
@@ -386,7 +387,15 @@ fn one_esc_cancels_a_running_turn() {
     });
 
     tui.press("\x1b");
-    tui.wait_for_screen("cancelled");
+    tui.wait_for_screen("Press Esc again to cancel");
+    assert!(
+        !tui.shows("System: cancelled"),
+        "one Esc must not end the turn; screen tail:\n{}",
+        tui.tail()
+    );
+
+    tui.press("\x1b");
+    tui.wait_for_screen("System: cancelled");
 
     assert!(tui.exit().success(), "the TUI exits cleanly after a cancel");
 }

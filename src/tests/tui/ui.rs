@@ -434,9 +434,10 @@ fn the_footer_names_ctrl_c_after_what_it_does_right_now() {
     app.status = crate::tui::event::AgentState::Thinking;
     let busy = footer(&app);
     assert!(busy.contains("ctrl+c stop"), "{busy}");
+    assert!(busy.contains("esc ×2 stop"), "{busy}");
     assert!(
-        !busy.contains("ctrl+c exit"),
-        "a running turn is stopped, not left: {busy}"
+        !busy.contains("ctrl+c exit") && !busy.contains("esc ×2 clear"),
+        "a running turn is stopped, not cleared or left: {busy}"
     );
 }
 

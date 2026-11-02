@@ -97,11 +97,16 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
-- One `Esc` cancels a running turn again. A submitted prompt reset the line but
-  kept the ghost suggestion it grew while typing, so the first `Esc` cleared
-  that invisible tail and cancelling took two presses — the ghost now goes with
-  the prompt it belonged to. The key path is covered end to end in a real pty
-  (`tests/e2e_slash.rs`, a gateway that never answers) as well as by unit tests.
+- `Esc` needs a second press to cancel a running turn: the first one says so in
+  a toast, so a stray key cannot throw away a turn that is costing tokens.
+  `Ctrl+C` remains the one-press stop. The footer names both per state — while a
+  turn runs it reads `esc ×2 stop · ctrl+c stop`, and `esc ×2 clear ·
+  ctrl+c exit` when idle. Cancelling no longer goes missing either: a submitted
+  prompt used to keep the ghost suggestion it grew while typing, so the first
+  `Esc` cleared that invisible tail and cancelling took a press more than the
+  keys promised — the ghost now goes with the prompt it belonged to. Both key
+  paths are covered end to end in a real pty against a gateway that never
+  answers.
 - `Ctrl+C` stops a running turn instead of leaving the session: the key cancels
   the turn (as `Esc` does) and only an idle prompt treats it as the way out,
   where it still needs its second press. The footer says which of the two it is
