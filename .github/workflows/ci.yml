@@ -138,8 +138,8 @@ jobs:
             # macOS ships no coreutils; shasum is the digest tool that is there.
             digest=$(shasum -a 256 "$file" | cut -d' ' -f1)
           else
-            # Windows without coreutils: certutil prints the hash on line 2.
-            digest=$(certutil -hashfile "$file" SHA256 | sed -n '2p' | tr -d ' \r')
+            # Windows without coreutils: certutil prints the hash uppercase on line 2.
+            digest=$(certutil -hashfile "$file" SHA256 | sed -n '2p' | tr -d ' \r' | tr 'A-F' 'a-f')
           fi
           echo "SHA256=$digest" >> "$GITHUB_ENV"
 
@@ -194,8 +194,8 @@ jobs:
               # macOS ships no coreutils; shasum is the digest tool that is there.
               actual=$(shasum -a 256 existing.bin | cut -d' ' -f1)
             else
-              # Windows without coreutils: certutil prints the hash on line 2.
-              actual=$(certutil -hashfile existing.bin SHA256 | sed -n '2p' | tr -d ' \r')
+              # Windows without coreutils: certutil prints the hash uppercase on line 2.
+              actual=$(certutil -hashfile existing.bin SHA256 | sed -n '2p' | tr -d ' \r' | tr 'A-F' 'a-f')
             fi
             [[ "$actual" == "$SHA256" ]] || { echo "refusing to overwrite $key: digest differs" >&2; exit 1; }
             rm -f existing.bin
