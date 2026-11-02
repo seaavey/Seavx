@@ -430,6 +430,13 @@ fn the_footer_names_ctrl_c_after_what_it_does_right_now() {
     let idle = footer(&app);
     assert!(idle.contains("ctrl+c exit"), "{idle}");
     assert!(idle.contains("esc ×2 clear"), "{idle}");
+    // Only the keys a user cannot guess: the rest was reminder noise.
+    for gone in ["tab complete", "history", "send"] {
+        assert!(
+            !idle.contains(gone),
+            "the footer still spends room on `{gone}`: {idle}"
+        );
+    }
 
     app.status = crate::tui::event::AgentState::Thinking;
     let busy = footer(&app);

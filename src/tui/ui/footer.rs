@@ -36,19 +36,10 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
         format!("{total}/{}k", max_context_limit / 1_000)
     };
 
-    // Hints step down rather than push the token count off the row: the counter
-    // is data, the key list is a reminder. Both keys mean something different
-    // while a turn runs — `Esc` arms its cancel, `Ctrl+C` is the stop — so the
-    // hint names what each does right now.
-    let (esc, quit) = match app.status {
-        AgentState::Idle => ("esc ×2 clear", "ctrl+c exit"),
-        _ => ("esc ×2 stop", "ctrl+c stop"),
-    };
-    let hints_tiers = [
-        format!("↑↓ history  ·  tab complete  ·  ⏎ send  ·  {esc}  ·  {quit}"),
-        format!("↑↓ history  ·  ⏎ send  ·  {quit}"),
-        "⏎ send · ctrl+c".to_string(),
-    ];
+    // Only what a key cannot tell the user by itself: the clear is a double
+    // press, and `Ctrl+C` changes meaning with the turn. Typing, `⏎` and `↑↓`
+    // need no reminder, and `tab` accepts a suggestion the screen already
+    // shows — three hints that only took room from the token counter.
     const SEPARATOR: &str = "  ·  ";
 
     let mut model = config.model.as_deref().unwrap_or("no model").to_string();
@@ -62,11 +53,19 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
             + SEPARATOR.chars().count()
             + format!("effort {effort_label}").chars().count()
     };
-    let hints = hints_tiers
-        .iter()
-        .find(|hints| left_width(&model) + hints.chars().count() + 2 <= area.width as usize)
-        .map(String::as_str)
-        .unwrap_or("");
+    let (full, quit) = match app.status {
+        AgentState::Idle => ("esc ×2 clear  ·  ctrl+c exit", "ctrl+c exit"),
+        _ => ("esc ×2 stop  ·  ctrl+c stop", "ctrl+c stop"),
+    };
+    let fits = |hint: &str| left_width(&model) + hint.chars().count() + 2 <= area.width as usize;
+    // On a pane too narrow for both, the way out stays and the rest goes.
+    let hints = if fits(full) {
+        full
+    } else if fits(quit) {
+        quit
+    } else {
+        ""
+    };
     // Last resort on a pane too narrow for both: the model gives up its tail.
     if hints.is_empty() && left_width(&model) > area.width as usize {
         let over = left_width(&model) - area.width as usize;
