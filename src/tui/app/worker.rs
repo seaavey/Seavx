@@ -258,10 +258,11 @@ pub async fn run_agent_worker(
             let title_session = session_id;
             let title_prompt = prompt.clone();
             let model_name = config.model.clone().unwrap_or_default();
-            // The turn streams, and a gateway that only implements
-            // `stream: true` refuses the non-stream call this used to make —
-            // silently, because the error was dropped. Ask the way the turn
-            // asks, and say why when it still fails.
+            // The turn's options, not `ChatOptions::default()`: without an
+            // explicit effort genai trims the `-high` off `gemini-3.8-flash-high`
+            // and the gateway answers for a model that does not exist (500
+            // wrapping the provider's 404).
+            let title_options = crate::agent::engine::chat_options_for(&config);
             let backend = crate::agent::backend::GenaiBackend::new(client_clone);
             tokio::spawn(async move {
                 let req = genai::chat::ChatRequest::from_user(format!(
@@ -269,7 +270,10 @@ pub async fn run_agent_worker(
                     title_prompt
                 ));
                 let mut ignore = |_: crate::agent::backend::StreamDelta| {};
-                match backend.stream(&model_name, req, None, &mut ignore).await {
+                match backend
+                    .stream(&model_name, req, Some(&title_options), &mut ignore)
+                    .await
+                {
                     Ok(res) => {
                         let text = res.into_first_text().unwrap_or_default();
                         let clean = crate::util::unquote(text.trim()).to_string();
