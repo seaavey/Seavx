@@ -1,11 +1,12 @@
 /**
  * cdn.seavx.com — serves Seavx build artifacts out of the private `seavx` R2 bucket.
  *
- *   GET /builds/<sha>/<file>   immutable artifact, cached for a year
- *   GET /latest/<os>/<arch>    302 to the newest build for that target
+ *   GET /builds/<sha>/<sha256>/<file>   immutable artifact, cached for a year
+ *   GET /{latest|edge}/<os>/<arch>      302 to the newest build on that channel
  *
- * The pointer objects `latest-<os>-<arch>.json` are written by CI on every push:
- *   { "sha": "a1b2c3d", "key": "builds/a1b2c3d/seavx-linux-x86_64", "built_at": "..." }
+ * The pointer objects `latest-<os>-<arch>.json` and `edge-<os>-<arch>.json` are
+ * written and minisign-signed by CI on every push:
+ *   { "channel", "target", "sha", "key", "version", "built_at", "sha256", "sig" }
  */
 export default {
   async fetch(request, env) {
@@ -14,28 +15,27 @@ export default {
       return new Response("method not allowed\n", { status: 405 });
     }
 
-    const latest = url.pathname.match(
-      /^\/latest\/([a-z0-9]+)\/([a-z0-9_]+)(\.json)?$/,
+    const pointer = url.pathname.match(
+      /^\/(latest|edge)\/([a-z0-9]+)\/([a-z0-9_]+)(\.json)?$/,
     );
-    if (latest) {
-      const pointer = await env.BUCKET.get(
-        `latest-${latest[1]}-${latest[2]}.json`,
-      );
-      if (!pointer) {
+    if (pointer) {
+      const [, route, os, arch, asJson] = pointer;
+      const object = await env.BUCKET.get(`${route}-${os}-${arch}.json`);
+      if (!object) {
         return new Response("no build published for that target\n", {
           status: 404,
         });
       }
       // The updater asks for the pointer itself; installers follow the redirect.
-      if (latest[3]) {
-        return new Response(pointer.body, {
+      if (asJson) {
+        return new Response(object.body, {
           headers: {
             "content-type": "application/json",
             "cache-control": "public, max-age=60",
           },
         });
       }
-      const { key } = await pointer.json();
+      const { key } = await object.json();
       // The pointer moves, the artifact it names never does.
       return new Response(null, {
         status: 302,
