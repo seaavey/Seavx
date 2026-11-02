@@ -110,7 +110,11 @@ per landed change; no entry describes behaviour that is not in the code.
   a toast, so a stray key cannot throw away a turn that is costing tokens.
   `Ctrl+C` remains the one-press stop. The footer names both per state — while a
   turn runs it reads `esc ×2 stop · ctrl+c stop`, and `esc ×2 clear ·
-  ctrl+c exit` when idle. Cancelling no longer goes missing either: a submitted
+  ctrl+c exit` when idle. The generic reminders (`↑↓ history`, `tab complete`,
+  `⏎ send`) are gone: they spent the row on keys a user already knows — or, for
+  `tab`, on a suggestion the screen is already showing — and the token counter
+  lost width to them. On a pane too narrow for both, the way out stays and the
+  rest goes. Cancelling no longer goes missing either: a submitted
   prompt used to keep the ghost suggestion it grew while typing, so the first
   `Esc` cleared that invisible tail and cancelling took a press more than the
   keys promised — the ghost now goes with the prompt it belonged to. Both key
