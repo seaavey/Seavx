@@ -23,9 +23,31 @@ impl Clipboard for Recording {
     }
 }
 
+/// A host with no display server: arboard has nothing to hand over, which is
+/// what the headless fallback is for (#27).
+struct Refusing;
+
+impl Clipboard for Refusing {
+    fn text(&self) -> Result<String, String> {
+        Err("unused".to_string())
+    }
+
+    fn image(&self) -> Result<ClipboardImage, String> {
+        Err("unused".to_string())
+    }
+
+    fn write(&self, _text: &str) -> Result<(), String> {
+        Err("no clipboard: no display".to_string())
+    }
+}
+
 fn picking(copied: &Arc<Mutex<Vec<String>>>) -> crate::tui::app::App<'static> {
     let mut app = test_app();
     app.clipboard = Arc::new(Recording(Arc::clone(copied)));
+    // A working clipboard must never reach the headless path.
+    app.copy_headless = Arc::new(|_: &str| -> Result<std::path::PathBuf, String> {
+        panic!("the fallback ran with a working clipboard")
+    });
     // Three painted rows at x = 0, y = 1, ten cells wide.
     app.set_transcript(
         Rect::new(0, 1, 10, 3),
@@ -155,4 +177,49 @@ fn a_wide_glyph_counts_for_the_cells_it_paints() {
     let (text, _) = selection.text(&rows, 0);
 
     assert_eq!(text, "中", "both cells of one glyph select the glyph once");
+}
+
+/// #27: with no display server, the drag has to leave through the terminal and
+/// a file instead of ending at a toast that says nothing.
+#[test]
+fn a_drag_on_a_host_without_a_clipboard_goes_out_anyway() {
+    let copied = Arc::new(Mutex::new(Vec::new()));
+    let mut app = picking(&copied);
+    app.clipboard = Arc::new(Refusing);
+    let fallback_saw = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = Arc::clone(&fallback_saw);
+    app.copy_headless = Arc::new(move |text: &str| {
+        seen.lock().unwrap().push(text.to_string());
+        Ok(std::path::PathBuf::from(".seavx/last-copy.txt"))
+    });
+
+    app.selection_begin(0, 1);
+    app.selection_extend(5, 2);
+    app.selection_finish();
+
+    assert_eq!(
+        fallback_saw.lock().unwrap().as_slice(),
+        ["hello worl\nsecond"],
+        "the block reached the fallback instead of being dropped"
+    );
+    let (toast, _) = app.toast.clone().expect("the copy is confirmed");
+    assert_eq!(toast, "✓ copied 2 lines (terminal, .seavx/last-copy.txt)");
+}
+
+#[test]
+fn a_copy_both_channels_refused_names_both_reasons() {
+    let copied = Arc::new(Mutex::new(Vec::new()));
+    let mut app = picking(&copied);
+    app.clipboard = Arc::new(Refusing);
+    app.copy_headless = Arc::new(|_: &str| Err(".seavx: permission denied".to_string()));
+
+    app.selection_begin(0, 1);
+    app.selection_extend(5, 2);
+    app.selection_finish();
+
+    let (toast, _) = app.toast.clone().expect("the failure is reported");
+    assert_eq!(
+        toast,
+        "✗ copy failed: no clipboard: no display; .seavx: permission denied"
+    );
 }

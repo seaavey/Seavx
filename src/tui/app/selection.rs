@@ -156,17 +156,28 @@ impl App<'_> {
             return;
         }
         // The clipboard worker owns the only `arboard` handle, so the write is
-        // one call to it; a failure says so instead of claiming a copy.
+        // one call to it; a host without one falls back to the terminal and a
+        // file rather than dropping the block (#27).
+        let copied = |lines: usize| {
+            if lines == 1 {
+                "✓ copied 1 line".to_string()
+            } else {
+                format!("✓ copied {lines} lines")
+            }
+        };
         self.toast = Some(match self.clipboard.write(&text) {
-            Ok(()) => (
-                if lines == 1 {
-                    "✓ copied 1 line".to_string()
-                } else {
-                    format!("✓ copied {lines} lines")
-                },
-                std::time::Instant::now(),
-            ),
-            Err(error) => (format!("✗ copy failed: {error}"), std::time::Instant::now()),
+            Ok(()) => (copied(lines), std::time::Instant::now()),
+            Err(error) => match (self.copy_headless)(&text) {
+                Ok(path) => (
+                    format!("{} (terminal, {})", copied(lines), path.display()),
+                    std::time::Instant::now(),
+                ),
+                // Both channels failed: the arboard error is why the fallback ran.
+                Err(fallback) => (
+                    format!("✗ copy failed: {error}; {fallback}"),
+                    std::time::Instant::now(),
+                ),
+            },
         });
     }
 }

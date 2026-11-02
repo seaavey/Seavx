@@ -67,15 +67,24 @@ impl SystemClipboard {
 /// handle never exists while the first lives.
 fn serve(inbox: &Receiver<Request>) {
     let mut handle: Option<arboard::Clipboard> = None;
+    let mut open_error: Option<String> = None;
     for request in inbox {
         if handle.is_none() {
-            handle = arboard::Clipboard::new().ok();
+            match arboard::Clipboard::new() {
+                Ok(clipboard) => handle = Some(clipboard),
+                Err(error) => open_error = Some(error.to_string()),
+            }
         }
+        // The host has no backend, or the one it has refused: say which.
+        let unavailable = || match &open_error {
+            Some(error) => format!("no clipboard: {error}"),
+            None => "no clipboard on this display".to_string(),
+        };
         let (reply, answer) = match request {
             Request::Text(reply) => (
                 reply,
                 match handle.as_mut() {
-                    None => Err("no clipboard on this display".to_string()),
+                    None => Err(unavailable()),
                     Some(clipboard) => clipboard
                         .get_text()
                         .map(Answer::Text)
@@ -85,7 +94,7 @@ fn serve(inbox: &Receiver<Request>) {
             Request::Image(reply) => (
                 reply,
                 match handle.as_mut() {
-                    None => Err("no clipboard on this display".to_string()),
+                    None => Err(unavailable()),
                     Some(clipboard) => clipboard
                         .get_image()
                         .map(|image| {
@@ -101,7 +110,7 @@ fn serve(inbox: &Receiver<Request>) {
             Request::Write(text, reply) => (
                 reply,
                 match handle.as_mut() {
-                    None => Err("no clipboard on this display".to_string()),
+                    None => Err(unavailable()),
                     Some(clipboard) => clipboard
                         .set_text(text)
                         .map(|_| Answer::Written)
@@ -136,6 +145,42 @@ impl Clipboard for SystemClipboard {
             }
         }
     }
+}
+
+/// Copy without a clipboard. OSC 52 asks the terminal the user is looking at —
+/// the one channel that survives SSH — and the file keeps the text when that
+/// terminal drops the sequence. Both are written every time: a terminal that
+/// ignores the sequence answers nothing, so there is no failure to fall back on.
+pub(super) fn copy_without_clipboard(
+    text: &str,
+    root: &std::path::Path,
+    out: &mut impl std::io::Write,
+) -> Result<std::path::PathBuf, String> {
+    use base64::Engine;
+    use std::io::Write;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    write!(out, "\x1b]52;c;{encoded}\x07")
+        .and_then(|()| out.flush())
+        .map_err(|error| format!("terminal refused the write: {error}"))?;
+
+    let dir = root.join(".seavx");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let path = dir.join("last-copy.txt");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // The block can hold anything the model printed; keep it off other accounts.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(path)
 }
 
 /// One clipboard read, off the UI thread and bounded to 2 s: on X11 and Wayland

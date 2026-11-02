@@ -222,3 +222,50 @@ async fn alt_backspace_falls_through_while_no_chip_exists() {
         "with no chip, the word delete keeps working"
     );
 }
+
+/// A host with no clipboard has to reach the terminal and a file, or the block
+/// the user dragged over is simply gone (#27).
+#[test]
+fn a_headless_copy_reaches_the_terminal_and_a_private_file() {
+    use base64::Engine;
+
+    let root = tempfile::tempdir().expect("temp root");
+    let mut out = Vec::new();
+
+    let path = copy_without_clipboard("hello\nworld", root.path(), &mut out).expect("copied");
+
+    let sequence = String::from_utf8(out).expect("the sequence is utf-8");
+    let encoded = sequence
+        .strip_prefix("\x1b]52;c;")
+        .and_then(|rest| rest.strip_suffix('\x07'))
+        .expect("an OSC 52 copy sequence");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid base64"),
+        b"hello\nworld"
+    );
+
+    assert_eq!(path, root.path().join(".seavx").join("last-copy.txt"));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file exists"),
+        "hello\nworld"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the block can hold anything the model printed");
+    }
+
+    // A second copy replaces the file instead of appending to it.
+    copy_without_clipboard("second", root.path(), &mut Vec::new()).expect("copied again");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file is still there"),
+        "second"
+    );
+}
