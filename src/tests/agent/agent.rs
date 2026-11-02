@@ -2806,3 +2806,36 @@ fn a_failure_is_shown_as_one_bounded_line() {
     assert_eq!(bounded.chars().count(), 161, "160 chars and the ellipsis");
     assert!(bounded.ends_with('…'));
 }
+
+/// A request without an explicit effort makes genai trim a `-high`/`-low` off
+/// the model name; a gateway then answers for a model that does not exist. The
+/// title and evaluator calls failed exactly that way.
+#[test]
+fn every_request_carries_an_explicit_effort() {
+    use crate::agent::engine::{AgentConfig, chat_options_for};
+
+    let mut config = AgentConfig {
+        model: Some("antigravity/gemini-3.8-flash-high".to_string()),
+        reasoning_effort: Some("high".to_string()),
+        ..AgentConfig::default()
+    };
+
+    assert!(matches!(
+        chat_options_for(&config).reasoning_effort,
+        Some(genai::chat::ReasoningEffort::High)
+    ));
+
+    // The configured effort wins; with none, the model name's level is sent.
+    config.reasoning_effort = None;
+    assert!(
+        matches!(
+            chat_options_for(&config).reasoning_effort,
+            Some(genai::chat::ReasoningEffort::High)
+        ),
+        "a `-high` model still says high explicitly"
+    );
+
+    // Nothing to infer: no effort, and the provider's own default applies.
+    config.model = Some("gpt-4o".to_string());
+    assert!(chat_options_for(&config).reasoning_effort.is_none());
+}

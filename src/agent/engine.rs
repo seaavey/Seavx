@@ -367,6 +367,27 @@ pub fn parse_reasoning_effort(effort: &str) -> Option<ReasoningEffort> {
     }
 }
 
+/// The request options for a config. Effort is always sent explicitly: with no
+/// effort in the options genai strips a `-high`/`-low` suffix off the model name,
+/// and a gateway then answers for a model that does not exist — the title and
+/// evaluator calls failed exactly that way.
+pub fn chat_options_for(config: &AgentConfig) -> ChatOptions {
+    let effort = config
+        .reasoning_effort
+        .as_deref()
+        .and_then(parse_reasoning_effort)
+        .or_else(|| ReasoningEffort::from_model_name(config.model_name()).0);
+
+    let options = ChatOptions::default()
+        .with_capture_reasoning_content(true)
+        .with_normalize_reasoning_content(true);
+
+    match effort {
+        Some(effort) => options.with_reasoning_effort(effort),
+        None => options,
+    }
+}
+
 /// Infer adapters from the host and make sure the URL is usable.
 pub fn normalize_base_url(url: &str) -> (String, Vec<AdapterKind>) {
     let mut trimmed = url.trim().to_string();
@@ -1052,21 +1073,7 @@ impl AgentRuntime {
     /// options genai strips a `-high`/`-low` suffix off the model name, and gateways reject
     /// the trimmed id (`model_not_allowed`).
     pub fn chat_options(&self) -> ChatOptions {
-        let effort = self
-            .config
-            .reasoning_effort
-            .as_deref()
-            .and_then(parse_reasoning_effort)
-            .or_else(|| ReasoningEffort::from_model_name(self.config.model_name()).0);
-
-        let options = ChatOptions::default()
-            .with_capture_reasoning_content(true)
-            .with_normalize_reasoning_content(true);
-
-        match effort {
-            Some(effort) => options.with_reasoning_effort(effort),
-            None => options,
-        }
+        chat_options_for(&self.config)
     }
 
     /// One user turn. The outcome carries the terminal status, what the OS said
