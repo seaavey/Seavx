@@ -37,14 +37,15 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
     };
 
     // Hints step down rather than push the token count off the row: the counter
-    // is data, the key list is a reminder. Ctrl+C stops a running turn and only
-    // exits an idle prompt, so the hint names what the key does right now.
-    let quit = match app.status {
-        AgentState::Idle => "ctrl+c exit",
-        _ => "ctrl+c stop",
+    // is data, the key list is a reminder. Both keys mean something different
+    // while a turn runs — `Esc` arms its cancel, `Ctrl+C` is the stop — so the
+    // hint names what each does right now.
+    let (esc, quit) = match app.status {
+        AgentState::Idle => ("esc ×2 clear", "ctrl+c exit"),
+        _ => ("esc ×2 stop", "ctrl+c stop"),
     };
     let hints_tiers = [
-        format!("↑↓ history  ·  tab complete  ·  ⏎ send  ·  esc ×2 clear  ·  {quit}"),
+        format!("↑↓ history  ·  tab complete  ·  ⏎ send  ·  {esc}  ·  {quit}"),
         format!("↑↓ history  ·  ⏎ send  ·  {quit}"),
         "⏎ send · ctrl+c".to_string(),
     ];

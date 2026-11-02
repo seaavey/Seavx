@@ -8,12 +8,12 @@ While you type, the prompt box completes from what you already wrote:
   typed prefix; going forward past the newest entry restores your draft.
 - The newest match also grows back as a dimmed tail. `Tab`, `→` or `Enter`
   accepts it, and typing replaces it.
-- `Esc` closes the ghost suggestion, then an open menu, then cancels the
-  running turn; it never exits. Pressed twice on an idle prompt it clears the
-  line.
-- `Ctrl+C` is the stop key: while a turn runs it cancels that turn and leaves
-  the session alone. On an idle prompt it is the way out, and needs a second
-  press within 1.5 s — the first one warns instead of quitting.
+- `Esc` closes the ghost suggestion, then an open menu, then arms the cancel of
+  the running turn; a second `Esc` within 1.5 s takes it. It never exits.
+  Pressed twice on an idle prompt it clears the line instead.
+- `Ctrl+C` is the stop key: while a turn runs it cancels that turn at once and
+  leaves the session alone. On an idle prompt it is the way out, and needs a
+  second press within 1.5 s — the first one warns instead of quitting.
 
 Prompts are kept per workspace in `.seavx/svx_history` (gitignored, newest 500),
 so recall survives restarts and picks up prompts written by another session.

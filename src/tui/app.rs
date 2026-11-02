@@ -579,10 +579,11 @@ impl<'a> App<'a> {
         self.auto_scroll = true;
     }
 
-    /// Esc, in order: close the ghost, close a popup, cancel the running turn,
-    /// and only quit when nothing else on screen claims the key.
-    /// `Esc` closes what is open, then cancels what runs; it never quits. Twice
-    /// while idle clears the line, the way a shell clears a half-typed command.
+    /// Esc, in order: close the ghost, close a popup, then arm or take the
+    /// cancel of the running turn; it never quits. A running turn needs its
+    /// second press, so one stray Esc cannot throw away a turn that is costing
+    /// tokens. Twice while idle clears the line, the way a shell clears a
+    /// half-typed command.
     pub fn escape(&mut self) {
         // A selected block is the first thing Esc throws away.
         if self.selection.is_some() {
@@ -598,7 +599,19 @@ impl<'a> App<'a> {
             return;
         }
         if self.status != AgentState::Idle {
-            self.cancel.cancel();
+            let twice = self
+                .last_esc
+                .is_some_and(|previous| previous.elapsed() < ESC_CLEARS_IN);
+            if twice {
+                self.last_esc = None;
+                self.cancel.cancel();
+            } else {
+                self.last_esc = Some(std::time::Instant::now());
+                self.toast = Some((
+                    "Press Esc again to cancel the turn".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
             return;
         }
         let twice = self
