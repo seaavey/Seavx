@@ -29,3 +29,14 @@ fn no_home_only_blocks_the_global_target() {
         workspace.join(".seavx/config.toml")
     );
 }
+
+/// The prompt offers the key in effect: an exported or workspace key is what
+/// `/models` is called with, so showing `none` for it got the user a 401 they
+/// could not answer (#30).
+#[test]
+fn the_prompt_offers_the_key_in_effect() {
+    assert_eq!(seed(Some("file"), Some("env")), "file");
+    assert_eq!(seed(None, Some("env")), "env");
+    assert_eq!(seed(Some("file"), None), "file");
+    assert_eq!(seed(None, None), "");
+}

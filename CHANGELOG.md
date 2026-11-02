@@ -97,6 +97,16 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- `seavx setup` acts on a typed key once on Windows: the three CLI raw-mode
+  readers (`prompt::pick`, `prompt::pick_skills` and the masked key prompt) now
+  drop the key-release record that crossterm 0.28 also reports as a character,
+  so the key is no longer inserted twice — which made every attempt answer `401`
+  — and an arrow no longer moves two rows. The wizard offers the key in effect,
+  meaning an exported `SEAVX_API_KEY`/`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` or the
+  key in the workspace file, instead of resetting the prompt to `none`. A `401`
+  reaches the same "save this endpoint anyway" prompt as any other failure
+  rather than re-asking the key in a loop with no exit, and an empty base URL
+  reports one clause instead of `invalid base URL: base_url is empty`.
 - The Windows build signs the pointer with upstream minisign 0.12, pinned by
   digest in the workflow. Chocolatey ships 0.8, which cannot load a passwordless
   secret key — `Unsupported key derivation function` — so the pointer object the

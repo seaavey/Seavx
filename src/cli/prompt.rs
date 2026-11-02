@@ -54,6 +54,21 @@ pub fn secret(label: &str, current: &str) -> anyhow::Result<String> {
     })
 }
 
+/// A key the user pressed. crossterm 0.28 on Windows reports one physical press
+/// as a press and a release, and the release still resolves to `KeyCode::Char`;
+/// acting on it doubles every typed character. Same filter as the TUI
+/// (`tui/app/run.rs`). Every raw-mode reader must go through this.
+fn live_key(event: crossterm::event::Event) -> Option<crossterm::event::KeyEvent> {
+    match event {
+        crossterm::event::Event::Key(key)
+            if key.kind != crossterm::event::KeyEventKind::Release =>
+        {
+            Some(key)
+        }
+        _ => None,
+    }
+}
+
 /// A checkbox list over `items` (`name`, one-line description).
 ///
 /// Returns the marked indices, or the row under the cursor when nothing is
@@ -66,7 +81,7 @@ pub fn pick_skills(
     global: &mut bool,
 ) -> Option<Vec<usize>> {
     use crossterm::cursor::{Hide, Show};
-    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::event::{self, KeyCode, KeyModifiers};
     use crossterm::queue;
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use std::io;
@@ -86,9 +101,9 @@ pub fn pick_skills(
         if draw(&mut out, &block, &mut drawn).is_err() {
             break None;
         }
-        let key = match event::read() {
-            Ok(Event::Key(key)) => key,
-            Ok(_) => continue,
+        let key = match event::read().map(live_key) {
+            Ok(Some(key)) => key,
+            Ok(None) => continue,
             Err(_) => break None,
         };
         match key.code {
@@ -121,7 +136,7 @@ pub fn pick_skills(
 /// cannot be shortcuts here — arrows move.
 pub fn pick(title: &str, items: &[String], current: Option<&str>) -> Option<String> {
     use crossterm::cursor::{Hide, Show};
-    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::event::{self, KeyCode, KeyModifiers};
     use crossterm::queue;
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use std::io;
@@ -147,9 +162,9 @@ pub fn pick(title: &str, items: &[String], current: Option<&str>) -> Option<Stri
         if draw(&mut out, &block, &mut drawn).is_err() {
             break None;
         }
-        let key = match event::read() {
-            Ok(Event::Key(key)) => key,
-            Ok(_) => continue,
+        let key = match event::read().map(live_key) {
+            Ok(Some(key)) => key,
+            Ok(None) => continue,
             Err(_) => break None,
         };
         match key.code {
@@ -351,7 +366,7 @@ fn draw(out: &mut impl std::io::Write, block: &[String], drawn: &mut u16) -> std
 }
 
 fn read_masked_line() -> anyhow::Result<String> {
-    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::event::{self, KeyCode, KeyModifiers};
     use std::io::{self, Write};
 
     crossterm::terminal::enable_raw_mode()?;
@@ -359,23 +374,24 @@ fn read_masked_line() -> anyhow::Result<String> {
     let mut out = io::stdout();
 
     let result = loop {
-        match event::read() {
-            Ok(Event::Key(key)) => match key.code {
-                KeyCode::Enter => break Ok(()),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    break Err(anyhow::anyhow!("cancelled"));
-                }
-                KeyCode::Char(c) => {
-                    value.push(c);
-                    let _ = out.write_all(b"*");
-                }
-                KeyCode::Backspace if value.pop().is_some() => {
-                    let _ = out.write_all(b"\x08 \x08");
-                }
-                _ => {}
-            },
-            Ok(_) => {}
+        let key = match event::read().map(live_key) {
+            Ok(Some(key)) => key,
+            Ok(None) => continue,
             Err(e) => break Err(anyhow::anyhow!(e)),
+        };
+        match key.code {
+            KeyCode::Enter => break Ok(()),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                break Err(anyhow::anyhow!("cancelled"));
+            }
+            KeyCode::Char(c) => {
+                value.push(c);
+                let _ = out.write_all(b"*");
+            }
+            KeyCode::Backspace if value.pop().is_some() => {
+                let _ = out.write_all(b"\x08 \x08");
+            }
+            _ => {}
         }
         let _ = out.flush();
     };
@@ -389,6 +405,28 @@ fn read_masked_line() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// crossterm 0.28 on Windows resolves the key-up record to `KeyCode::Char`
+    /// as well, so acting on it typed every character twice (#29).
+    #[test]
+    fn a_key_release_is_not_a_second_press() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+        let char_event = |kind| {
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                kind,
+            ))
+        };
+        assert_eq!(
+            live_key(char_event(KeyEventKind::Press)).map(|key| key.code),
+            Some(KeyCode::Char('a'))
+        );
+        assert!(live_key(char_event(KeyEventKind::Repeat)).is_some());
+        assert!(live_key(char_event(KeyEventKind::Release)).is_none());
+        assert!(live_key(Event::FocusGained).is_none());
+    }
 
     /// The raw-mode loop needs a tty; its key handling reduces to this.
     #[test]

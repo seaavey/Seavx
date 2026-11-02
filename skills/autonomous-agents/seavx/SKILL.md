@@ -26,7 +26,7 @@ layer (`genai`), SQLite sessions, and a checkpoint store `/undo` restores from.
 | `seavx sessions list\|show <id>\|export <id>\|resume <id>` | the session store from the shell |
 | `seavx model [model] [-e effort]` | set model and effort; this refreshes the model cache |
 | `seavx doctor [--offline]` | environment and health report |
-| `seavx init`, `seavx setup providers` | write a config file (`seavx init` → workspace, `seavx setup [--workspace]` → global by default); ask for base URL, key, model, effort; a `401`/`403` from `/models` re-asks the key instead of saving the endpoint |
+| `seavx init`, `seavx setup providers` | write a config file (`seavx init` → workspace, `seavx setup [--workspace]` → global by default); ask for base URL, key, model, effort; the key is offered as `****` when one is already in effect (env or workspace file); a `401`/`403` from `/models` re-asks the key or saves the endpoint without one |
 | `seavx memory`, `seavx skills …` | inspect `MEMORY.md`/`USER.md`; list, install, remove skills |
 | `seavx update [--force] [--channel stable\|edge]`, `seavx uninstall` | self-update, removal (`uninstall` asks whether to keep data) |
 
