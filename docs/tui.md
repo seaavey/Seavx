@@ -10,7 +10,10 @@ While you type, the prompt box completes from what you already wrote:
   accepts it, and typing replaces it.
 - `Esc` closes the ghost suggestion, then an open menu, then cancels the
   running turn; it never exits. Pressed twice on an idle prompt it clears the
-  line. `Ctrl+C` twice is the only way out.
+  line.
+- `Ctrl+C` is the stop key: while a turn runs it cancels that turn and leaves
+  the session alone. On an idle prompt it is the way out, and needs a second
+  press within 1.5 s — the first one warns instead of quitting.
 
 Prompts are kept per workspace in `.seavx/svx_history` (gitignored, newest 500),
 so recall survives restarts and picks up prompts written by another session.

@@ -6,7 +6,7 @@ use super::{
     App, EnterAction, ModalSelection, apply_command_effect, clipboard, edit_query, new_input,
     paste, run_agent_worker, spawn_session_resume, visible_models,
 };
-use crate::tui::event::Action;
+use crate::tui::event::{Action, AgentState};
 
 pub(super) fn is_mode_shortcut(key: &KeyEvent) -> bool {
     key.code == KeyCode::BackTab
@@ -27,9 +27,10 @@ pub(super) fn edits_text(key: &KeyEvent) -> bool {
 }
 
 pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::UnboundedSender<Action>) {
-    // Quitting is never blocked. A pending question is answered by
-    // dropping its reply, which the confirmer treats as a denial, so
-    // Ctrl+D cannot approve anything on the way out.
+    // Quitting is never blocked on an idle prompt. A pending question is answered
+    // by dropping its reply, which the confirmer treats as a denial, so Ctrl+C
+    // cannot approve anything on the way out — and while a turn runs it stops
+    // the turn instead of the session.
     if quit_shortcut(app, &key) {
         return;
     }
@@ -350,9 +351,6 @@ pub(super) async fn handle(app: &mut App<'_>, key: KeyEvent, tx: &mpsc::Unbounde
 
     match key.code {
         KeyCode::Esc => app.escape(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
         // The terminal's own paste arrives as `Event::Paste`; this is the path
         // for a terminal that does not send one (and for `Alt+V`, which will
         // force text once images exist).
@@ -468,8 +466,10 @@ async fn paste_from_clipboard(app: &mut App<'_>) {
     }
 }
 
-/// The one way out of the TUI, checked before anything that could swallow a key:
-/// `Ctrl+C`, twice within 1.5 s. `Esc` never quits — it clears the line instead.
+/// The way out of the TUI, checked before anything that could swallow a key:
+/// `Ctrl+C`, twice within 1.5 s — but only on an idle prompt. While a turn runs
+/// the same key stops that turn, so an interrupt never costs the session.
+/// `Esc` never quits — it clears the line instead.
 /// Returns `true` when the key was consumed.
 pub(super) fn quit_shortcut(app: &mut App, key: &KeyEvent) -> bool {
     if !key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -477,6 +477,10 @@ pub(super) fn quit_shortcut(app: &mut App, key: &KeyEvent) -> bool {
     }
     match key.code {
         KeyCode::Char('c') => {
+            if app.status != AgentState::Idle {
+                app.cancel.cancel();
+                return true;
+            }
             if let Some(prev) = app.last_ctrl_c
                 && prev.elapsed() < std::time::Duration::from_millis(1500)
             {

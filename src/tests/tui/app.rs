@@ -1207,6 +1207,28 @@ fn ctrl_c_needs_a_second_press_and_a_plain_key_is_not_a_shortcut() {
 }
 
 #[test]
+fn ctrl_c_stops_a_running_turn_instead_of_leaving_the_session() {
+    let mut app = test_app();
+    let ctrl = |code: KeyCode| KeyEvent::new(code, KeyModifiers::CONTROL);
+    app.status = AgentState::Thinking;
+
+    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('c'))));
+    assert!(app.cancel.is_cancelled(), "the running turn was stopped");
+    assert!(!app.should_quit, "stopping a turn is not exiting the app");
+    assert!(
+        app.toast.is_none(),
+        "no exit warning while a turn is running"
+    );
+
+    // Idle again: the same key is the way out, and still needs its second press.
+    app.status = AgentState::Idle;
+    app.cancel = crate::agent::cancel::CancelToken::new();
+    assert!(quit_shortcut(&mut app, &ctrl(KeyCode::Char('c'))));
+    assert!(!app.should_quit, "one press only warns");
+    assert!(app.toast.is_some());
+}
+
+#[test]
 fn model_index_outside_the_cached_list_is_an_error_not_a_name() {
     let cached: Vec<String> = ["alpha", "beta"].iter().map(|m| m.to_string()).collect();
 

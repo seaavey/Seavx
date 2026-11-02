@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::theme;
 use crate::tui::app::App;
+use crate::tui::event::AgentState;
 
 pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
     let dim = theme::dim();
@@ -36,11 +37,16 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
     };
 
     // Hints step down rather than push the token count off the row: the counter
-    // is data, the key list is a reminder.
-    const HINTS: [&str; 3] = [
-        "↑↓ history  ·  tab complete  ·  ⏎ send  ·  esc esc clear  ·  ctrl+c exit",
-        "↑↓ history  ·  ⏎ send  ·  ctrl+c exit",
-        "⏎ send · ctrl+c",
+    // is data, the key list is a reminder. Ctrl+C stops a running turn and only
+    // exits an idle prompt, so the hint names what the key does right now.
+    let quit = match app.status {
+        AgentState::Idle => "ctrl+c exit",
+        _ => "ctrl+c stop",
+    };
+    let hints_tiers = [
+        format!("↑↓ history  ·  tab complete  ·  ⏎ send  ·  esc ×2 clear  ·  {quit}"),
+        format!("↑↓ history  ·  ⏎ send  ·  {quit}"),
+        "⏎ send · ctrl+c".to_string(),
     ];
     const SEPARATOR: &str = "  ·  ";
 
@@ -55,10 +61,10 @@ pub(super) fn render(app: &App, area: Rect, frame: &mut Frame) {
             + SEPARATOR.chars().count()
             + format!("effort {effort_label}").chars().count()
     };
-    let hints = HINTS
+    let hints = hints_tiers
         .iter()
         .find(|hints| left_width(&model) + hints.chars().count() + 2 <= area.width as usize)
-        .copied()
+        .map(String::as_str)
         .unwrap_or("");
     // Last resort on a pane too narrow for both: the model gives up its tail.
     if hints.is_empty() && left_width(&model) > area.width as usize {

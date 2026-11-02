@@ -417,6 +417,30 @@ fn the_footer_drops_hints_before_it_clips_the_token_count() {
 }
 
 #[test]
+fn the_footer_names_ctrl_c_after_what_it_does_right_now() {
+    let mut app = test_app();
+    app.config.model = Some("deepseek-chat".to_string());
+    let footer = |app: &App| -> String {
+        let mut terminal = Terminal::new(TestBackend::new(170, 24)).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..170).map(|x| buffer[(x, 23)].symbol()).collect()
+    };
+
+    let idle = footer(&app);
+    assert!(idle.contains("ctrl+c exit"), "{idle}");
+    assert!(idle.contains("esc ×2 clear"), "{idle}");
+
+    app.status = crate::tui::event::AgentState::Thinking;
+    let busy = footer(&app);
+    assert!(busy.contains("ctrl+c stop"), "{busy}");
+    assert!(
+        !busy.contains("ctrl+c exit"),
+        "a running turn is stopped, not left: {busy}"
+    );
+}
+
+#[test]
 fn streamed_reasoning_deltas_stay_in_one_paragraph() {
     let mut app = test_app();
     // The engine emits one delta per token, none of them ending in a newline.
