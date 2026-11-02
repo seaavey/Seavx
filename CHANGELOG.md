@@ -97,6 +97,12 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- The background skill evaluator retries only a call that never completed, a
+  rate limit or a server fault: an answer the provider gave with a status is
+  final, so a `400`/`401`/`404` no longer spends a second call on the same
+  refusal. Its notice now names that status — the provider's cause line, without
+  the request body — instead of the model line and a pointer at the log, and the
+  sentence no longer ends in a doubled period.
 - `seavx setup` acts on a typed key once on Windows: the three CLI raw-mode
   readers (`prompt::pick`, `prompt::pick_skills` and the masked key prompt) now
   drop the key-release record that crossterm 0.28 also reports as a character,
