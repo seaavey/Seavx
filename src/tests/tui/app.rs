@@ -1271,6 +1271,23 @@ async fn a_submitted_prompt_leaves_no_ghost_to_swallow_the_first_esc() {
 }
 
 #[test]
+fn a_prompt_titles_the_session_without_waiting_for_the_model() {
+    let mut app = test_app();
+    app.session_id = Some(4);
+
+    // What the worker stores, and shows, on the first turn.
+    assert!(app.apply_title(
+        Some(4),
+        crate::session::title_from("port the loader\nthen the tests")
+    ));
+    assert_eq!(app.session_title.as_deref(), Some("port the loader"));
+
+    // A title for a session that is no longer open is dropped.
+    assert!(!app.apply_title(Some(9), "another session".to_string()));
+    assert_eq!(app.session_title.as_deref(), Some("port the loader"));
+}
+
+#[test]
 fn model_index_outside_the_cached_list_is_an_error_not_a_name() {
     let cached: Vec<String> = ["alpha", "beta"].iter().map(|m| m.to_string()).collect();
 

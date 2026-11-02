@@ -97,6 +97,15 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- A new session shows its own title instead of `new session` until the model
+  names it. The title the store already had — the prompt's first line — was
+  never sent to the window, so the status line waited on a second request that
+  could fail without a trace. It is now shown as soon as the session row
+  exists, and the model's shorter title replaces it when it arrives. That
+  request also stopped being silent: it asks with the streaming call the turn
+  uses, because a gateway that only implements `stream: true` refuses the
+  non-stream shape this used to send, and a failure is logged with its cause
+  instead of dropped.
 - `Esc` needs a second press to cancel a running turn: the first one says so in
   a toast, so a stray key cannot throw away a turn that is costing tokens.
   `Ctrl+C` remains the one-press stop. The footer names both per state — while a

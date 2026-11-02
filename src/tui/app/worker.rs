@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 
 use super::store::lock_store;
 use super::{App, PendingQuestion, TuiConfirmer, TurnRequest};
+use crate::agent::backend::ChatBackend;
 use crate::agent::engine::AgentMode;
 use crate::agent::events::AgentEvent;
 use crate::tui::event::{Action, AgentState};
@@ -226,6 +227,18 @@ pub async fn run_agent_worker(
                     session_id = Some(id);
                     history = replayed;
                     let _ = tx.send(Action::SessionStarted(id));
+                    // The stored title is the prompt's first line, so the header
+                    // shows it at once. The model's shorter title replaces it if
+                    // that request comes back; nothing here waits for it.
+                    if is_first_turn {
+                        let earliest = crate::session::title_from(&prompt);
+                        if !earliest.is_empty() {
+                            let _ = tx.send(Action::AgentTitle {
+                                title: earliest,
+                                session: Some(id),
+                            });
+                        }
+                    }
                 }
                 Err(error) => {
                     let _ = tx.send(Action::SessionFailed(format!(
@@ -245,26 +258,33 @@ pub async fn run_agent_worker(
             let title_session = session_id;
             let title_prompt = prompt.clone();
             let model_name = config.model.clone().unwrap_or_default();
-            // Not `chat_options`: a title is one short line, and extended
-            // thinking on a proxy adapter can come back without the block
-            // signature genai requires.
-            let title_options = genai::chat::ChatOptions::default();
+            // The turn streams, and a gateway that only implements
+            // `stream: true` refuses the non-stream call this used to make —
+            // silently, because the error was dropped. Ask the way the turn
+            // asks, and say why when it still fails.
+            let backend = crate::agent::backend::GenaiBackend::new(client_clone);
             tokio::spawn(async move {
                 let req = genai::chat::ChatRequest::from_user(format!(
                     "Generate a very short 3-5 word concise title for this task without punctuation or quotes:\n{}",
                     title_prompt
                 ));
-                if let Ok(res) = client_clone
-                    .exec_chat(&model_name, req, Some(&title_options))
-                    .await
-                    && let Some(text) = res.into_first_text()
-                {
-                    let clean = crate::util::unquote(text.trim()).to_string();
-                    if !clean.is_empty() {
-                        let _ = title_tx.send(Action::AgentTitle {
-                            title: clean,
-                            session: title_session,
-                        });
+                let mut ignore = |_: crate::agent::backend::StreamDelta| {};
+                match backend.stream(&model_name, req, None, &mut ignore).await {
+                    Ok(res) => {
+                        let text = res.into_first_text().unwrap_or_default();
+                        let clean = crate::util::unquote(text.trim()).to_string();
+                        if !clean.is_empty() {
+                            let _ = title_tx.send(Action::AgentTitle {
+                                title: clean,
+                                session: title_session,
+                            });
+                        }
+                    }
+                    // The prompt's first line is already the title, so this is
+                    // a missed refinement, not a lost session; the cause is
+                    // what makes it fixable.
+                    Err(error) => {
+                        tracing::warn!(error = %error, "session title skipped: title request failed")
                     }
                 }
             });
