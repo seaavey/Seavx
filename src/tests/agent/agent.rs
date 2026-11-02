@@ -2233,6 +2233,17 @@ mod retry_budget {
         );
     }
 
+    fn status_error(status: u16) -> genai::Error {
+        genai::Error::WebModelCall {
+            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
+            webc_error: genai::webc::Error::ResponseFailedStatus {
+                status: reqwest::StatusCode::from_u16(status).expect("status code"),
+                body: "body".to_string(),
+                headers: Box::new(reqwest::header::HeaderMap::new()),
+            },
+        }
+    }
+
     #[test]
     fn only_a_call_that_never_completed_is_retried() {
         use crate::agent::engine::evaluator_retryable;
@@ -2242,6 +2253,22 @@ mod retry_budget {
         assert!(!evaluator_retryable(&genai::Error::Internal(
             "400 bad request".to_string()
         )));
+        // A status the provider answered is deterministic whatever the adapter
+        // wrapped it in. 408 is included: a gateway that means "timed out"
+        // answers 5xx, not this.
+        for status in [400, 401, 403, 404, 408] {
+            assert!(
+                !evaluator_retryable(&status_error(status)),
+                "{status} was retried"
+            );
+        }
+        // A rate limit and a server fault are the two answers that clear.
+        for status in [429, 500, 503] {
+            assert!(
+                evaluator_retryable(&status_error(status)),
+                "{status} was given up on"
+            );
+        }
         // The call broke before an answer existed: worth one more try.
         let broken = genai::Error::WebStream {
             model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
@@ -2249,6 +2276,44 @@ mod retry_budget {
             error: "connection reset".into(),
         };
         assert!(evaluator_retryable(&broken));
+    }
+
+    #[test]
+    fn the_notice_carries_the_status_and_not_the_request_body() {
+        use crate::agent::engine::provider_cause;
+
+        let unauthorized = genai::Error::WebModelCall {
+            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
+            webc_error: genai::webc::Error::ResponseFailedStatus {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                body: "{\"error\":\"no such model\"}".to_string(),
+                headers: Box::new(reqwest::header::HeaderMap::new()),
+            },
+        };
+        let cause = provider_cause(&unauthorized);
+        assert_eq!(cause, "Request failed with status code '401 Unauthorized'");
+        assert!(!cause.contains("no such model"), "the body leaked: {cause}");
+
+        // The cause may itself end in a period; the notice adds its own.
+        let reset = genai::Error::WebStream {
+            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
+            cause: "connection reset.".to_string(),
+            error: "connection reset".into(),
+        };
+        assert_eq!(provider_cause(&reset), "connection reset");
+
+        // A long cause stays one bounded line.
+        let long = genai::Error::WebStream {
+            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
+            cause: "x".repeat(400),
+            error: "long".into(),
+        };
+        let cause = provider_cause(&long);
+        assert!(
+            cause.ends_with('…'),
+            "the long cause was not truncated: {cause}"
+        );
+        assert_eq!(cause.chars().count(), 161, "one line plus the ellipsis");
     }
 
     #[tokio::test]

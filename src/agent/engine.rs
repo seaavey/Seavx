@@ -627,15 +627,23 @@ pub enum RetryTrigger {
 }
 
 /// A provider call that never completed — transport, DNS, timeout — is worth one
-/// more try; a request the adapter rejected is not. Keeps the background skill
-/// evaluator from spending a second call on an answer it will get again.
+/// more try, and so is a rate limit or a server fault; a request the adapter
+/// answered with a status is not, because the same request gets the same
+/// refusal. Keeps the background skill evaluator from spending a second call on
+/// an answer it will get again.
 pub fn evaluator_retryable(error: &genai::Error) -> bool {
-    matches!(
-        error,
-        genai::Error::WebModelCall { .. }
-            | genai::Error::WebAdapterCall { .. }
-            | genai::Error::WebStream { .. }
-    )
+    match error.status() {
+        Some(status) => {
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        // No status: the call broke before an answer existed.
+        None => matches!(
+            error,
+            genai::Error::WebModelCall { .. }
+                | genai::Error::WebAdapterCall { .. }
+                | genai::Error::WebStream { .. }
+        ),
+    }
 }
 
 /// One budget per user turn, never per tool call.
@@ -850,6 +858,22 @@ pub(super) fn one_line(text: &str) -> String {
     } else {
         short
     }
+}
+
+/// The line a user can act on. `Display` names the model first and the cause
+/// second, and the cause is where the status and the provider's message live;
+/// the response body after it is request detail and stays in the log.
+pub(super) fn provider_cause(error: &genai::Error) -> String {
+    let text = error.to_string();
+    let cause = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Cause:"))
+        .map(str::trim)
+        .unwrap_or_else(|| text.lines().next().unwrap_or_default().trim());
+    // shortcut: the body is cut at webc's own wording, revisit if that Display
+    // changes.
+    let cause = cause.split(". Response body:").next().unwrap_or(cause);
+    one_line(cause).trim_end_matches('.').to_string()
 }
 
 fn report_stopped(
@@ -2022,11 +2046,12 @@ impl AgentRuntime {
                 Err(err) => {
                     tracing::warn!(error = %err, "Skill synthesis skipped: evaluator request failed");
                     // One line: the error carries the whole request body, and that
-                    // belongs in the log, not in the transcript.
+                    // belongs in the log, not in the transcript. The cause is the
+                    // half a user can act on, so it replaces the model line.
                     event_sink(AgentEvent::Notice(format!(
                         "skill evaluator skipped after {attempt} attempt{}: {}. The turn is unaffected; the provider error is in the log.",
                         if attempt == 1 { "" } else { "s" },
-                        one_line(&err.to_string())
+                        provider_cause(&err)
                     )));
                     return;
                 }
