@@ -51,13 +51,14 @@ only then renames it over the binary. A failure at any point leaves the installe
 binary byte-identical and deletes the temp file; `--force` relaxes ordering only,
 never a check.
 
-`PINNED_KEYS` is empty, so nothing installs from this branch. The pointer
-production serves still predates the signed format (no `channel`, `target` or
-`sig`), and parsing runs before the key set is consulted, so the message a run
-gets today is `<url>: channel: missing or not a string`. Once a signed pointer
-exists, the empty key set answers `no pinned update key`, and a pointer no pinned
-key signed answers `signature: not signed by a pinned update key`. Do not "fix"
-either by disabling the check.
+`PINNED_KEYS` (`src/cli/update.rs`), `install.sh`'s `UPDATE_KEY` and
+`install.ps1`'s `$UpdateKey` carry the same release key, `RWQHDAX…1Bf`;
+`the_installers_name_only_published_binaries` fails when one drifts. A pointer no
+pinned key signed answers `signature: not signed by a pinned update key` — do not
+"fix" that by disabling the check. CI signs with `MINISIGN_SECRET_KEY` on every
+master build; Linux and macOS use the packaged `minisign`, Windows pins upstream
+0.12 by digest because Chocolatey only ships 0.8, which rejects a passwordless
+secret key with `Unsupported key derivation function`.
 
 `SEAVX_UPDATE_BASE` moves the origin for a test server; it changes no check, and
 both installers read it too. `install.sh` and `install.ps1` pin the same key and

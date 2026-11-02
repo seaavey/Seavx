@@ -94,8 +94,7 @@ curl -sI https://cdn.seavx.com/latest/linux/x86_64   # 302 to the newest linux b
 curl -O https://cdn.seavx.com/builds/<sha>/<sha256>/seavx-linux-x86_64
 ```
 
-Once a release key is pinned, an installed binary updates itself from the same
-origin:
+An installed binary updates itself from the same origin:
 
 ```bash
 seavx update                   # newest tagged release
@@ -107,23 +106,23 @@ release pointer, that the pointer is for the requested channel and this
 platform, that its route names the digest, the `sha256` of the bytes it
 downloaded, and that the candidate itself reports the pointer's version.
 `--force` only skips the version ordering; a failure leaves the installed binary
-untouched. Nothing installs on this branch yet. The signing key is unpublished
-and `PINNED_KEYS` is empty, but the pointer served today predates the signed
-format — no `channel`, `target` or `sig` — and the parser reads `channel` before
-the key set is consulted, so the command stops with
+untouched. CI signs the pointer on every master build, and the release key is
+pinned in the client and in both installers:
 
 ```console
 $ seavx update
 Checking for updates... (current version: v0.1.3-rc.1)
-Error: https://cdn.seavx.com/latest/linux/x86_64.json: channel: missing or not a string
+SEAVX is already up to date (v0.1.3-rc.1, 67e4220)
+$ seavx update --channel edge
+A newer build of v0.1.3-rc.1 is available (6f86d0f).
+Downloading v0.1.3-rc.1 (6f86d0f)...
+Successfully updated SEAVX v0.1.3-rc.1 (6f86d0f, /home/seaavey/.local/bin/seavx)
+signature  ok
+checksum   ok
 ```
 
-`--channel edge` stops earlier: `edge/linux/x86_64.json` is a 404, because no
-master build has published one. An empty key set refusing with `no pinned update
-key` is what happens once a signed pointer exists.
-
-<!-- TODO(update): this paragraph goes stale the moment Task 0 pins the key;
-     rewrite it against a signed pointer and drop the transcript above. -->
+A pointer whose signature does not verify is refused before anything is
+downloaded, by the client and by both installers.
 
 ## Configure a provider
 
@@ -188,7 +187,7 @@ seavx resume svx-2f124b69
 
 ## Status
 
-Version 0.1.3-rc.1, actively developed by one maintainer. No stability guarantee yet:
+Version 0.1.4, actively developed by one maintainer. No stability guarantee yet:
 config keys and the session schema can change between minor versions, and the
 [CHANGELOG](CHANGELOG.md) records what moved. The [roadmap](ROADMAP.md) lists the
 three milestones in progress.

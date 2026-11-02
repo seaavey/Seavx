@@ -16,15 +16,13 @@ per landed change; no entry describes behaviour that is not in the code.
   installed binary byte-identical and deletes the temp file, and `--force`
   skips the version ordering and nothing else: a forced downgrade downloads
   through the same checks as an upgrade. The default channel is stable (a tagged
-  release); `--channel edge` reads the master pointer, which no master build has
-  published yet, so it answers a 404. The client and both installers now accept
+  release); `--channel edge` reads the master pointer, one build ahead of the
+  pointer a tag moves. The client and both installers now accept
   macOS arm64 beside linux x86_64 and windows x86_64 — CI already built that
   target and `latest/macos/arm64.json` already answered, so what is new is the
-  update path installing it. No release key is pinned yet, and the pointer in
-  production still predates the signed format, so nothing installs either way:
-  parsing refuses (`channel: missing or not a string`) before an empty key set
-  would answer `no pinned update key`, and trusting a checksum from an unsigned
-  pointer never gets the chance.
+  update path installing it. The release key is pinned in the client and both
+  installers, and CI signs the pointer on every master build, so the update path
+  runs against a signed pointer on all three targets.
 
 - The reasoning-effort pickers offer what the model publishes instead of one
   fixed list: `seavx model`, `seavx setup` and the TUI modal read
@@ -99,16 +97,21 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- The Windows build signs the pointer with upstream minisign 0.12, pinned by
+  digest in the workflow. Chocolatey ships 0.8, which cannot load a passwordless
+  secret key — `Unsupported key derivation function` — so the pointer object the
+  Windows leg publishes was the one build that never carried a signature.
 - Both installers verify the release pointer before the binary lands: the
   channel, the target, the same field shapes the client enforces, the
   `builds/{sha}/{sha256}/{binary}` route and the minisign signature over the
   same canonical bytes, with the download staged in a temp location and renamed
   into place — `<exe>.tmp` beside the destination in `install.ps1`, a `mktemp -d`
   copy through a `.new` beside it in `install.sh` — so a failed check or a short
-  write leaves the working binary untouched. An installer that pins no release
-  key now refuses instead of trusting a checksum that arrived from an unsigned
-  pointer. One that has a key but no `minisign` on `PATH` warns and verifies the
-  checksum only, which detects transfer corruption and not a forged pointer.
+  write leaves the working binary untouched. An installer pins the same key as the
+  client and refuses a pointer whose signature does not verify, instead of
+  trusting a checksum that arrived unsigned. One that has the key but no
+  `minisign` on `PATH` warns and verifies the checksum only, which detects
+  transfer corruption and not a forged pointer.
 - Catalog lookups ignore the separators a gateway spells a model with:
   `deepseek-v4-1-flash-1017`, `deepseek-v4.1-flash-1017:free` and a routed
   `rv/deepseek-ai/DeepSeek-V4.1-Flash-1017` are one key, so a gateway that
