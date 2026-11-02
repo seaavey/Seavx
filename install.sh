@@ -9,10 +9,10 @@ BASE="${SEAVX_UPDATE_BASE:-https://cdn.seavx.com}"
 # Trimmed once: every URL below is built with a single `/`.
 BASE="${BASE%/}"
 
-# TODO(update): paste the Task 0 release public key here, as in `PINNED_KEYS`
-# (src/cli/update.rs). While it is empty the install refuses, because a checksum
-# that arrives from an unsigned pointer authenticates nothing.
-UPDATE_KEY=""
+# The release key `PINNED_KEYS` pins (src/cli/update.rs); rotate both together.
+# An empty value refuses the install: a checksum that arrives from an unsigned
+# pointer authenticates nothing.
+UPDATE_KEY="RWQHDAXMOIB5cgZlx5MRziwUzJ6urbRVNNmodqclv8PHdvKIqUbnb1Bf"
 
 # Only these platforms have CI-built binaries; everything else builds from source.
 # `BINARY` is the last segment of the signed route, i.e. `Target::binary`.

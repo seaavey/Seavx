@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The keys a release pointer must be signed by. A rotation adds a second entry.
-const PINNED_KEYS: &[&str] = &[]; // TODO(update): paste the Task 0 public key here before the first release build
+const PINNED_KEYS: &[&str] = &["RWQHDAXMOIB5cgZlx5MRziwUzJ6urbRVNNmodqclv8PHdvKIqUbnb1Bf"];
 
 const CDN: &str = "https://cdn.seavx.com";
 const POINTER_TIMEOUT: Duration = Duration::from_secs(30);

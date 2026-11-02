@@ -7,10 +7,10 @@ $Base = if ($env:SEAVX_UPDATE_BASE) { $env:SEAVX_UPDATE_BASE } else { 'https://c
 # Trimmed once: every URL below is built with a single `/`.
 $Base = $Base.TrimEnd('/')
 
-# TODO(update): paste the Task 0 release public key here, as in `PINNED_KEYS`
-# (src/cli/update.rs). While it is empty the install refuses, because a checksum
-# that arrives from an unsigned pointer authenticates nothing.
-$UpdateKey = ''
+# The release key `PINNED_KEYS` pins (src/cli/update.rs); rotate both together.
+# An empty value refuses the install: a checksum that arrives from an unsigned
+# pointer authenticates nothing.
+$UpdateKey = 'RWQHDAXMOIB5cgZlx5MRziwUzJ6urbRVNNmodqclv8PHdvKIqUbnb1Bf'
 
 $Target = 'windows-x86_64'
 # The last segment of the signed route, i.e. `Target::binary`.
