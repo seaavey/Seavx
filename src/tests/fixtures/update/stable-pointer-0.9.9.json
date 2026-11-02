@@ -1,0 +1,10 @@
+{
+  "channel": "stable",
+  "target": "linux-x86_64",
+  "sha": "06a4060",
+  "key": "builds/06a4060/81ce1245c381cf69a80d627853806331651fed06808598e34d8af628102ea0eb/seavx-linux-x86_64",
+  "version": "0.9.9",
+  "built_at": "2026-10-31T16:41:34Z",
+  "sha256": "81ce1245c381cf69a80d627853806331651fed06808598e34d8af628102ea0eb",
+  "sig": "untrusted comment: signature from rsign secret key\nRUQkqsrNANQV1eRhTlMO0VYwFO70qkUZlWxJLIhhS6MyERC804Z7COuJT4BlDw511eZxwwDMnJwzv28785Vd+kkZ9kPxO1GRyg8=\ntrusted comment: seavx fixture pointer - signs no release\n2xKfIvA+/Fu1iquBBoPhCVCTPTm05IHW7oiTp2twUhI527xJK+NdYJyOxUwZUOoJ61C1m0ku2a8Lwsac9F/JDw==\n"
+}

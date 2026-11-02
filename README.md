@@ -64,10 +64,10 @@ interactive agent.
 
 ## Install
 
-Linux x86_64 and macOS arm64 have prebuilt binaries. Any other Linux or macOS
-combination builds from source, which needs [Cargo](https://rustup.rs). The
-binary lands in `~/.local/bin`, and the installer says so when that directory is
-not on `PATH`.
+Linux x86_64, macOS arm64 and Windows x86_64 have prebuilt binaries. Any other
+Linux or macOS combination builds from source, which needs
+[Cargo](https://rustup.rs). The binary lands in `~/.local/bin`, and the
+installer says so when that directory is not on `PATH`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/seaavey/Seavx/master/install.sh | bash
@@ -86,12 +86,44 @@ From a checkout:
 cargo install --path .
 ```
 
-Every push to master publishes a build tagged with its commit:
+Every push to master publishes a build tagged with its commit, for linux
+x86_64, macOS arm64 and windows x86_64:
 
 ```bash
 curl -sI https://cdn.seavx.com/latest/linux/x86_64   # 302 to the newest linux build
-curl -O https://cdn.seavx.com/builds/<sha>/seavx-linux-x86_64
+curl -O https://cdn.seavx.com/builds/<sha>/<sha256>/seavx-linux-x86_64
 ```
+
+Once a release key is pinned, an installed binary updates itself from the same
+origin:
+
+```bash
+seavx update                   # newest tagged release
+seavx update --channel edge    # newest master build
+```
+
+Before anything is replaced, the client verifies the minisign signature over the
+release pointer, that the pointer is for the requested channel and this
+platform, that its route names the digest, the `sha256` of the bytes it
+downloaded, and that the candidate itself reports the pointer's version.
+`--force` only skips the version ordering; a failure leaves the installed binary
+untouched. Nothing installs on this branch yet. The signing key is unpublished
+and `PINNED_KEYS` is empty, but the pointer served today predates the signed
+format — no `channel`, `target` or `sig` — and the parser reads `channel` before
+the key set is consulted, so the command stops with
+
+```console
+$ seavx update
+Checking for updates... (current version: v0.1.3-rc.1)
+Error: https://cdn.seavx.com/latest/linux/x86_64.json: channel: missing or not a string
+```
+
+`--channel edge` stops earlier: `edge/linux/x86_64.json` is a 404, because no
+master build has published one. An empty key set refusing with `no pinned update
+key` is what happens once a signed pointer exists.
+
+<!-- TODO(update): this paragraph goes stale the moment Task 0 pins the key;
+     rewrite it against a signed pointer and drop the transcript above. -->
 
 ## Configure a provider
 

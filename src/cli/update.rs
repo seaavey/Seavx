@@ -1,101 +1,308 @@
 //! `seavx update`: replace the running binary with the newest CI build served by cdn.seavx.com.
 
-/// Pointer object CI publishes next to each build.
-#[derive(serde::Deserialize)]
-struct Latest {
-    sha: String,
-    key: String,
-    version: String,
-    /// Hex SHA-256 of the build. Absent from a pointer published before the
-    /// field existed, so a missing value warns instead of blocking an update.
-    #[serde(default)]
-    sha256: Option<String>,
+mod manifest;
+
+use manifest::{
+    Channel, Manifest, Ordering, Target, digest_matches, hex_lower, ordering, probe_version,
+};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// The keys a release pointer must be signed by. A rotation adds a second entry.
+const PINNED_KEYS: &[&str] = &["RWQHDAXMOIB5cgZlx5MRziwUzJ6urbRVNNmodqclv8PHdvKIqUbnb1Bf"];
+
+const CDN: &str = "https://cdn.seavx.com";
+const POINTER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Eight short fields: a larger body is a hostile CDN, not a newer pointer.
+const POINTER_LIMIT: usize = 64 * 1024;
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The binary this process is: what a published pointer is ordered against.
+pub(crate) struct Current {
+    pub version: semver::Version,
+    pub sha: Option<&'static str>,
 }
 
-/// Lowercase hex, the spelling `sha256sum` and the CI pointer use.
-fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Compare what the pointer published with the bytes actually received.
-/// `Ok(true)` on a match, `Ok(false)` when the pointer carries no checksum, and
-/// `Err` with both values when they differ.
-fn verify_digest(expected: Option<&str>, actual: &str) -> Result<bool, String> {
-    match expected {
-        Some(expected) if expected.eq_ignore_ascii_case(actual) => Ok(true),
-        Some(expected) => Err(format!(
-            "download does not match the published checksum: expected {expected}, got {actual}"
-        )),
-        None => Ok(false),
-    }
-}
-
-/// True when the pointer names the commit this binary was built from. CI republishes
-/// every master build under the same unreleased version, so the version alone cannot
-/// answer that. A build made outside git has no commit, and the version stands alone.
-fn same_commit(current: Option<&str>, latest: &Latest) -> bool {
-    match current {
-        Some(sha) => sha.eq_ignore_ascii_case(&latest.sha),
-        None => true,
-    }
-}
-
-pub async fn run(force: bool) -> anyhow::Result<()> {
-    const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-    // Absent when the build ran outside a git checkout.
-    const CURRENT_SHA: Option<&str> = option_env!("SEAVX_GIT_SHA");
-
-    let (os, arch) = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => ("linux", "x86_64"),
-        ("windows", "x86_64") => ("windows", "x86_64"),
-        (os, arch) => {
-            anyhow::bail!(
-                "Unsupported platform for binary self-update: {os}-{arch}. Please update via cargo install or build from source."
-            );
-        }
+pub async fn run(force: bool, channel: &str) -> anyhow::Result<()> {
+    let channel =
+        Channel::parse(channel).ok_or_else(|| anyhow::anyhow!("unknown channel {channel:?}"))?;
+    let current = Current {
+        version: semver::Version::parse(env!("CARGO_PKG_VERSION"))?,
+        // Absent when the build ran outside a git checkout.
+        sha: option_env!("SEAVX_GIT_SHA"),
     };
+    let exe = std::env::current_exe()?;
+    let base = resolve_base(std::env::var("SEAVX_UPDATE_BASE").ok());
+    install(force, channel, &exe, &base, &current, PINNED_KEYS).await
+}
 
-    println!("Checking for updates... (current version: v{CURRENT_VERSION})");
+/// The CDN root. `SEAVX_UPDATE_BASE` moves the origin and nothing else, so a test
+/// can serve the committed fixtures without weakening what the pointer must prove.
+fn resolve_base(from_env: Option<String>) -> String {
+    from_env.map_or_else(
+        || CDN.to_string(),
+        |base| base.strip_suffix('/').unwrap_or(&base).to_string(),
+    )
+}
+
+/// Verify the signed pointer for this channel and platform, then install the
+/// artifact it names. Everything the pointer claims is checked before the
+/// artifact is requested; `force` only relaxes the version ordering.
+async fn install(
+    force: bool,
+    channel: Channel,
+    exe: &Path,
+    base: &str,
+    current: &Current,
+    keys: &[&str],
+) -> anyhow::Result<()> {
+    let target = Target::detect().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unsupported platform for binary self-update: {}-{}. Please update via cargo install or build from source.",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+
+    println!(
+        "Checking for updates... (current version: v{})",
+        current.version
+    );
 
     let client = reqwest::Client::builder()
         .user_agent("seavx-updater")
         .build()?;
 
-    let latest: Latest = client
-        .get(format!("https://cdn.seavx.com/latest/{os}/{arch}.json"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let pointer_url = format!("{base}/{}", channel.pointer_path(&target));
+    let pointer = fetch_pointer(&client, &pointer_url).await?;
+    let manifest =
+        Manifest::parse(&pointer).map_err(|error| anyhow::anyhow!("{pointer_url}: {error}"))?;
 
-    let current_exe = std::env::current_exe()?;
-
-    // CI republishes every master build under the same unreleased version, so a
-    // matching version alone does not mean the running binary is that build.
-    if !force && latest.version == CURRENT_VERSION {
-        if same_commit(CURRENT_SHA, &latest) {
-            println!(
-                "SEAVX is already up to date (v{}, {})",
-                latest.version, latest.sha
-            );
-            return Ok(());
-        }
-        println!(
-            "A newer build of v{CURRENT_VERSION} is available ({}).",
-            latest.sha
+    // Signature first, then the bindings it signs for: a pointer that names
+    // another channel or target is refused before its `key` is ever fetched.
+    manifest
+        .verify(keys)
+        .and_then(|()| manifest.check_channel(channel))
+        .and_then(|()| manifest.check_target(&target))
+        .map_err(|error| anyhow::anyhow!("{pointer_url}: {error}"))?;
+    // Defence in depth: the unit test is the only proof of this branch, since a
+    // pointer failing it cannot carry a valid signature.
+    if !manifest.key_matches_route() {
+        anyhow::bail!(
+            "{pointer_url}: signed key {} should be builds/{}/{}/{}",
+            manifest.key,
+            manifest.sha,
+            manifest.sha256,
+            target.binary
         );
     }
 
-    println!("Downloading v{} ({})...", latest.version, latest.sha);
+    match ordering(&current.version, current.sha, &manifest) {
+        Ordering::UpToDate if !force => {
+            println!(
+                "SEAVX is already up to date (v{}, {})",
+                manifest.version, manifest.sha
+            );
+            return Ok(());
+        }
+        Ordering::Downgrade if !force => {
+            anyhow::bail!(
+                "refusing to downgrade from v{} to v{}; pass --force to install it anyway",
+                current.version,
+                manifest.version
+            );
+        }
+        Ordering::SameVersionNewCommit => println!(
+            "A newer build of v{} is available ({}).",
+            current.version, manifest.sha
+        ),
+        _ => {}
+    }
+
+    println!("Downloading v{} ({})...", manifest.version, manifest.sha);
     let response = client
-        .get(format!("https://cdn.seavx.com/{}", latest.key))
+        .get(format!("{base}/{}", manifest.key))
+        .timeout(DOWNLOAD_TIMEOUT)
         .send()
         .await?
         .error_for_status()?;
+    let pb = progress(response.content_length());
 
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Unable to get parent dir of executable"))?;
+    // Owns the temp path: every failure below leaves the directory as it was.
+    let guard = TempFile::new(dir);
+    let temp = guard.path().to_path_buf();
+
+    // Streamed straight into the temp file: the download is never held whole in
+    // memory, and a broken transfer leaves no partial bytes at the target.
+    use futures::StreamExt;
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+    let mut stream = response.bytes_stream();
+    let mut file = tokio::fs::File::create(&temp).await.map_err(|error| {
+        anyhow::anyhow!(
+            "cannot write {} in {}: {error}",
+            temp.display(),
+            dir.display()
+        )
+    })?;
+    let mut digest = Sha256::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        pb.inc(chunk.len() as u64);
+        digest.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.sync_all().await?;
+    drop(file);
+
+    let actual = hex_lower(&digest.finalize());
+    if let Err(message) = digest_matches(&manifest.sha256, &actual) {
+        pb.abandon();
+        anyhow::bail!(message);
+    }
+    pb.finish_with_message("Download complete");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| anyhow::anyhow!("cannot chmod {}: {error}", temp.display()))?;
+    }
+
+    // The downloaded file is run to prove it is the build the pointer signed,
+    // not merely bytes with the right hash.
+    let stdout = probe_exe(&temp, PROBE_TIMEOUT)
+        .await
+        .map_err(|error| anyhow::anyhow!("{}: {error}", temp.display()))?;
+    let reported = probe_version(&stdout);
+    if reported.as_ref() != Some(&manifest.version) {
+        anyhow::bail!(
+            "the downloaded binary reports {}, the pointer expects v{}",
+            reported.map_or_else(|| "no version".to_string(), |version| format!("v{version}")),
+            manifest.version
+        );
+    }
+
+    replace_exe(&temp, exe).map_err(|error| {
+        anyhow::anyhow!(
+            "Failed to replace binary at {}: {error}. You may need elevated permissions (e.g. sudo).",
+            exe.display()
+        )
+    })?;
+    guard.keep();
+
+    let transition = if manifest.version == current.version {
+        format!("v{}", manifest.version)
+    } else {
+        format!("v{} to v{}", current.version, manifest.version)
+    };
+    println!(
+        "Successfully updated SEAVX {transition} ({}, {})\nsignature  ok\nchecksum   ok",
+        manifest.sha,
+        exe.display()
+    );
+
+    Ok(())
+}
+
+/// Read the pointer under the size cap: nothing is verified until the whole body
+/// is buffered, so an unbounded read is the CDN's cheapest way to exhaust the
+/// updater. `content-length` is only a hint, so the cap is enforced per chunk.
+async fn fetch_pointer(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
+    use futures::StreamExt;
+
+    let response = client
+        .get(url)
+        .timeout(POINTER_TIMEOUT)
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| anyhow::anyhow!("{url}: {error}"))?;
+        if body.len() + chunk.len() > POINTER_LIMIT {
+            anyhow::bail!("{url}: pointer body exceeds {POINTER_LIMIT} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Run the candidate with `--version`, killing it if it hangs. The child is always
+/// reaped before this returns: the caller deletes the temp file it runs from, and
+/// Windows refuses that while the process still exists.
+async fn probe_exe(bin: &Path, timeout: Duration) -> anyhow::Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut child = tokio::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        // A dropped child is killed; the timeout arm below still waits for it.
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            // Kill then wait: `kill_on_drop` alone closes the handle without
+            // waiting, leaving the process alive to hold the temp file.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(anyhow::anyhow!(
+                "did not answer --version within {timeout:?}"
+            ));
+        }
+    };
+    if !status.success() {
+        anyhow::bail!(
+            "--version exited with {}",
+            status
+                .code()
+                .map_or_else(|| "a signal".to_string(), |code| code.to_string())
+        );
+    }
+    // Read after the exit: the pipe is at EOF, so this cannot block.
+    let mut output = Vec::new();
+    stdout.read_to_end(&mut output).await?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+/// The temp path next to the binary, removed on every failure path unless kept.
+struct TempFile(PathBuf);
+
+impl TempFile {
+    fn new(dir: &Path) -> TempFile {
+        let mut name = format!(".seavx-update-{}", std::process::id());
+        // Windows runs the temp file as a process, which needs the extension.
+        if cfg!(windows) {
+            name.push_str(".exe");
+        }
+        TempFile(dir.join(name))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn keep(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn progress(size: Option<u64>) -> indicatif::ProgressBar {
     // A template is a constant, so a rejected one falls back instead of panicking.
-    let pb = match response.content_length() {
+    match size {
         Some(size) => {
             let pb = indicatif::ProgressBar::new(size);
             let style = indicatif::ProgressStyle::default_bar()
@@ -113,85 +320,7 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
             pb.set_style(style);
             pb
         }
-    };
-
-    let current_dir = current_exe
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Unable to get parent dir of executable"))?;
-    let temp_path = current_dir.join(format!(".seavx-update-{}.tmp", std::process::id()));
-
-    // Streamed straight into the temp file: the download is never held whole in
-    // memory, and a broken transfer leaves no partial bytes at the target.
-    use futures::StreamExt;
-    use sha2::{Digest, Sha256};
-    use tokio::io::AsyncWriteExt;
-    let mut stream = response.bytes_stream();
-    let mut file = tokio::fs::File::create(&temp_path).await?;
-    let mut digest = Sha256::new();
-    while let Some(chunk_result) = stream.next().await {
-        match chunk_result {
-            Ok(chunk) => {
-                pb.inc(chunk.len() as u64);
-                digest.update(&chunk);
-                if let Err(error) = file.write_all(&chunk).await {
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    return Err(error.into());
-                }
-            }
-            Err(error) => {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(error.into());
-            }
-        }
     }
-    file.sync_all().await?;
-    drop(file);
-
-    // The pointer arrives over TLS from the same origin as the build, so the
-    // digest catches a corrupt or swapped object. It cannot prove authenticity
-    // to a client whose pointer was already forged: that needs a signature.
-    let actual = hex_lower(&digest.finalize());
-    match verify_digest(latest.sha256.as_deref(), &actual) {
-        Ok(true) => {}
-        Ok(false) => eprintln!(
-            "warning: this build was published without a checksum; the download was not verified"
-        ),
-        Err(message) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            pb.abandon();
-            anyhow::bail!(message);
-        }
-    }
-    pb.finish_with_message("Download complete");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        let _ = std::fs::set_permissions(&temp_path, perms);
-    }
-
-    // Atomically replace current executable
-    if let Err(e) = replace_exe(&temp_path, &current_exe) {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        anyhow::bail!(
-            "Failed to replace binary at {}: {e}. You may need elevated permissions (e.g. sudo).",
-            current_exe.display()
-        );
-    }
-
-    let transition = if latest.version == CURRENT_VERSION {
-        format!("v{}", latest.version)
-    } else {
-        format!("v{CURRENT_VERSION} to v{}", latest.version)
-    };
-    println!(
-        "Successfully updated SEAVX {transition} ({}, {})",
-        latest.sha,
-        current_exe.display()
-    );
-
-    Ok(())
 }
 
 #[cfg(test)]
