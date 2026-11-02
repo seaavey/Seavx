@@ -29,6 +29,12 @@ Mouse capture is on, so a drag belongs to the app instead of the terminal:
   the rows it was mapped against no longer exist.
 - A click copies nothing. `Shift`+drag still reaches the terminal's own
   selection, which copies the painted rows with their decorations.
+- With no clipboard on the host — an SSH or tmux session with neither `$DISPLAY`
+  nor `$WAYLAND_DISPLAY` — the release still copies: the block goes out as an
+  OSC 52 sequence, which the terminal you are looking at turns into its own
+  clipboard, and to `.seavx/last-copy.txt` (mode 0600) in case that terminal
+  drops the sequence. tmux needs `set-clipboard on` for the first to work; the
+  file does not depend on it. One toast names both.
 
 ---
 

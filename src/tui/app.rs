@@ -105,6 +105,10 @@ pub struct TranscriptCache {
     pub rows: u16,
 }
 
+/// Where a copy goes when the host has no clipboard: the file it wrote.
+pub type HeadlessCopy =
+    std::sync::Arc<dyn Fn(&str) -> Result<std::path::PathBuf, String> + Send + Sync>;
+
 pub struct App<'a> {
     pub workspace: String,
     /// The canonical workspace root: the directory the checkpoint store and the
@@ -113,6 +117,9 @@ pub struct App<'a> {
     pub input: TextArea<'a>,
     /// Injected so tests paste from a fake and production reads the real one.
     pub clipboard: std::sync::Arc<dyn Clipboard>,
+    /// Where a copy goes when the host has no clipboard; injected so tests never
+    /// write to the real stdout or the checkout.
+    pub copy_headless: HeadlessCopy,
     /// Images waiting on the next Enter; cleared by an accepted turn.
     pub pending_attachments: Vec<crate::session::Attachment>,
     pub segments: Vec<Segment>,
@@ -467,6 +474,13 @@ impl<'a> App<'a> {
                 .to_path_buf(),
             input: new_input(),
             clipboard: std::sync::Arc::new(SystemClipboard::default()),
+            copy_headless: std::sync::Arc::new(|text: &str| {
+                clipboard::copy_without_clipboard(
+                    text,
+                    std::path::Path::new("."),
+                    &mut std::io::stdout(),
+                )
+            }),
             pending_attachments: Vec::new(),
             segments: Vec::new(),
             revision: 0,

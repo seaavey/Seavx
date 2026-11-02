@@ -97,6 +97,15 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- Copying from the transcript works on a host with no clipboard. A drag whose
+  write to the system clipboard fails now goes out as an OSC 52 sequence — the
+  terminal the user is looking at copies it, which is the one channel that
+  survives SSH — and to `.seavx/last-copy.txt` (mode 0600, gitignored), so a
+  terminal that drops the sequence still leaves the text somewhere the user can
+  read it. The toast names where it went instead of only saying the copy failed,
+  and the failure itself now carries arboard's own error rather than a fixed
+  sentence that hid whether there was no backend, no display, or a refused
+  connection.
 - The background skill evaluator retries only a call that never completed, a
   rate limit or a server fault: an answer the provider gave with a status is
   final, so a `400`/`401`/`404` no longer spends a second call on the same
