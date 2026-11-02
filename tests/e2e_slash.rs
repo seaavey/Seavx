@@ -385,6 +385,11 @@ fn two_esc_presses_cancel_a_running_turn() {
     tui.waits_for("the request to reach the gateway", || {
         requested.load(Ordering::SeqCst)
     });
+    // The session line names the prompt from the first frame: the title is the
+    // prompt's first line, and the model's shorter one only refines it. Its
+    // fingerprint is the title followed by the state word, the dashes and the
+    // orb between them are dropped by the screen filter (#48).
+    tui.wait_for_screen("hallothinking");
 
     tui.press("\x1b");
     tui.wait_for_screen("Press Esc again to cancel");
