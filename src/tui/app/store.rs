@@ -148,6 +148,10 @@ impl App<'_> {
         self.scroll = self.max_scroll();
         self.auto_scroll = true;
         self.status = AgentState::Thinking;
+        // The dimmed tail belonged to the submitted text; left behind, it is
+        // invisible and the first Esc after the submit clears it instead of
+        // cancelling the turn.
+        self.clear_ghost();
         self.input = new_input();
         self.reset_history_nav();
         // A cancelled turn must not poison the next one.
