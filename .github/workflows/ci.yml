@@ -156,7 +156,18 @@ jobs:
           case "${{ runner.os }}" in
             Linux)   sudo apt-get update && sudo apt-get install -y minisign ;;
             macOS)   brew install minisign ;;
-            Windows) choco install minisign -y ;;
+            # choco ships 0.8, which refuses a passwordless secret key ("Unsupported
+            # key derivation function"). Pin upstream 0.12; the digest is the published
+            # minisign-0.12-win64.zip, checked against jedisct1's release key
+            # RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3.
+            Windows)
+              curl -fsSL -o "$RUNNER_TEMP/minisign.zip" \
+                https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip
+              echo "37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479  $RUNNER_TEMP/minisign.zip" \
+                | sha256sum -c -
+              powershell -NoProfile -Command "Expand-Archive -Force '$RUNNER_TEMP/minisign.zip' -DestinationPath '$RUNNER_TEMP/minisign'"
+              echo "$RUNNER_TEMP/minisign/minisign-win64/x86_64" >> "$GITHUB_PATH"
+              ;;
           esac
 
       - name: Mirror to R2
