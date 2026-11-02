@@ -187,7 +187,7 @@ seavx resume svx-2f124b69
 
 ## Status
 
-Version 0.1.4, actively developed by one maintainer. No stability guarantee yet:
+Version 0.1.3-rc.1, actively developed by one maintainer. No stability guarantee yet:
 config keys and the session schema can change between minor versions, and the
 [CHANGELOG](CHANGELOG.md) records what moved. The [roadmap](ROADMAP.md) lists the
 three milestones in progress.
