@@ -337,3 +337,56 @@ fn a_cold_model_picker_names_the_unreachable_host() {
     // test is about the notice, not the teardown. `Drop` kills the child.
     tui.wait_for_screen("127.0.0.1:");
 }
+
+/// A gateway that accepts the connection and never answers, so a turn stays
+/// running until a key stops it.
+fn hanging_gateway() -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    use std::net::TcpListener;
+    use std::sync::atomic::Ordering;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fake gateway");
+    let port = listener.local_addr().expect("gateway addr").port();
+    let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&requested);
+    thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            flag.store(true, Ordering::SeqCst);
+            // Hold the socket open: the turn must stop without an answer.
+            thread::sleep(Duration::from_secs(15));
+            drop(stream);
+        }
+    });
+    (format!("http://127.0.0.1:{port}/v1/"), requested)
+}
+
+/// One `Esc` must cancel a running turn. The reported bug is that it takes two:
+/// the first press is swallowed by something that is not the cancel branch.
+#[test]
+fn one_esc_cancels_a_running_turn() {
+    use std::sync::atomic::Ordering;
+
+    let home = tempfile::tempdir().expect("temp home");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let (base_url, requested) = hanging_gateway();
+    fs::create_dir_all(workspace_root(workspace.path())).expect("config dir");
+    fs::write(
+        workspace_root(workspace.path()).join("config.toml"),
+        format!(
+            "base_url = \"{base_url}\"\napi_key = \"e2e-key\"\nmodel = \"probe/e2e\"\nmax_turns = 2\n"
+        ),
+    )
+    .expect("write config");
+
+    let mut tui = Tui::start(workspace.path(), home.path());
+    tui.wait_for_screen(READY);
+
+    tui.run("hallo");
+    tui.waits_for("the request to reach the gateway", || {
+        requested.load(Ordering::SeqCst)
+    });
+
+    tui.press("\x1b");
+    tui.wait_for_screen("cancelled");
+
+    assert!(tui.exit().success(), "the TUI exits cleanly after a cancel");
+}

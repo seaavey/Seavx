@@ -1228,6 +1228,27 @@ fn ctrl_c_stops_a_running_turn_instead_of_leaving_the_session() {
     assert!(app.toast.is_some());
 }
 
+#[tokio::test]
+async fn a_submitted_prompt_leaves_no_ghost_to_swallow_the_first_esc() {
+    let mut app = test_app();
+    // A history match is what grows the dimmed tail.
+    app.history.push("hallo semuanya".to_string());
+    app.set_input("hallo");
+    app.refresh_ghost();
+    assert!(app.ghost_active(), "the suggestion grew a dimmed tail");
+
+    assert!(app.submit_turn("hallo").is_some(), "the turn was accepted");
+    assert!(
+        !app.ghost_active(),
+        "the ghost belonged to the submitted text, not to the turn"
+    );
+
+    // The reported bug: the first Esc after a submit only cleared that leftover
+    // ghost, so cancelling took two presses.
+    app.escape();
+    assert!(app.cancel.is_cancelled(), "one Esc cancels the turn");
+}
+
 #[test]
 fn model_index_outside_the_cached_list_is_an_error_not_a_name() {
     let cached: Vec<String> = ["alpha", "beta"].iter().map(|m| m.to_string()).collect();
