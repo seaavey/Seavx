@@ -111,6 +111,15 @@ tree with table headers.
 
 ## M2 — MCP servers as tools
 
+### Current state
+
+There is no MCP configuration, client, transport, or registry in the codebase.
+`AgentTool` in `src/agent/tools.rs` currently requires static tool names and
+descriptions, and `ToolRegistry` owns the built-in tools. The permission matrix
+already has an `execute` action and agent events support user-facing `Notice`s.
+M2 follows M1 because it reads the config; it does not start until the provider
+config migration is in place.
+
 ### End state
 
 ```toml
@@ -120,36 +129,90 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/project"]
 env = { LOG_LEVEL = "warn" }
 ```
 
-- Transport: stdio only in this milestone. HTTP/SSE is a second transport behind
-  the same client seam when someone needs it.
-- Startup: the registry asks each server for `initialize` then `tools/list`;
-  each tool becomes an `AgentTool` named `mcp__<server>__<tool>` so two servers
-  cannot collide and a name tells you where it came from.
-- A server that fails to start, handshake or list is reported once as a `Notice`
-  and skipped. One broken server never blocks a session.
-- Schema: MCP's JSON Schema is passed through as-is into the genai tool
-  definition; the repo's `schemars` path stays for built-in tools.
-- Calls: `tools/call` with the turn's cancel token; a timeout per call, and the
-  child process is killed on drop so a crashed session leaves no orphans.
+- Transport: stdio only in this milestone. Launch `command` with `args` directly,
+  without a shell. Speak line-delimited JSON-RPC on stdin/stdout; reserve stderr
+  for diagnostics. HTTP/SSE is out of scope.
+- Starting a server is a separate trust decision. Before spawning each configured
+  command, require a dedicated one-shot yes/no confirmation for this runtime,
+  showing the server name and redacted command details. It has no remember or
+  category action. Config values alone do not grant launch approval, even when
+  they come from a workspace config. Do not persist this approval or let
+  `permitted_actions`, `tool_permissions = "allow"`, or Auto mode bypass it.
+  `tool_permissions = "deny"` and `seavx exec` skip startup without launching a
+  process. A denial emits one `Notice`. Apply the regular permission gate to each
+  later tool call.
+- Start each approved server once per agent runtime. Negotiate a supported MCP
+  protocol version in `initialize`, send `notifications/initialized`, then
+  request `tools/list` and follow its cursor until complete. Register tools only
+  after a successful handshake and schema check. Bound startup, frame, and list
+  sizes. A server that fails to start, handshake, or list emits one `Notice` and
+  is skipped; one broken server never blocks a turn. Drain stderr separately
+  with bounded, redacted diagnostics.
+- Each tool becomes an `AgentTool` named `mcp__<server>__<tool>`. Both
+  `AgentTool::name` and `AgentTool::description` must return runtime `&str`
+  values rather than require `&'static str`. Reject invalid names and collisions
+  with built-in or already registered tools; never replace an existing tool.
+- Pass each valid MCP `inputSchema` through to the genai tool definition without
+  converting it through `schemars`. Require a JSON object schema; skip and report
+  malformed entries. The built-in tools keep their `schemars` path.
+- Calls use `tools/call`, a fresh JSON-RPC request id, the active turn's cancel
+  token, and a bounded per-call timeout. On cancellation, timeout, or runtime
+  drop, stop the server process and its descendants. Mark the server unavailable
+  and remove its tools from subsequent model requests; do not restart it during
+  that runtime. A new runtime must pass the startup gate again. Return text
+  content to the model, reject unsupported non-text result blocks explicitly,
+  and map MCP's `isError` result to a tool failure. A server error is not a
+  runtime crash.
+- `doctor` never starts configured commands. It reports configured server names,
+  stdio transport, and `not probed`; it does not report tool counts because
+  obtaining them requires launching each server. No dedicated `seavx mcp`
+  command.
 
 ### Decisions
 
-- MCP tools are `execute`-kind for the permission model: `ask` by default,
-  liftable by `permitted_actions`, never lifted globally. A tool that can run
-  `npx` is not a read.
-- No tool allowlist per server in v1; the permission gate is the allowlist.
-  Add one only when the tool namespace gets big enough to crowd the prompt.
-- `seavx doctor` gains a section: server name, transport, status, tool count.
-  No dedicated `seavx mcp` command.
+- An MCP server runs a user-configured executable with the host user's
+  privileges and process environment; `env` overlays configured values. Stdio
+  avoids opening a listener, but does not sandbox the process or limit its
+  filesystem, network, or environment access. Startup approval is required even
+  when the config is workspace-local.
+- Server startup always needs an explicit one-shot confirmation in an interactive
+  run. The config declares what to launch, not permission to launch it. Startup
+  approval is per server and runtime, is never stored in `permitted_actions` or
+  `tool_permissions`, and is unavailable in `seavx exec`. This prevents a
+  workspace config from running a command silently.
+- MCP tool calls are `execute`-kind and use the existing permission matrix. In
+  the default `ask` mode, Seavx asks before each call. The existing
+  `permitted_actions = ["execute"]` lifts that category; `tool_permissions = "allow"`
+  and Auto mode follow their existing behavior, while `tool_permissions = "deny"`
+  refuses calls in every mode. Startup approval does not grant tool-call
+  permission.
+- No per-server tool allowlist in v1; the permission matrix is the allowlist.
+  Add a narrower filter only if real tool namespaces crowd the prompt.
+- Resources, prompts, roots, sampling, server-initiated requests, and dynamic
+  tool-list refresh are out of scope. Advertise only client capabilities this
+  milestone implements.
 
 ### Proof
 
-- A fixture MCP server in `src/tests/` (a small Rust binary speaking JSON-RPC
-  over stdio, built by the test harness): handshake, list, call, tool error,
-  server that exits during handshake, server that never answers.
-- Name collision between two servers; a tool named like a built-in one.
-- `cargo clippy` clean with the JSON Schema passthrough — no `unwrap` on
-  untrusted server output.
+- A fixture MCP server in `src/tests/` speaks JSON-RPC over stdio and covers the
+  initialize/initialized/list sequence, call, tool error, malformed schema,
+  malformed JSON, oversized frame/list, early exit, and a server that never
+  answers. Verify stderr cannot corrupt protocol output and captured diagnostics
+  are bounded and redacted.
+- Verify startup and call timeouts, cancellation, process-tree cleanup, one
+  failed server alongside one healthy server, and removal of dead server tools
+  from subsequent model requests without an automatic restart.
+- Verify startup confirmation is one-shot and not persisted,
+  `tool_permissions = "deny"` skips launch, `tool_permissions = "allow"`,
+  permitted actions, and Auto mode cannot bypass confirmation, and `seavx exec`
+  never launches a configured server. Verify tool calls still follow `execute`
+  permissions, including the Auto-mode behavior in the existing matrix.
+- Verify collisions between two servers and with a built-in tool; neither may
+  replace an existing registration. Verify both dynamic names and descriptions
+  reach the provider tool definition.
+- Verify a call is denied in `ask`/`deny` as configured and that explicit
+  `permitted_actions = ["execute"]` lifts only the execute category.
+- `cargo clippy` must be clean. Do not unwrap or trust unvalidated server output.
 
 ---
 
@@ -225,8 +288,22 @@ allowed_chat_ids = [123456789]
 
 ## M4 — a self-update that can be trusted
 
-Independent of M1–M3: it touches the CLI updater, the publish workflow, the two
-installers and `docs/security.md`, and nothing that reads the config.
+Independent of M1–M3 because it does not read the config. It touches the CLI
+arguments and dispatch in `src/main.rs`, the updater and its tests, the verifier
+dependency and lockfile, the publish workflow, CDN worker, both installers,
+`docs/security.md`, README, CHANGELOG, and the matching Seavx skill. Those docs
+ship with the implementation milestone.
+
+### Current state
+
+`src/cli/update.rs` has only `--force`, reads a fixed
+`latest/<os>/<arch>.json` pointer, and supports Linux x86_64 and Windows x86_64.
+It verifies `sha256` when present and warns when it is absent; it does not verify
+a signature. CI currently publishes `latest-*` pointers on both master and tag
+pushes. `worker/index.js` has no channel route. `install.sh` downloads the raw
+latest binary, and `install.ps1` writes the raw download directly to `seavx.exe`;
+neither verifies a checksum or signature. This milestone replaces that
+baseline. Do not describe the current updater or installers as authenticated.
 
 ### End state
 
@@ -245,114 +322,195 @@ Downloading v0.1.3 (06a4060)...
 Successfully updated SEAVX v0.1.3 (06a4060, /home/seaavey/.local/bin/seavx)
 ```
 
-The pointer object grows one field, written by CI:
+The pointer object carries the fields the client must authenticate:
 
 ```json
-{"sha":"06a4060","key":"builds/06a4060/seavx-linux-x86_64","version":"0.1.3",
- "built_at":"2026-10-31T16:41:34Z","sha256":"3e92be…","sig":"untrusted comment: …\nRWQ…"}
+{
+  "channel": "stable",
+  "target": "linux-x86_64",
+  "sha": "06a4060",
+  "key": "builds/06a4060/3e92be…/seavx-linux-x86_64",
+  "version": "0.1.3",
+  "built_at": "2026-10-31T16:41:34Z",
+  "sha256": "3e92be…",
+  "sig": "<minisign signature>"
+}
 ```
 
-- `sig` is a minisign signature over the binary bytes, inline in the pointer so
-  the signed object and the object that routes to it travel together.
-- Verification runs in one order and stops at the first failure: signature,
-  checksum, probe (`<temp binary> --version` exits 0), then replace.
-- A missing or wrong signature refuses the update. A missing checksum stays a
-  warning, so a pointer published before this milestone still installs.
-- `--channel edge` reads `edge-<os>-<arch>.json`. The default `latest-*` comes
-  from a tag push only.
-- macOS joins the platforms that can self-update.
-- `docs/security.md` gains an **Updates** section: what the signature proves,
-  what it does not (a compromised private key, a machine already running
-  attacker code), and that the updater is a trust boundary, not a sandbox.
+- CI signs a canonical manifest containing `channel`, `target`, `sha`, `key`,
+  `version`, `built_at`, and `sha256`, in that fixed order. The signed UTF-8
+  bytes begin with `SEAVX-UPDATE-v1` followed by LF, then one `name=value` line
+  per field in that order, then a final LF. `sig` is not part of the signed
+  bytes. Values are validated as `stable|edge`, one of
+  `linux-x86_64|windows-x86_64|macos-arm64`, a seven-character lowercase hex
+  commit, `builds/<sha>/<sha256>/seavx-<target>` (with `.exe` on Windows), SemVer,
+  a UTC RFC 3339 timestamp, and a 64-character lowercase SHA-256 digest. JSON
+  key order and escaping therefore do not affect verification.
+- Before using `key`, the client requires `channel` to equal the requested
+  channel and `target` to equal the running binary's detected platform. A valid
+  signature for another channel or target is still refused.
+- The manifest signature authenticates the artifact route and its SHA-256. The
+  client verifies the signature before downloading, hashes the streamed bytes,
+  probes the temporary binary with `--version`, checks that version against the
+  signed version, then replaces the executable. Any failed step stops the update
+  and removes the temporary file. Network requests and the version probe have
+  bounded timeouts.
+- A new pointer must include a valid signature and SHA-256. Missing or invalid
+  values fail closed. `--force` bypasses only version/up-to-date checks; it never
+  bypasses signature, checksum, target, or probe validation.
+- The default channel is stable and uses `latest-<os>-<arch>.json`; tag builds
+  publish it. `--channel edge` uses `edge-<os>-<arch>.json`; master builds publish
+  it. Before the first stable tag, `latest-*` continues to point at master so
+  existing installs keep working.
+- Build artifacts use digest-addressed keys. CI may reuse an existing key only
+  when its bytes match the digest; it must fail rather than overwrite a mismatch.
+  The CDN can then cache those paths as immutable for a year.
+- Self-update supports Linux x86_64, Windows x86_64, and macOS arm64. CI's target
+  name is `aarch64`; the pointer and installer use `arm64`.
+- Both installers download into a temporary file, validate the pointer and
+  artifact before replacing the installed binary, and remove the temporary file
+  on failure. A bad or incomplete download must leave an existing installation
+  untouched.
+- `docs/security.md` gains an **Updates** section: the client accepts the update
+  only when the trusted signing key approves the manifest and the downloaded
+  bytes match its digest. This does not prove the binary is harmless, prevent a
+  compromised signing key or CI, protect an already compromised machine, or
+  prevent replay of an older valid signed pointer. Version ordering rejects a
+  downgrade on either channel unless `--force` is used. A replay of an older
+  signed pointer with the same version is not reliably detectable; same-version
+  edge freshness is not guaranteed.
 
 ### Decisions
 
 - **minisign, not a hand-rolled Ed25519 scheme.** CI signs with the `minisign`
   CLI (`-S -W`, no passphrase, so the step is non-interactive) and the client
-  verifies with the `minisign-verify` crate, which only verifies. The public key
-  is a `const` in the updater; the secret key lives in a GitHub secret and is
-  materialised as a file for the one signing step. Read both crate versions from
-  `Cargo.lock` before coding. Rotation is a `const` array of accepted keys, not a
-  single key: a build that trusts the old and the new key ships first, the next
-  one drops the old. The alternative — `ed25519-dalek` plus a signature
-  envelope of our own — means owning a canonical byte string, a key encoding and
-  a rotation story to save one dependency.
-- **The signature covers the binary, not the pointer.** The bytes that execute
-  are the bytes that are verified; a forged pointer can relabel `version` or
-  point at another key, and both outcomes are harmless: the first changes a
-  printed string, the second yields a 404 or different signed content.
-- **The signature fails closed, the checksum does not.** `verify_digest` returns
-  `Ok(false)` for a pointer with no checksum because that field arrived later
-  than the client. The signature has no such history and must not inherit the
-  shape: a pointer without `sig` is refused with a message that says why.
-- **No `.old` rollback on Unix.** The probe is the rollback: a binary that
-  cannot print its own version never reaches the target path. Windows keeps its
-  rename-aside dance because the OS refuses to overwrite a running image.
-- **`semver` for ordering, and only when it parses.** Equality cannot answer
-  "which is newer", which is why `0.1.3-rc.1` in `Cargo.toml` today already
-  invites a silent downgrade to the published `0.1.3`. A pointer version that
-  does not parse falls back to the equality check with a warning: a metadata
-  glitch must not block every install.
+  verifies with the `minisign-verify` crate, which only verifies. The public-key
+  set is pinned in the updater and both installers; never accept a key from the
+  pointer or CDN. The secret key lives in a GitHub secret and is materialised as
+  a file for the one signing step. Read both crate versions from `Cargo.lock`
+  before coding. Rotate the updater and both installers together: ship a build
+  accepting old and new keys first, then drop the old key in a later build.
+- **Sign the manifest, not only the binary.** Signing only binary bytes would let
+  a forged pointer relabel the version or route the client to a different
+  legitimately signed build. Signing the channel, target, commit, artifact key,
+  version, timestamp, and digest binds those claims to the bytes the client
+  downloads. This does not prevent replay of a previously valid manifest.
+- **The signature and checksum both fail closed.** The signed manifest contains a
+  required SHA-256. The updater refuses a pointer with no signature or checksum,
+  including an old unsigned pointer. CI publishes signed pointers before a client
+  that requires them ships, so legacy pointer compatibility is not needed after
+  rollout.
+- **`--force` never skips verification.** It can reinstall the signed artifact
+  selected by the channel even when the version/commit looks current, but the
+  signature, digest, target, and probe remain mandatory.
+- **The probe is preflight validation, not rollback.** A candidate that cannot
+  print the expected version never reaches the target path. Unix has no automatic
+  recovery if a replacement later proves unusable; the user reinstalls or
+  restores the prior binary manually. Windows keeps the rename-aside dance to
+  restore the old file when replacement fails, not as an automatic post-update
+  rollback.
+- **Use `semver` for version ordering.** Refuse an invalid signed version rather
+  than treating it as equal. Skip a downgrade on either channel unless `--force`
+  is set. For the same version, compare commit ids so edge builds can update
+  while a matching build is reported up to date.
 - **`SEAVX_UPDATE_BASE` exists so the flow can be tested.** Default
   `https://cdn.seavx.com`; tests and manual checks point it at a local server.
-  It is not a bypass — unsigned bytes are refused whatever the origin.
-- **`install.sh` verifies what it already downloads past.** It parses `sha256`
-  out of the pointer and fails on a mismatch, which is the same guarantee the
-  updater gives. The signature is checked there too when `minisign` is on the
-  machine, and skipped with a printed note when it is not: a curl-pipe installer
-  cannot require a tool it has not installed yet.
+  It changes the origin, not the verification rules.
+- **Artifact keys are digest-addressed.** Store each build at
+  `builds/<sha>/<sha256>/<binary-name>` so reruns cannot replace a different
+  binary behind a cached key. If an object already exists, CI verifies its bytes
+  against the path digest and fails on a mismatch; the worker's year-long cache
+  remains valid for those immutable paths.
+- **Installers verify the digest and pin the signer.** Both installers fetch and
+  validate the pointer, require the platform and stable channel to match its
+  signed fields, and verify SHA-256. If `minisign` is installed, they verify with
+  the same pinned public-key set as the updater. Otherwise, they warn that the
+  checksum only detects transfer corruption, not a forged pointer or publisher;
+  a compromised CDN could replace both pointer and artifact. The updater itself
+  always requires a signature.
 
 ### What the current code forces
 
-- `Latest` (`src/cli/update.rs`) deserialises four fields; `sig` is additive and
-  the client that ignores it keeps working, so the field can ship before the
-  client that requires it.
-- The download already streams into `.seavx-update-<pid>.tmp` beside the exe and
-  hashes while writing. The signature and the probe read that same file, so
-  there is no second temp path and no whole-file buffer in memory.
-- `update.rs:48` refuses macOS while CI builds and publishes `macos-arm64`; the
-  fix is one match arm. `std::env::consts::ARCH` says `aarch64`, the CDN path
-  says `arm64`, and `install.sh` already spells that target `macos/arm64`.
-- `replace_exe` already takes both paths as arguments, so "nothing was replaced"
-  is assertable in a test without touching the running binary.
-- CI writes the pointer with a `printf` and two `aws s3 cp`s; signing is one
-  `minisign -S` step before the `printf`, and the edge channel is a second
-  pointer object guarded by the same `github.ref` check that already exists.
-- `worker/index.js` matches `/latest/<os>/<arch>` literally. The channel becomes
-  one group in that regex and one filename template — the pointer already flows
-  through untouched, so the `sig` field needs no worker change at all.
-- Every master push currently republishes under the same unreleased version,
-  which is why `same_commit` exists. Channels do not replace it; they decide
-  which pointer a client reads.
+- `src/main.rs` owns the `Update` arguments and dispatch. Add `--channel edge`
+  there and cover parsing/dispatch in CLI tests; `src/cli/update.rs` alone cannot
+  expose the flag.
+- `Latest` (`src/cli/update.rs`) currently reads `sha`, `key`, `version`, and
+  optional `sha256`. It has no `channel`, `target`, or `sig`. Add the signed
+  manifest fields and validate the signature, requested channel, and detected
+  target before using `key` or `version`.
+- The updater already streams the artifact into `.seavx-update-<pid>.tmp` beside
+  the executable and hashes it while writing. Reuse that path and digest; verify
+  the manifest before download and remove the temp file on every failure path.
+- The current platform match accepts Linux x86_64 and Windows x86_64. CI already
+  builds macOS arm64 as `aarch64-apple-darwin`; `install.sh` uses `macos/arm64`.
+  Add that target to the updater and bind every target to its expected artifact
+  name.
+- `replace_exe` already takes explicit temp and executable paths. Keep that seam
+  for tests that prove a failed verification leaves the target untouched.
+- CI currently writes `latest-*` pointers on both master and tag pushes. It has
+  no signing step or edge pointer. Add signing and channel-specific publication
+  without breaking the old `latest-*` pointer during rollout.
+- CI currently uploads artifacts to `builds/$SHORT_SHA/<binary>` with ordinary
+  `aws s3 cp`, so a rerun can overwrite a key. Move to
+  `builds/$SHORT_SHA/$SHA256/<binary>` and reject an existing object whose bytes
+  do not match the digest. The worker already caches build paths for a year as
+  immutable, so keep that policy only for the digest-addressed artifacts.
+- `worker/index.js` currently routes only `/latest/<os>/<arch>` and its `.json`
+  form. Add the edge route and map each channel to its pointer object; continue
+  serving immutable build artifacts through their existing keys.
+- Both installers currently download a binary directly. Change them to fetch and
+  validate the pointer, check the artifact digest, and verify the manifest
+  signature with the same pinned public keys when minisign is available. Keep
+  the explicit checksum-only warning when it is not.
+- Every master push currently republishes `latest-*` under the same unreleased
+  version. Keep that behavior only until the signed-client rollout reaches its
+  first tag; after that, master writes `edge-*` and tags write stable `latest-*`.
 
 ### Proof
 
-- Signature tests with a checked-in fixture key pair, marked as signing nothing:
-  valid signature accepted, one flipped byte refused, signature from another key
-  refused, pointer without `sig` refused naming the reason, malformed base64
-  refused.
-- Ordering tests: a failed signature leaves the target untouched and removes the
-  temp file, using `replace_exe`'s explicit paths.
-- Version tests: equal, newer, older, `0.1.3-rc.1` against `0.1.3`, unparseable
-  pointer, and `--force` bypassing all of it.
-- Probe test: a script that exits non-zero aborts before any rename.
-- End-to-end against a local server through `SEAVX_UPDATE_BASE`: up to date,
-  update applied, tampered bytes, unsigned pointer. This is the first test in
-  the repo that speaks HTTP to a server it started itself; it is the reason the
-  seam exists.
-- Manual: tamper the object behind the pointer once, confirm the refusal, then
-  `seavx -d update` against the real CDN.
+- CLI tests cover default stable behavior, `--channel edge`, invalid channel
+  values, and dispatch to the expected pointer path.
+- Signature tests use a checked-in fixture key pair that signs no release:
+  valid manifest accepted, changed channel/target/version/key/digest refused,
+  validly signed metadata for the wrong requested channel or platform refused
+  before artifact download, one flipped artifact byte refused, signature from
+  another key refused, missing signature refused with its reason, and malformed
+  signature refused. The verifier key never comes from the pointer.
+- Installer checks prove both scripts stage before replacement, a bad pointer or
+  artifact leaves an existing binary untouched, temporary files are cleaned up,
+  the same pinned public-key set is used by both scripts, a checksum mismatch
+  fails, a minisign verification failure fails, and missing minisign emits the
+  documented checksum-only warning.
+- Ordering tests prove an invalid signature or checksum leaves the target
+  untouched and removes the temporary file. Also cover cleanup after a failed
+  transfer, failed sync, failed probe, and failed replacement.
+- Version tests cover equal, newer, older, `0.1.3-rc.1` against `0.1.3`, invalid
+  SemVer, same-version commit changes, and `--force` bypassing only version
+  checks. A forced update with a bad signature must still fail.
+- Probe tests cover non-zero exit, timeout, and a binary whose reported version
+  differs from the signed manifest.
+- End-to-end against a local server through `SEAVX_UPDATE_BASE`: current build,
+  stable and edge updates, signed update, tampered artifact, modified pointer,
+  wrong channel, wrong target, unsigned pointer, and forced reinstall. No test
+  needs a real signing key or CDN write.
+- CI publishes artifacts under commit-and-digest keys. A rerun may reuse an
+  existing object only after its digest matches; a mismatch must fail. Verify
+  the worker routes both channels to their intended pointer filenames.
+- Manual: run `seavx -d update` against the real CDN and confirm the published
+  channel and signature. Perform tamper tests only against the local test server.
 
 ### Rollout
 
-Three states, in this order, because a client that requires `sig` must never be
-the first thing to reach a pointer that lacks it:
+Three states, in this order, because a client that requires a signature must not
+be the first thing to reach an unsigned pointer:
 
-1. CI signs, and writes `edge-*` alongside the `latest-*` it still produces from
-   master. Old clients ignore the field.
-2. The client verifies, probes, orders versions, accepts `--channel` and macOS.
-3. The first tag flips `latest-*` to tag-only. Before that tag exists, the
-   default channel keeps resolving to master because CI is still writing it.
+1. CI publishes signed `edge-*` pointers for master and signed `latest-*` pointers
+   for the current master build. Old clients ignore the additive fields.
+2. Ship the client that verifies signed metadata, probes the candidate, orders
+   versions, accepts `--channel edge`, and supports macOS arm64. Keep writing
+   `latest-*` from master until a stable tag exists.
+3. The first tag publishes the stable `latest-*` pointer. Later master pushes
+   update only `edge-*`; the default channel then remains on the latest tag.
 
 ---
 
