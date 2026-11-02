@@ -40,6 +40,11 @@ pub fn persist(
     Ok(preserved)
 }
 
+/// The prompt default: what the target file says, else what is in effect.
+fn seed(target: Option<&str>, effective: Option<&str>) -> String {
+    target.or(effective).unwrap_or_default().to_string()
+}
+
 /// The file the wizard writes: this workspace's config when asked, the global
 /// one otherwise.
 pub fn target_path(
@@ -84,10 +89,14 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
 
     let model_mgr = crate::agent::models::ModelManager::new(&std::path::PathBuf::from("."));
     let mut available_models: Vec<String> = Vec::new();
-    // Pre-filled only from the configured value: with nothing configured the
-    // prompt starts empty and an empty answer is refused by the validator.
-    let mut url_default = config.base_url.clone().unwrap_or_default();
-    let mut key_default = config.api_key.clone().unwrap_or_default();
+    // Pre-filled from the config in effect, not only the target file: a key
+    // exported in the environment or written to the workspace file is the key
+    // `/models` is called with, so offering `none` for it is the 401 trap in
+    // #30. Nothing from `effective` is written — `config` stays the source of
+    // the file's contents.
+    let effective = crate::agent::engine::AgentConfig::load(std::path::Path::new("."));
+    let mut url_default = seed(config.base_url.as_deref(), effective.base_url.as_deref());
+    let mut key_default = seed(config.api_key.as_deref(), effective.api_key.as_deref());
 
     // Ask the endpoint for its model list, so a wrong URL or key fails here instead of in the TUI.
     let (base_url, api_key) = 'endpoint: loop {
@@ -101,15 +110,15 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
         let normalized = match crate::agent::engine::validate_base_url(&url) {
             Ok(normalized) => normalized,
             Err(error) => {
-                println!("invalid base URL: {error}\n");
+                println!("{error}; enter a URL like https://gateway.example/v1/\n");
                 url_default = url;
                 continue;
             }
         };
 
-        // The key is re-asked on its own until the gateway accepts it: a 401/403
-        // refuses the credential, and "save anyway" there is how a keyless
-        // provider gets written.
+        // The key is asked until the gateway answers; a failure offers the same
+        // "save anyway" exit as any other, so a keyless or 401 endpoint is never
+        // a loop with no way out.
         loop {
             screen(
                 &config_path,
@@ -136,18 +145,24 @@ pub async fn providers(workspace: bool) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     println!("failed: {e}");
-                    if crate::agent::models::key_rejected(&e) {
-                        println!("the endpoint needs a key it accepts; enter it again\n");
-                        key_default.clear();
-                        continue;
+                    let rejected = crate::agent::models::key_rejected(&e);
+                    if rejected {
+                        println!(
+                            "the endpoint rejected that key; enter it again, or save this endpoint without a key\n"
+                        );
+                        // The URL answered, so the retry is about the key.
+                        url_default = normalized.clone();
                     }
                     let keep = prompt::line("Save this endpoint anyway? [y/N]", "")?;
                     if keep.eq_ignore_ascii_case("y") {
                         break 'endpoint (normalized, key);
                     }
+                    key_default.clear();
+                    if rejected {
+                        continue;
+                    }
                     // A rejected attempt is forgotten, so the retry starts from blank fields.
                     url_default.clear();
-                    key_default.clear();
                     continue 'endpoint;
                 }
             }
