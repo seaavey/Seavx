@@ -97,6 +97,11 @@ per landed change; no entry describes behaviour that is not in the code.
 
 ### fix
 
+- `Ctrl+C` stops a running turn instead of leaving the session: the key cancels
+  the turn (as `Esc` does) and only an idle prompt treats it as the way out,
+  where it still needs its second press. The footer says which of the two it is
+  — `ctrl+c stop` while a turn runs, `ctrl+c exit` when idle — and its clear
+  hint reads `esc ×2 clear` instead of the doubled-looking `esc esc clear`.
 - Copying from the transcript works on a host with no clipboard. A drag whose
   write to the system clipboard fails now goes out as an OSC 52 sequence — the
   terminal the user is looking at copies it, which is the one channel that
